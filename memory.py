@@ -1669,25 +1669,58 @@ def replay_memories():
         conn.close()
         return
 
-    # 1. 古いリンクを全削除して再計算（閾値変更を反映）
-    conn.execute("DELETE FROM links")
-    new_links = 0
+    # 1. シナプスホメオスタシス（Tononi SHY）
+    #    全リンクのstrengthを一律減衰させ、閾値以下を刈り込む。
+    #    外傷的記憶（arousal >= 閾値）に繋がるリンクは減衰を免除。
+    arousal_by_id = {row["id"]: row["arousal"] for row in rows}
 
+    existing_links = conn.execute("SELECT id, source_id, target_id, strength FROM links").fetchall()
+    pruned = 0
+    downscaled = 0
+    pruned_pairs = set()  # 刈り込まれたペア（同じリプレイ内で復活させない）
+    for link in existing_links:
+        src_arousal = arousal_by_id.get(link["source_id"], 0)
+        tgt_arousal = arousal_by_id.get(link["target_id"], 0)
+        # 外傷的記憶に繋がるリンクは減衰を免除
+        if src_arousal >= TRAUMA_AROUSAL_THRESHOLD or tgt_arousal >= TRAUMA_AROUSAL_THRESHOLD:
+            continue
+        new_strength = link["strength"] * 0.9
+        if new_strength < LINK_THRESHOLD:
+            conn.execute("DELETE FROM links WHERE id = ?", (link["id"],))
+            pruned_pairs.add((link["source_id"], link["target_id"]))
+            pruned += 1
+        else:
+            conn.execute("UPDATE links SET strength = ? WHERE id = ?",
+                         (new_strength, link["id"]))
+            downscaled += 1
+
+    # 2. 新しい記憶ペアのリンクを追加
+    #    既存リンク・刈込済みペアはスキップ（覚醒時の共活性化で復活すべき）
+    existing_pairs = set(
+        (r["source_id"], r["target_id"])
+        for r in conn.execute("SELECT source_id, target_id FROM links").fetchall()
+    )
+    skip_pairs = existing_pairs | pruned_pairs
+    new_links = 0
     for i, row_a in enumerate(rows):
         vec_a = bytes_to_vec(row_a["embedding"])
         for row_b in rows[i+1:]:
+            if (row_a["id"], row_b["id"]) in skip_pairs:
+                continue
             vec_b = bytes_to_vec(row_b["embedding"])
             sim = cosine_similarity(vec_a, vec_b)
 
             if sim > LINK_THRESHOLD:
                 conn.execute(
-                    "INSERT OR IGNORE INTO links (source_id, target_id, strength) VALUES (?, ?, ?)",
+                    "INSERT INTO links (source_id, target_id, strength) VALUES (?, ?, ?)",
                     (row_a["id"], row_b["id"], sim)
                 )
                 conn.execute(
-                    "INSERT OR IGNORE INTO links (source_id, target_id, strength) VALUES (?, ?, ?)",
+                    "INSERT INTO links (source_id, target_id, strength) VALUES (?, ?, ?)",
                     (row_b["id"], row_a["id"], sim)
                 )
+                skip_pairs.add((row_a["id"], row_b["id"]))
+                skip_pairs.add((row_b["id"], row_a["id"]))
                 new_links += 1
 
     # 2. 弱い記憶の自動忘却
@@ -1704,9 +1737,10 @@ def replay_memories():
     sweep_contexts(conn)
 
     conn.commit()
-    conn.close()
 
-    print(f"✓ リプレイ完了: {new_links}リンク再構築, {auto_forgotten}件自動忘却")
+    total_links = conn.execute("SELECT COUNT(*) FROM links").fetchone()[0] // 2
+    conn.close()
+    print(f"✓ リプレイ完了: {total_links}リンク（刈込{pruned}本, 減衰{downscaled}本, 新規{new_links}本）, {auto_forgotten}件自動忘却")
 
     # 3. 統合候補を表示
     consolidate_memories(dry_run=True)
