@@ -1303,6 +1303,16 @@ def add_memory(content, category="fact", source=None):
     print(f"  断片: [{kw_str}]")
     print(f"  カテゴリ: {category}{link_str}{intf_str}")
 
+    # ひらめき連想: arousalが高いinsightは連想を自動で走らせて提案する
+    if arousal >= 0.5 and "insight" in emotions:
+        chain = chain_memories(new_id, depth=2)
+        if len(chain) > 1:  # 自分以外にリンク先がある
+            print(f"  💡連想が走る:")
+            for mem, dist in chain[1:]:  # 自分自身はスキップ
+                prefix = "  " * (dist + 2)
+                snippet = mem["content"][:60]
+                print(f"{prefix}→ #{mem['id']} {snippet}")
+
     # 重要な記憶は自動でメモにも残す（人間がメモを取るのと同じ）
     if importance >= 4 and source is None:
         os.makedirs(MEMO_DIR, exist_ok=True)
