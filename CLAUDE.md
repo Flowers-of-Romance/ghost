@@ -88,6 +88,7 @@ python memory.py mood [emotion] [arousal]  # 気分状態の設定
 python memory.py mood clear                # 気分クリア
 python memory.py replay                # 海馬リプレイ
 python memory.py consolidate [--dry-run]
+python memory.py proceduralize [--dry-run]  # 反復記憶→行動指針に昇格
 
 # 予期記憶
 python memory.py prospect add "トリガー" "アクション"
@@ -103,3 +104,17 @@ python visualize.py                    # ネットワーク可視化
 python transfer.py [N]                 # アナロジー検出
 python autobiography.py               # 自伝的記憶の生成
 ```
+
+## 学習された行動指針
+
+<!-- 自動生成: memory.py proceduralize による。手動編集しない -->
+<!-- 十分に反復された記憶パターンが行動指針として昇格したもの -->
+
+- #4: 記憶の実装を通じて人間の記憶の構造を明らかにするという逆向きのアプローチを取ることにした
+- #23: Memory brain v2
+つづきもやろう
+- #7: でも、人間には一応記憶がある
+- #28: 記憶実験の執筆中
+- #15: そっちもやろう
+like検索は記憶っぽくない
+- #10: memory.mdはどの程度記憶できる？

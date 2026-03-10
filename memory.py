@@ -31,6 +31,7 @@ memory.py - 脳に近い記憶システム
   python memory.py forget ID
   python memory.py resurrect "query"  # 忘却された記憶を復活検索
   python memory.py schema             # リンク密集クラスタからスキーマ（メタ記憶）を生成
+  python memory.py proceduralize      # 反復された記憶を行動指針に昇格（CLAUDE.mdに書込み）
   python memory.py stats
   python memory.py mood [emotion] [arousal]  # 気分状態の設定・表示
   python memory.py mood clear                # 気分状態をクリア
@@ -87,6 +88,16 @@ RECONSOLIDATION_DRIFT = 0.15  # arousalが最大±15%変動
 # 発火確率 = FLASHBACK_BASE_PROB * (元のarousal) * (類似度 - 閾値)
 FLASHBACK_BASE_PROB = 0.15     # 基礎確率
 FLASHBACK_SIM_THRESHOLD = 0.75  # この類似度を超えたら発火判定に入る
+
+# 手続き化: 反復が閾値を超えた記憶を行動指針に昇格
+PROCEDURALIZE_ACCESS_THRESHOLD = 20   # 最低想起回数
+PROCEDURALIZE_LINK_THRESHOLD = 15     # 最低リンク数
+CLAUDE_MD_PATH = str(Path(__file__).parent / "CLAUDE.md")
+HEBB_MARKER = "## 学習された行動指針"
+
+# 外傷的記憶: arousalがこの閾値を超えると既存メカニズムの挙動が変わる
+# 馴化しない、統合されない、減衰が遅い、夢に頻出する
+TRAUMA_AROUSAL_THRESHOLD = 0.85
 
 # --- 情動辞書 ---
 EMOTION_MARKERS = {
@@ -288,6 +299,13 @@ def cosine_similarity(a, b):
 
 # --- 時間減衰 ---
 
+def effective_half_life(arousal):
+    """arousalに応じた半減期を返す。外傷的記憶は減衰が極端に遅い。"""
+    if arousal >= TRAUMA_AROUSAL_THRESHOLD:
+        return HALF_LIFE_DAYS * (1 + arousal * 4)  # 0.85→4.4倍, 1.0→5倍
+    return HALF_LIFE_DAYS * (1 + arousal * 2)       # 通常: 0.3→1.6倍, 0.5→2倍
+
+
 def freshness(created_at_str, half_life=HALF_LIFE_DAYS):
     try:
         created = datetime.fromisoformat(created_at_str.replace('Z', '+00:00'))
@@ -455,6 +473,14 @@ def init_db():
             fired INTEGER NOT NULL DEFAULT 0,
             fire_count INTEGER NOT NULL DEFAULT 0
         );
+
+        CREATE TABLE IF NOT EXISTS procedures (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id INTEGER NOT NULL UNIQUE,
+            rule_text TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            FOREIGN KEY (memory_id) REFERENCES memories(id)
+        );
     """)
     # CHECK制約にprocedure/schemaを追加（既存DBのテーブルを再作成）
     try:
@@ -542,6 +568,18 @@ def reconsolidate(conn, memory_id):
     old_arousal = row["arousal"]
     access = row["access_count"]
 
+    # 外傷的記憶: 馴化しない。むしろ想起するたびに再刻印される
+    if old_arousal >= TRAUMA_AROUSAL_THRESHOLD:
+        drift = random.uniform(-0.02, RECONSOLIDATION_DRIFT)  # 下がりにくく上がりやすい
+        drift += 0.02  # 再刻印バイアス
+        new_arousal = max(0.0, min(1.0, old_arousal + drift))
+        new_importance = max(1, min(5, round(new_arousal * 4 + 1)))
+        conn.execute(
+            "UPDATE memories SET arousal = ?, importance = ? WHERE id = ?",
+            (new_arousal, new_importance, memory_id)
+        )
+        return abs(drift) > 0.02
+
     # 変動: ランダムなドリフト
     drift = random.uniform(-RECONSOLIDATION_DRIFT, RECONSOLIDATION_DRIFT)
 
@@ -589,11 +627,14 @@ def consolidate_memories(dry_run=False):
         conn.close()
         return
 
-    # 類似度が高いペアを見つける
+    # 類似度が高いペアを見つける（外傷的記憶は統合を拒否する——凍結）
     pairs = []
     for i, a in enumerate(rows):
         vec_a = bytes_to_vec(a["embedding"])
         for b in rows[i+1:]:
+            # どちらかが外傷的arousalならスキップ
+            if a["arousal"] >= TRAUMA_AROUSAL_THRESHOLD or b["arousal"] >= TRAUMA_AROUSAL_THRESHOLD:
+                continue
             vec_b = bytes_to_vec(b["embedding"])
             sim = cosine_similarity(vec_a, vec_b)
             if sim > CONSOLIDATION_THRESHOLD:
@@ -843,6 +884,160 @@ def build_schemas(dry_run=False):
             print(f"✓ スキーマ生成完了: {schema_count}件のスキーマを作成")
         else:
             print("新しいスキーマ候補はありません")
+
+
+# ============================================================
+# 6c. 手続き化 — 反復された記憶パターンを行動指針に昇格
+# ============================================================
+
+def proceduralize(dry_run=False):
+    """
+    手続き化: 十分に反復された記憶を行動指針（CLAUDE.md）に昇格させる。
+
+    脳の学習: エピソード記憶が反復されると手続き記憶になる。
+    自転車の乗り方を最初は意識的に覚え、やがて無意識にできるようになるのと同じ。
+    反復 → 強化 → 統合 → 手続き化。
+
+    条件:
+    - access_count >= PROCEDURALIZE_ACCESS_THRESHOLD
+    - リンク数 >= PROCEDURALIZE_LINK_THRESHOLD
+    - まだ手続き化されていない
+
+    出力:
+    - CLAUDE.mdの「学習された行動指針」セクションに追記
+    - proceduresテーブルに記録
+    """
+    conn = get_connection()
+
+    # proceduresテーブルがなければ作る
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS procedures (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id INTEGER NOT NULL UNIQUE,
+            rule_text TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            FOREIGN KEY (memory_id) REFERENCES memories(id)
+        )
+    """)
+
+    # 既に手続き化済みのID
+    existing = set(
+        row[0] for row in conn.execute("SELECT memory_id FROM procedures").fetchall()
+    )
+
+    # 候補: 高頻度想起 × 高リンク数
+    rows = conn.execute("""
+        SELECT m.id, m.content, m.keywords, m.category, m.access_count,
+               m.arousal, m.emotions, m.importance,
+               COUNT(l.id) as link_count
+        FROM memories m
+        LEFT JOIN links l ON l.source_id = m.id
+        WHERE m.forgotten = 0
+        GROUP BY m.id
+        HAVING m.access_count >= ? AND COUNT(l.id) >= ?
+        ORDER BY m.access_count * COUNT(l.id) DESC
+    """, (PROCEDURALIZE_ACCESS_THRESHOLD, PROCEDURALIZE_LINK_THRESHOLD)).fetchall()
+
+    candidates = [r for r in rows if r["id"] not in existing]
+
+    if not candidates:
+        print("手続き化の候補はありません")
+        conn.close()
+        return
+
+    if dry_run:
+        print("手続き化候補:")
+        for row in candidates:
+            print(f"  #{row['id']} ({row['access_count']}回想起, {row['link_count']}リンク)")
+            print(f"    {row['content'][:80]}")
+        print(f"\n候補: {len(candidates)}件")
+        conn.close()
+        return
+
+    # 手続き化実行
+    new_rules = []
+    for row in candidates:
+        content = row["content"]
+        # スキーマの場合はキーワードから行動指針を構成
+        if row["category"] == "schema":
+            keywords = json.loads(row["keywords"])
+            rule_text = f"[{', '.join(keywords[:6])}] — {content[:120]}"
+        else:
+            rule_text = content[:150]
+
+        conn.execute(
+            "INSERT OR IGNORE INTO procedures (memory_id, rule_text) VALUES (?, ?)",
+            (row["id"], rule_text)
+        )
+        new_rules.append((row["id"], row["access_count"], row["link_count"], rule_text))
+
+    conn.commit()
+    conn.close()
+
+    # CLAUDE.mdに書き込む
+    if new_rules:
+        _write_procedures_to_claude_md()
+        print(f"✓ 手続き化完了: {len(new_rules)}件の記憶が行動指針に昇格")
+        for mid, acc, lnk, rule in new_rules:
+            print(f"  #{mid} ({acc}回×{lnk}リンク) → {rule[:60]}")
+    else:
+        print("新しい手続きはありません")
+
+
+def _write_procedures_to_claude_md():
+    """proceduresテーブルの全ルールをCLAUDE.mdに同期する。"""
+    conn = get_connection()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS procedures (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id INTEGER NOT NULL UNIQUE,
+            rule_text TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            FOREIGN KEY (memory_id) REFERENCES memories(id)
+        )
+    """)
+    rules = conn.execute(
+        "SELECT p.memory_id, p.rule_text, p.created_at, m.access_count "
+        "FROM procedures p JOIN memories m ON p.memory_id = m.id "
+        "ORDER BY m.access_count DESC"
+    ).fetchall()
+    conn.close()
+
+    if not rules:
+        return
+
+    # セクションを構築
+    lines = [
+        "",
+        HEBB_MARKER,
+        "",
+        "<!-- 自動生成: memory.py proceduralize による。手動編集しない -->",
+        "<!-- 十分に反復された記憶パターンが行動指針として昇格したもの -->",
+        "",
+    ]
+    for rule in rules:
+        lines.append(f"- #{rule['memory_id']}: {rule['rule_text']}")
+    lines.append("")
+
+    section_text = "\n".join(lines)
+
+    # CLAUDE.mdを読んで、既存セクションがあれば置換、なければ末尾に追加
+    try:
+        with open(CLAUDE_MD_PATH, "r", encoding="utf-8") as f:
+            content = f.read()
+    except FileNotFoundError:
+        content = ""
+
+    if HEBB_MARKER in content:
+        # 既存セクションを置換（次の##セクションまで、またはファイル末尾まで）
+        import re as _re
+        pattern = _re.escape(HEBB_MARKER) + r".*?(?=\n## |\Z)"
+        content = _re.sub(pattern, section_text.strip(), content, flags=_re.DOTALL)
+    else:
+        content = content.rstrip() + "\n" + section_text
+
+    with open(CLAUDE_MD_PATH, "w", encoding="utf-8") as f:
+        f.write(content)
 
 
 # ============================================================
@@ -1274,8 +1469,9 @@ def search_memories(query, limit=10, use_like=False, fuzzy=False):
             # 情動ブースト
             emo_boost = 1.0 + row["arousal"] * 0.3
 
-            # 鮮度
-            fresh = freshness(row["created_at"])
+            # 鮮度（外傷的記憶は減衰が遅い）
+            hl = effective_half_life(row["arousal"])
+            fresh = freshness(row["created_at"], half_life=hl)
             fresh_factor = 0.7 + fresh * 0.3
 
             # 強化
@@ -1529,7 +1725,8 @@ def recall_important(limit=15):
     scored = []
     for row in rows:
         emo_boost = 1.0 + row["arousal"] * 0.5
-        fresh = freshness(row["created_at"])
+        hl = effective_half_life(row["arousal"])
+        fresh = freshness(row["created_at"], half_life=hl)
         access_boost = 1.0 + min(row["access_count"], 10) * 0.03
 
         # プライミング
@@ -1959,6 +2156,10 @@ def main():
     elif cmd == "schema":
         dry = "--dry-run" in sys.argv
         build_schemas(dry_run=dry)
+
+    elif cmd == "proceduralize":
+        dry = "--dry-run" in sys.argv
+        proceduralize(dry_run=dry)
 
     elif cmd == "stats":
         s = get_stats()

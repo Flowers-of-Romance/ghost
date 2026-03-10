@@ -46,6 +46,9 @@ memory.pyは脳の記憶メカニズムを再現する:
 | 状態依存記憶 | 気分と一致する情動の記憶が想起されやすい |
 | フラッシュバック | 忘却された記憶が確率的に蘇る |
 | 予期記憶 | トリガー語に反応して自動リマインド |
+| Hebbian learning | 反復された記憶が行動指針に昇格（CLAUDE.mdに自動書込み） |
+| 外傷的記憶 | arousalが極端に高い記憶は馴化・統合・減衰に抵抗する |
+| 情動重み付き減衰 | 情動が強い記憶ほど忘れにくい（半減期が変動） |
 
 ### 検索
 
@@ -107,6 +110,9 @@ python memory.py consolidate [--dry-run]
 python memory.py prospect add "トリガー" "アクション"
 python memory.py prospect list
 python memory.py prospect clear ID
+
+# 手続き化（Hebbian learning）
+python memory.py proceduralize [--dry-run]
 ```
 
 ### カテゴリ
@@ -144,7 +150,7 @@ python Extract.py --chat conversation.txt
 
 ### 夢 (dream.py)
 
-バロウズのカットアップ技法で記憶の断片をシャッフル表示する。睡眠中の脳内イメージ。
+バロウズのカットアップ技法で記憶の断片を表示する。arousalが高い記憶ほど夢に出やすく、リンクが強い記憶同士は一緒に出現する。外傷的記憶は反復する。
 
 ```bash
 python dream.py        # 20行の夢
