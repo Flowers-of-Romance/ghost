@@ -4,6 +4,7 @@
 
 ### Added
 - **Hebbian learning（手続き化）**: 反復された記憶（access_count × リンク数が閾値超え）がCLAUDE.mdの行動指針に自動昇格。`python memory.py proceduralize [--dry-run]`
+- **ひらめき連想**: insightでarousal >= 0.5の記憶が保存されると、連想チェーンが自動で走って関連記憶を提案する
 - **シナプスホメオスタシス（Tononi SHY）**: replay時に全リンクのstrengthを0.9倍。閾値以下は刈り込み。外傷的記憶のリンクは免除。リンク数が自然に平衡に達する
 - **外傷的記憶**: arousal >= 0.85 の記憶は通常の処理パイプラインに抵抗する
   - 再固定化で馴化しない（想起のたびに再刻印）
