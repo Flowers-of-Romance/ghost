@@ -11,6 +11,7 @@ ghost/
 ├── dream.py            # バロウズ式カットアップ夢 — 睡眠中の脳内イメージ
 ├── interpret_dream.py  # 夢の解釈 — 断片の出典・情動分析
 ├── autobiography.py    # 自伝的ナラティブ生成 — エピソード記憶の物語化
+├── memory_server.py    # embeddingモデル常駐サーバー — 高速化用
 ├── CLAUDE.md           # Claude Code統合ルール
 └── memory.db           # SQLiteデータベース（init後に生成）
 ```
