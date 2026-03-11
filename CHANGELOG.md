@@ -1,5 +1,23 @@
 # Changelog
 
+## [v4] - 2026-03-11
+
+### Added
+- **P2P同期**: 複数端末間で記憶を同期。各端末が独立した海馬として動作し、接続時に差分を交換する
+  - `sync push <host:port>` — ローカルの変更をリモートに送信
+  - `sync pull <host:port>` — リモートの変更を取得してマージ
+  - `sync serve` — 同期サーバーを起動
+  - `sync status` — 接続確認と同期履歴
+- **UUID**: 全記憶・リンクにUUIDを付与。端末間でIDが衝突しない
+- **updated_at**: 全テーブルに更新タイムスタンプ。SQLiteトリガーで自動更新。差分同期の基盤
+- **node_id**: 端末識別用UUID
+- **memory_sync_server.py**: 同期専用HTTPサーバー（port 7235）
+- **俯瞰トリガー**: コンテキスト疲労を感じたらrecall --voicesを実行する指示をCLAUDE.mdに追加
+
+### Changed
+- **衝突解決**: access_countは大きいほう、last_accessedは新しいほう、content/emotionsはupdated_atが新しいほうを採用
+- **proceduralize**: 書き込み先をCLAUDE.md → LEARNED.mdに分離。fact/schemaカテゴリを除外
+
 ## [v3.3] - 2026-03-11
 
 ### Changed

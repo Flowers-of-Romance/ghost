@@ -40,6 +40,11 @@ memory.py - 脳に近い記憶システム
   python memory.py prospect clear ID                 # 予期記憶を完了
   python memory.py export [filename]                 # 記憶をJSONファイルにエクスポート
   python memory.py import filename                   # JSONファイルから記憶をインポート
+  python memory.py sync status <host:port>           # 同期先の接続確認
+  python memory.py sync push <host:port>             # ローカル→リモートに同期
+  python memory.py sync pull <host:port>             # リモート→ローカルに同期
+  python memory.py sync serve [--port N]             # 同期サーバーを起動
+  python memory.py sync node-id                      # この端末のIDを表示
 """
 
 import sqlite3
@@ -51,6 +56,7 @@ import re
 import math
 import io
 import random
+import uuid as _uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -544,6 +550,122 @@ def init_db():
         conn.execute("ALTER TABLE memories ADD COLUMN spatial_context TEXT DEFAULT NULL")
     except sqlite3.OperationalError:
         pass  # already exists
+
+    # === P2P同期用カラム ===
+    # uuid: 端末間で記憶を一意に識別
+    try:
+        conn.execute("ALTER TABLE memories ADD COLUMN uuid TEXT")
+    except sqlite3.OperationalError:
+        pass
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_uuid ON memories(uuid)")
+
+    # 既存レコードにUUID付与
+    rows_no_uuid = conn.execute("SELECT id FROM memories WHERE uuid IS NULL").fetchall()
+    for row in rows_no_uuid:
+        conn.execute("UPDATE memories SET uuid = ? WHERE id = ?",
+                     (str(_uuid.uuid4()), row[0]))
+
+    # updated_at: 同期の差分検出用
+    try:
+        conn.execute("ALTER TABLE memories ADD COLUMN updated_at TEXT")
+    except sqlite3.OperationalError:
+        pass
+    # 既存レコードのupdated_atをcreated_atで埋める
+    conn.execute("UPDATE memories SET updated_at = created_at WHERE updated_at IS NULL")
+
+    # linksにuuidペアとupdated_at
+    try:
+        conn.execute("ALTER TABLE links ADD COLUMN source_uuid TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE links ADD COLUMN target_uuid TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE links ADD COLUMN updated_at TEXT")
+    except sqlite3.OperationalError:
+        pass
+    # 既存linksのuuidを埋める
+    conn.execute("""
+        UPDATE links SET
+            source_uuid = (SELECT uuid FROM memories WHERE id = links.source_id),
+            target_uuid = (SELECT uuid FROM memories WHERE id = links.target_id),
+            updated_at = COALESCE(links.updated_at, links.created_at)
+        WHERE source_uuid IS NULL OR target_uuid IS NULL OR updated_at IS NULL
+    """)
+
+    # prospectiveにuuid
+    try:
+        conn.execute("ALTER TABLE prospective ADD COLUMN uuid TEXT")
+    except sqlite3.OperationalError:
+        pass
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_prospective_uuid ON prospective(uuid)")
+    rows_no_uuid = conn.execute("SELECT id FROM prospective WHERE uuid IS NULL").fetchall()
+    for row in rows_no_uuid:
+        conn.execute("UPDATE prospective SET uuid = ? WHERE id = ?",
+                     (str(_uuid.uuid4()), row[0]))
+
+    # proceduresにuuidとmemory_uuid
+    try:
+        conn.execute("ALTER TABLE procedures ADD COLUMN uuid TEXT")
+    except sqlite3.OperationalError:
+        pass
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_procedures_uuid ON procedures(uuid)")
+    try:
+        conn.execute("ALTER TABLE procedures ADD COLUMN memory_uuid TEXT")
+    except sqlite3.OperationalError:
+        pass
+    rows_no_uuid = conn.execute("SELECT id, memory_id FROM procedures WHERE uuid IS NULL").fetchall()
+    for row in rows_no_uuid:
+        mem_uuid = conn.execute("SELECT uuid FROM memories WHERE id = ?", (row[1],)).fetchone()
+        conn.execute("UPDATE procedures SET uuid = ?, memory_uuid = ? WHERE id = ?",
+                     (str(_uuid.uuid4()), mem_uuid[0] if mem_uuid else None, row[0]))
+
+    # updated_atを自動更新するトリガー
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS trg_memories_updated_at
+        AFTER UPDATE ON memories
+        FOR EACH ROW
+        WHEN NEW.updated_at = OLD.updated_at OR NEW.updated_at IS NULL
+        BEGIN
+            UPDATE memories SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            WHERE id = NEW.id;
+        END
+    """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS trg_links_updated_at
+        AFTER UPDATE ON links
+        FOR EACH ROW
+        WHEN NEW.updated_at = OLD.updated_at OR NEW.updated_at IS NULL
+        BEGIN
+            UPDATE links SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            WHERE id = NEW.id;
+        END
+    """)
+
+    # sync_meta: 同期履歴
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sync_meta (
+            peer_id TEXT PRIMARY KEY,
+            peer_url TEXT NOT NULL,
+            last_sync_at TEXT,
+            last_sync_direction TEXT
+        )
+    """)
+
+    # node_id: この端末のID（初回生成）
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS node_info (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
+    existing_node = conn.execute("SELECT value FROM node_info WHERE key = 'node_id'").fetchone()
+    if not existing_node:
+        conn.execute("INSERT INTO node_info (key, value) VALUES ('node_id', ?)",
+                     (str(_uuid.uuid4()),))
+
     conn.commit()
     conn.close()
     print(f"✓ memory.db を初期化しました: {DB_PATH}")
@@ -1339,15 +1461,17 @@ def add_memory(content, category="fact", source=None):
         "location": _detect_location()
     })
 
+    now_utc = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    mem_uuid = str(_uuid.uuid4())
     conn.execute(
         """INSERT INTO memories
            (content, category, importance, emotions, arousal, keywords,
             source_conversation, embedding, context_expires_at, temporal_context,
-            spatial_context)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            spatial_context, uuid, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (content, category, importance,
          json.dumps(emotions), arousal, json.dumps(keywords, ensure_ascii=False),
-         source, blob, context_expires, temporal_ctx, spatial_ctx)
+         source, blob, context_expires, temporal_ctx, spatial_ctx, mem_uuid, now_utc)
     )
     conn.commit()
     new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -1364,13 +1488,15 @@ def add_memory(content, category="fact", source=None):
             sim = cosine_similarity(vec, other_vec)
             if sim > LINK_THRESHOLD:
                 try:
+                    other_uuid = conn.execute("SELECT uuid FROM memories WHERE id = ?", (row["id"],)).fetchone()
+                    other_uuid = other_uuid[0] if other_uuid else None
                     conn.execute(
-                        "INSERT OR IGNORE INTO links (source_id, target_id, strength) VALUES (?, ?, ?)",
-                        (new_id, row["id"], sim)
+                        "INSERT OR IGNORE INTO links (source_id, target_id, strength, source_uuid, target_uuid, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (new_id, row["id"], sim, mem_uuid, other_uuid, now_utc)
                     )
                     conn.execute(
-                        "INSERT OR IGNORE INTO links (source_id, target_id, strength) VALUES (?, ?, ?)",
-                        (row["id"], new_id, sim)
+                        "INSERT OR IGNORE INTO links (source_id, target_id, strength, source_uuid, target_uuid, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (row["id"], new_id, sim, other_uuid, mem_uuid, now_utc)
                     )
                     link_count += 1
                 except sqlite3.IntegrityError:
@@ -2652,6 +2778,213 @@ def export_memories(filename=None):
     print(f"✓ {len(memories)}件の記憶をエクスポート: {filename}")
 
 
+# ============================================================
+# 7. P2P同期
+# ============================================================
+
+def _get_node_id():
+    """この端末のnode_idを返す。"""
+    conn = get_connection()
+    row = conn.execute("SELECT value FROM node_info WHERE key = 'node_id'").fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def sync_export(since=None):
+    """同期用: since以降に更新された記憶・リンクをdictで返す。sinceがNoneなら全件。"""
+    import base64
+    conn = get_connection()
+
+    if since:
+        mem_rows = conn.execute(
+            "SELECT * FROM memories WHERE updated_at > ? AND forgotten = 0",
+            (since,)
+        ).fetchall()
+        link_rows = conn.execute(
+            "SELECT * FROM links WHERE updated_at > ?", (since,)
+        ).fetchall()
+        # 忘却された記憶も同期（相手側でも忘却するため）
+        forgotten_rows = conn.execute(
+            "SELECT uuid FROM memories WHERE updated_at > ? AND forgotten = 1",
+            (since,)
+        ).fetchall()
+    else:
+        mem_rows = conn.execute(
+            "SELECT * FROM memories WHERE forgotten = 0"
+        ).fetchall()
+        link_rows = conn.execute("SELECT * FROM links").fetchall()
+        forgotten_rows = conn.execute(
+            "SELECT uuid FROM memories WHERE forgotten = 1"
+        ).fetchall()
+
+    memories = []
+    for row in mem_rows:
+        mem = {
+            "uuid": row["uuid"],
+            "content": row["content"],
+            "category": row["category"],
+            "importance": row["importance"],
+            "emotions": row["emotions"],
+            "arousal": row["arousal"],
+            "keywords": row["keywords"],
+            "created_at": row["created_at"],
+            "last_accessed": row["last_accessed"],
+            "access_count": row["access_count"],
+            "source_conversation": row["source_conversation"],
+            "merged_from": row["merged_from"],
+            "context_expires_at": row["context_expires_at"],
+            "temporal_context": row["temporal_context"],
+            "spatial_context": row["spatial_context"],
+            "updated_at": row["updated_at"],
+        }
+        # embeddingはbase64でエンコード
+        if row["embedding"]:
+            mem["embedding_b64"] = base64.b64encode(row["embedding"]).decode("ascii")
+        memories.append(mem)
+
+    links = []
+    for lr in link_rows:
+        links.append({
+            "source_uuid": lr["source_uuid"],
+            "target_uuid": lr["target_uuid"],
+            "strength": lr["strength"],
+            "link_type": lr["link_type"],
+            "created_at": lr["created_at"],
+            "updated_at": lr["updated_at"],
+        })
+
+    forgotten_uuids = [r["uuid"] for r in forgotten_rows]
+
+    node_id = _get_node_id()
+    conn.close()
+
+    return {
+        "node_id": node_id,
+        "since": since,
+        "memories": memories,
+        "links": links,
+        "forgotten_uuids": forgotten_uuids,
+    }
+
+
+def sync_import(data):
+    """同期用: 受信データをマージする。衝突解決込み。"""
+    import base64
+    conn = get_connection()
+
+    stats = {"new": 0, "updated": 0, "links_new": 0, "links_updated": 0, "forgotten": 0}
+
+    # 1. 記憶のマージ
+    for mem in data.get("memories", []):
+        existing = conn.execute(
+            "SELECT id, access_count, last_accessed, updated_at, importance, arousal FROM memories WHERE uuid = ?",
+            (mem["uuid"],)
+        ).fetchone()
+
+        if existing is None:
+            # 新規: INSERT
+            blob = None
+            if mem.get("embedding_b64"):
+                blob = base64.b64decode(mem["embedding_b64"])
+            conn.execute(
+                """INSERT INTO memories
+                   (uuid, content, category, importance, emotions, arousal, keywords,
+                    created_at, last_accessed, access_count, forgotten,
+                    source_conversation, embedding, merged_from,
+                    context_expires_at, temporal_context, spatial_context, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)""",
+                (mem["uuid"], mem["content"], mem["category"], mem["importance"],
+                 mem["emotions"], mem["arousal"], mem["keywords"],
+                 mem["created_at"], mem["last_accessed"], mem["access_count"],
+                 mem["source_conversation"], blob, mem["merged_from"],
+                 mem["context_expires_at"], mem["temporal_context"],
+                 mem["spatial_context"], mem["updated_at"])
+            )
+            stats["new"] += 1
+        else:
+            # 既存: マージ
+            # access_count: 合算はしない。大きいほうを採用（同じ記憶を両端末で触った場合）
+            new_access = max(existing["access_count"], mem["access_count"])
+            # last_accessed: 新しいほう
+            new_last = max(existing["last_accessed"] or "", mem["last_accessed"] or "") or None
+            # content/emotions/arousal/importance: updated_atが新しいほう
+            remote_newer = (mem["updated_at"] or "") > (existing["updated_at"] or "")
+            if remote_newer:
+                blob = None
+                if mem.get("embedding_b64"):
+                    blob = base64.b64decode(mem["embedding_b64"])
+                conn.execute(
+                    """UPDATE memories SET
+                       content = ?, importance = ?, emotions = ?, arousal = ?,
+                       keywords = ?, access_count = ?, last_accessed = ?,
+                       source_conversation = ?, embedding = COALESCE(?, embedding),
+                       temporal_context = ?, spatial_context = ?, updated_at = ?
+                       WHERE uuid = ?""",
+                    (mem["content"], mem["importance"], mem["emotions"], mem["arousal"],
+                     mem["keywords"], new_access, new_last,
+                     mem["source_conversation"], blob,
+                     mem["temporal_context"], mem["spatial_context"],
+                     mem["updated_at"], mem["uuid"])
+                )
+            else:
+                # ローカルが新しい場合もaccess_countとlast_accessedだけ更新
+                conn.execute(
+                    "UPDATE memories SET access_count = ?, last_accessed = ? WHERE uuid = ?",
+                    (new_access, new_last, mem["uuid"])
+                )
+            stats["updated"] += 1
+
+    # 2. 忘却の同期
+    for fuuid in data.get("forgotten_uuids", []):
+        result = conn.execute(
+            "UPDATE memories SET forgotten = 1 WHERE uuid = ? AND forgotten = 0",
+            (fuuid,)
+        )
+        if result.rowcount > 0:
+            stats["forgotten"] += 1
+
+    # 3. リンクのマージ
+    # まずuuid→local idのマップを作る
+    uuid_to_id = {}
+    for row in conn.execute("SELECT id, uuid FROM memories WHERE uuid IS NOT NULL").fetchall():
+        uuid_to_id[row["uuid"]] = row["id"]
+
+    for link in data.get("links", []):
+        src_id = uuid_to_id.get(link["source_uuid"])
+        tgt_id = uuid_to_id.get(link["target_uuid"])
+        if src_id is None or tgt_id is None:
+            continue  # 片方の記憶がない（まだ同期されてない）
+
+        existing_link = conn.execute(
+            "SELECT id, strength FROM links WHERE source_id = ? AND target_id = ?",
+            (src_id, tgt_id)
+        ).fetchone()
+
+        if existing_link is None:
+            conn.execute(
+                """INSERT INTO links (source_id, target_id, strength, link_type,
+                   source_uuid, target_uuid, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (src_id, tgt_id, link["strength"], link["link_type"],
+                 link["source_uuid"], link["target_uuid"],
+                 link["created_at"], link["updated_at"])
+            )
+            stats["links_new"] += 1
+        else:
+            # strengthは大きいほうを採用
+            new_strength = max(existing_link["strength"], link["strength"])
+            if new_strength != existing_link["strength"]:
+                conn.execute(
+                    "UPDATE links SET strength = ? WHERE id = ?",
+                    (new_strength, existing_link["id"])
+                )
+                stats["links_updated"] += 1
+
+    conn.commit()
+    conn.close()
+    return stats
+
+
 def import_memories(filename):
     """JSONファイルから記憶をインポートする。重複はスキップ。"""
     with open(filename, "r", encoding="utf-8") as f:
@@ -2993,6 +3326,163 @@ def main():
             print("使い方: python memory.py import filename")
             return
         import_memories(sys.argv[2])
+
+    elif cmd == "sync":
+        if len(sys.argv) < 3:
+            print("使い方:")
+            print("  python memory.py sync status <host:port>  # 接続確認")
+            print("  python memory.py sync push <host:port>    # ローカル→リモート")
+            print("  python memory.py sync pull <host:port>    # リモート→ローカル")
+            print("  python memory.py sync serve [--port N]    # 同期サーバー起動")
+            print("  python memory.py sync node-id             # この端末のID表示")
+            return
+
+        subcmd = sys.argv[2]
+        token = os.environ.get("MEMORY_SYNC_TOKEN", "")
+
+        if subcmd == "node-id":
+            print(f"node_id: {_get_node_id()}")
+
+        elif subcmd == "serve":
+            # サーバー起動（memory_sync_server.pyに委譲）
+            import subprocess
+            args = [sys.executable, str(Path(__file__).parent / "memory_sync_server.py")]
+            args.extend(sys.argv[3:])  # --port等を転送
+            subprocess.run(args)
+
+        elif subcmd in ("status", "push", "pull"):
+            if len(sys.argv) < 4:
+                print(f"使い方: python memory.py sync {subcmd} <host:port>")
+                return
+            import urllib.request
+            import urllib.error
+
+            host = sys.argv[3]
+            if not host.startswith("http"):
+                host = f"http://{host}"
+            headers = {}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+
+            if subcmd == "status":
+                try:
+                    req = urllib.request.Request(f"{host}/sync/node-id", headers=headers)
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        data = json.loads(resp.read())
+                    print(f"✓ 接続OK")
+                    print(f"  相手のnode_id: {data['node_id']}")
+                    print(f"  自分のnode_id: {_get_node_id()}")
+                    # 同期履歴
+                    conn = get_connection()
+                    meta = conn.execute("SELECT * FROM sync_meta WHERE peer_id = ?",
+                                        (data['node_id'],)).fetchone()
+                    if meta:
+                        print(f"  前回同期: {meta['last_sync_at']} ({meta['last_sync_direction']})")
+                    else:
+                        print(f"  初回同期")
+                    conn.close()
+                except urllib.error.URLError as e:
+                    print(f"✗ 接続失敗: {e}")
+
+            elif subcmd == "push":
+                # ローカルの変更を相手に送信
+                conn = get_connection()
+                # 相手のnode_idを取得
+                try:
+                    req = urllib.request.Request(f"{host}/sync/node-id", headers=headers)
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        peer_data = json.loads(resp.read())
+                    peer_id = peer_data["node_id"]
+                except urllib.error.URLError as e:
+                    print(f"✗ 接続失敗: {e}")
+                    conn.close()
+                    return
+
+                # 前回同期時刻
+                meta = conn.execute("SELECT last_sync_at FROM sync_meta WHERE peer_id = ?",
+                                    (peer_id,)).fetchone()
+                since = meta["last_sync_at"] if meta else None
+                conn.close()
+
+                # エクスポート
+                data = sync_export(since=since)
+                payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                print(f"送信: {len(data['memories'])}件の記憶, {len(data['links'])}件のリンク")
+
+                # 送信
+                try:
+                    req = urllib.request.Request(
+                        f"{host}/sync/push",
+                        data=payload,
+                        headers={**headers, "Content-Type": "application/json; charset=utf-8"},
+                        method="POST"
+                    )
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        result = json.loads(resp.read())
+                    s = result["stats"]
+                    print(f"✓ push完了: 新規{s['new']}件, 更新{s['updated']}件, "
+                          f"リンク新規{s['links_new']}件, 忘却{s['forgotten']}件")
+                except urllib.error.URLError as e:
+                    print(f"✗ push失敗: {e}")
+                    return
+
+                # 同期履歴を更新
+                now_utc = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                conn = get_connection()
+                conn.execute(
+                    """INSERT OR REPLACE INTO sync_meta (peer_id, peer_url, last_sync_at, last_sync_direction)
+                       VALUES (?, ?, ?, 'push')""",
+                    (peer_id, host, now_utc)
+                )
+                conn.commit()
+                conn.close()
+
+            elif subcmd == "pull":
+                # 相手の変更を取得してマージ
+                try:
+                    req = urllib.request.Request(f"{host}/sync/node-id", headers=headers)
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        peer_data = json.loads(resp.read())
+                    peer_id = peer_data["node_id"]
+                except urllib.error.URLError as e:
+                    print(f"✗ 接続失敗: {e}")
+                    return
+
+                conn = get_connection()
+                meta = conn.execute("SELECT last_sync_at FROM sync_meta WHERE peer_id = ?",
+                                    (peer_id,)).fetchone()
+                since = meta["last_sync_at"] if meta else None
+                conn.close()
+
+                # 取得
+                url = f"{host}/sync/changes"
+                if since:
+                    url += f"?since={since}"
+                try:
+                    req = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        data = json.loads(resp.read())
+                except urllib.error.URLError as e:
+                    print(f"✗ pull失敗: {e}")
+                    return
+
+                print(f"受信: {len(data['memories'])}件の記憶, {len(data['links'])}件のリンク")
+
+                # マージ
+                stats = sync_import(data)
+                print(f"✓ pull完了: 新規{stats['new']}件, 更新{stats['updated']}件, "
+                      f"リンク新規{stats['links_new']}件, 忘却{stats['forgotten']}件")
+
+                # 同期履歴を更新
+                now_utc = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                conn = get_connection()
+                conn.execute(
+                    """INSERT OR REPLACE INTO sync_meta (peer_id, peer_url, last_sync_at, last_sync_direction)
+                       VALUES (?, ?, ?, 'pull')""",
+                    (peer_id, host, now_utc)
+                )
+                conn.commit()
+                conn.close()
 
     elif cmd == "memo":
         if len(sys.argv) < 3:
