@@ -89,6 +89,9 @@ RECONSOLIDATION_DRIFT = 0.15  # arousalが最大±15%変動
 FLASHBACK_BASE_PROB = 0.15     # 基礎確率
 FLASHBACK_SIM_THRESHOLD = 0.75  # この類似度を超えたら発火判定に入る
 
+# 場所細胞: 同じ場所で作られた記憶は想起されやすい
+SPATIAL_BOOST = 1.08  # 場所一致時のブースト倍率
+
 # 手続き化: 反復が閾値を超えた記憶を行動指針に昇格
 PROCEDURALIZE_ACCESS_THRESHOLD = 20   # 最低想起回数
 PROCEDURALIZE_LINK_THRESHOLD = 15     # 最低リンク数
@@ -507,12 +510,13 @@ def init_db():
                     embedding BLOB,
                     merged_from TEXT DEFAULT NULL,
                     context_expires_at TEXT DEFAULT NULL,
-                    temporal_context TEXT DEFAULT NULL
+                    temporal_context TEXT DEFAULT NULL,
+                    spatial_context TEXT DEFAULT NULL
                 );
                 INSERT INTO memories SELECT id, content, category, importance, emotions, arousal,
                     keywords, created_at, last_accessed, access_count, forgotten,
                     source_conversation, embedding, merged_from,
-                    NULL, NULL FROM memories_old;
+                    NULL, NULL, NULL FROM memories_old;
                 DROP TABLE memories_old;
                 CREATE INDEX IF NOT EXISTS idx_memories_forgotten ON memories(forgotten);
             """)
@@ -533,6 +537,11 @@ def init_db():
     # temporal_context カラムを追加（既存DBの場合）
     try:
         conn.execute("ALTER TABLE memories ADD COLUMN temporal_context TEXT DEFAULT NULL")
+    except sqlite3.OperationalError:
+        pass  # already exists
+    # spatial_context カラムを追加（既存DBの場合）
+    try:
+        conn.execute("ALTER TABLE memories ADD COLUMN spatial_context TEXT DEFAULT NULL")
     except sqlite3.OperationalError:
         pass  # already exists
     conn.commit()
@@ -1087,6 +1096,86 @@ def interfere(conn, new_content, new_vec):
 
 
 # ============================================================
+# 7.5 予測符号化 — 予測誤差だけが情報を持つ
+# ============================================================
+
+def prediction_error(conn, new_vec):
+    """
+    予測符号化 (predictive coding):
+    脳は常に次の入力を予測しており、予測と一致した情報は捨てる。
+    予測を裏切った分（予測誤差）だけが学習シグナルになる。
+
+    サイバネティクス的に言えば:
+    既存記憶 = 内部モデル（世界の予測）
+    新しい入力 = 感覚信号
+    予測誤差 = 1 - max(既存記憶との類似度)
+
+    誤差が大きい → 内部モデルが予測できなかった → 重要な情報
+    誤差が小さい → すでに知っている → 冗長
+
+    Returns: (prediction_error: float, most_similar_id: int or None)
+    """
+    if new_vec is None:
+        return 0.5, None  # embeddingなしなら中程度の誤差を仮定
+
+    rows = conn.execute(
+        "SELECT id, embedding FROM memories WHERE forgotten = 0 AND embedding IS NOT NULL"
+    ).fetchall()
+
+    if not rows:
+        return 1.0, None  # 記憶がない = 全てが新しい
+
+    max_sim = 0.0
+    most_similar_id = None
+    for row in rows:
+        old_vec = bytes_to_vec(row["embedding"])
+        sim = cosine_similarity(new_vec, old_vec)
+        if sim > max_sim:
+            max_sim = sim
+            most_similar_id = row["id"]
+
+    error = 1.0 - max_sim
+    return error, most_similar_id
+
+
+def apply_prediction_error(importance, arousal, error):
+    """
+    予測誤差を重要度とarousalに反映する。
+
+    多言語embeddingではベースライン類似度が高い（中央値≈0.84）ため、
+    生の誤差ではなく正規化した誤差を使う:
+      normalized = (error - baseline_error) / (max_error - baseline_error)
+    baseline_error = 0.15 (類似度0.85相当、中央値付近)
+    max_error = 0.25 (類似度0.75相当、ほぼ最大距離)
+
+    干渉忘却（似た記憶を弱める）と相補的:
+    - 干渉忘却: 似すぎた古い記憶を弱める（冗長性の排除）
+    - 予測符号化: 似てない新しい記憶を強める（新規性の強化）
+    → 2つ合わせて、記憶システムが自動的に情報量を最大化する
+      （サイバネティクス的フィードバックループ）
+    """
+    # 正規化: ベースラインからの逸脱度を0-1にスケール
+    # multilingual-e5-smallは日本語テキスト間の類似度が0.76-1.0に圧縮されるため、
+    # 微小な差を増幅する必要がある
+    baseline = 0.10  # sim≈0.90: 明らかに関連するトピック
+    ceiling = 0.18   # sim≈0.82: 25パーセンタイル、ほぼ無関係
+    normalized = max(0.0, (error - baseline)) / (ceiling - baseline)
+    normalized = min(1.0, normalized)
+
+    if normalized > 0.7:
+        # 高い予測誤差: 内部モデルが予測できなかった情報
+        importance = min(5, importance + 2)
+        arousal = min(1.0, arousal + 0.2)
+    elif normalized > 0.3:
+        # 中程度の予測誤差: やや新しい
+        importance = min(5, importance + 1)
+        arousal = min(1.0, arousal + 0.1)
+    # normalized <= 0.3: 予測通り。補正なし。
+
+    return importance, arousal
+
+
+# ============================================================
 # 8. プライミング — 最近の想起が関連記憶を活性化
 # ============================================================
 
@@ -1239,6 +1328,10 @@ def add_memory(content, category="fact", source=None):
     # 予期記憶チェック
     check_prospective(conn, content)
 
+    # 予測符号化 — 予測誤差が大きいほど重要
+    pred_error, similar_id = prediction_error(conn, vec)
+    importance, arousal = apply_prediction_error(importance, arousal, pred_error)
+
     # 干渉忘却 — 新しい記憶が類似する古い記憶を弱める
     interference_count = interfere(conn, content, vec)
 
@@ -1248,21 +1341,27 @@ def add_memory(content, category="fact", source=None):
         expires = datetime.now(timezone.utc) + timedelta(days=30)
         context_expires = expires.strftime('%Y-%m-%dT%H:%M:%SZ')
 
-    # 時間的文脈を記録（place/time cells）
+    # 時間的文脈を記録（time cells）
     now_local = datetime.now()
     temporal_ctx = json.dumps({
         "hour": now_local.hour,
         "weekday": now_local.strftime("%a")
     })
 
+    # 空間的文脈を記録（place cells）
+    spatial_ctx = json.dumps({
+        "location": _detect_location()
+    })
+
     conn.execute(
         """INSERT INTO memories
            (content, category, importance, emotions, arousal, keywords,
-            source_conversation, embedding, context_expires_at, temporal_context)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            source_conversation, embedding, context_expires_at, temporal_context,
+            spatial_context)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (content, category, importance,
          json.dumps(emotions), arousal, json.dumps(keywords, ensure_ascii=False),
-         source, blob, context_expires, temporal_ctx)
+         source, blob, context_expires, temporal_ctx, spatial_ctx)
     )
     conn.commit()
     new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -1298,10 +1397,19 @@ def add_memory(content, category="fact", source=None):
     kw_str = ", ".join(keywords[:5])
     link_str = f", {link_count}件リンク" if link_count else ""
     intf_str = f", {interference_count}件干渉" if interference_count else ""
+    # 予測誤差の正規化（表示用）
+    _pe_baseline, _pe_ceiling = 0.10, 0.18
+    pred_normalized = min(1.0, max(0.0, (pred_error - _pe_baseline) / (_pe_ceiling - _pe_baseline)))
+    if pred_normalized > 0.3:
+        pred_str = f", 予測誤差:{pred_normalized:.0%}"
+    elif similar_id:
+        pred_str = f", 予測通り(≈#{similar_id})"
+    else:
+        pred_str = ""
     print(f"✓ 記憶 #{new_id} を保存")
     print(f"  情動: {emo_str} (覚醒度:{arousal:.2f}) → 重要度:{importance}")
     print(f"  断片: [{kw_str}]")
-    print(f"  カテゴリ: {category}{link_str}{intf_str}")
+    print(f"  カテゴリ: {category}{link_str}{intf_str}{pred_str}")
 
     # ひらめき連想: arousalが高いinsightは連想を自動で走らせて提案する
     if arousal >= 0.5 and "insight" in emotions:
@@ -1420,6 +1528,52 @@ def index_memos():
         print("新しいファイルはありません")
 
 
+import socket as _socket
+
+def _detect_location():
+    """場所の自動検出。SSH接続元 → ホスト名 → 'local' の順で判定。
+
+    脳の場所細胞(place cells)に対応。
+    海馬の場所細胞は「どこにいるか」をエンコードし、
+    同じ場所に戻ると同じ記憶が想起されやすくなる。
+    """
+    # SSH接続: 接続元IPから場所を推定
+    ssh_conn = os.environ.get("SSH_CONNECTION", "")
+    if ssh_conn:
+        parts = ssh_conn.split()
+        client_ip = parts[0] if parts else "unknown"
+        return f"ssh:{client_ip}"
+
+    ssh_client = os.environ.get("SSH_CLIENT", "")
+    if ssh_client:
+        parts = ssh_client.split()
+        client_ip = parts[0] if parts else "unknown"
+        return f"ssh:{client_ip}"
+
+    # ローカル: ホスト名で場所を区別
+    try:
+        hostname = _socket.gethostname()
+        return f"local:{hostname}"
+    except Exception:
+        return "local"
+
+
+def _spatial_boost(row):
+    """記憶が現在と同じ場所で作られていたら小さなブースト。
+    場所依存記憶（context-dependent memory）の実装。"""
+    sc = row["spatial_context"] if "spatial_context" in row.keys() else None
+    if not sc:
+        return 1.0
+    try:
+        ctx = json.loads(sc)
+        current_location = _detect_location()
+        if ctx.get("location") == current_location:
+            return SPATIAL_BOOST
+    except (json.JSONDecodeError, KeyError, TypeError):
+        pass
+    return 1.0
+
+
 def _time_bucket(hour):
     """時間帯バケット: morning(5-11), afternoon(12-17), evening(18-22), night(23-4)"""
     if 5 <= hour <= 11:
@@ -1493,11 +1647,14 @@ def search_memories(query, limit=10, use_like=False, fuzzy=False):
             # 時間帯ブースト
             temporal = _temporal_boost(row)
 
+            # 場所ブースト（場所細胞）
+            spatial = _spatial_boost(row)
+
             # 気分一致性ブースト
             mood_boost = get_mood_congruence_boost(row)
 
             # 総合スコア
-            score = sim * emo_boost * fresh_factor * access_boost * priming * temporal * mood_boost
+            score = sim * emo_boost * fresh_factor * access_boost * priming * temporal * spatial * mood_boost
             scored.append((row, score, sim))
 
         scored.sort(key=lambda x: x[1], reverse=True)
@@ -1776,10 +1933,13 @@ def recall_important(limit=15):
         # プライミング
         priming = get_priming_boost(conn, row["id"])
 
+        # 場所ブースト（場所細胞）
+        spatial = _spatial_boost(row)
+
         # 気分一致性ブースト
         mood_boost = get_mood_congruence_boost(row)
 
-        score = emo_boost * (0.5 + fresh * 0.5) * access_boost * priming * mood_boost
+        score = emo_boost * (0.5 + fresh * 0.5) * access_boost * priming * spatial * mood_boost
         scored.append((row, score))
 
     scored.sort(key=lambda x: x[1], reverse=True)
@@ -1894,6 +2054,17 @@ def get_stats():
     s["merged"] = conn.execute(
         "SELECT COUNT(*) FROM memories WHERE merged_from IS NOT NULL AND forgotten = 0"
     ).fetchone()[0]
+    # 場所別の記憶数
+    s["by_location"] = {}
+    loc_rows = conn.execute(
+        "SELECT spatial_context FROM memories WHERE forgotten = 0 AND spatial_context IS NOT NULL"
+    ).fetchall()
+    for row in loc_rows:
+        try:
+            loc = json.loads(row["spatial_context"]).get("location", "unknown")
+            s["by_location"][loc] = s["by_location"].get(loc, 0) + 1
+        except (json.JSONDecodeError, TypeError):
+            pass
     conn.close()
     return s
 
@@ -1970,6 +2141,15 @@ def format_memory_detail(row):
         f"  鮮度: {freshness(row['created_at']):.0%} | 参照: {row['access_count']}回",
         f"  記録: {row['created_at'][:10]}",
     ]
+    # 場所の表示
+    sc = row["spatial_context"] if "spatial_context" in row.keys() else None
+    if sc:
+        try:
+            loc = json.loads(sc).get("location", "")
+            if loc:
+                lines.append(f"  場所: {loc}")
+        except (json.JSONDecodeError, TypeError):
+            pass
     if merged:
         lines.append(f"  統合元: #{', #'.join(str(m) for m in merged)}")
     if row["source_conversation"]:
@@ -2002,6 +2182,7 @@ def export_memories(filename=None):
             "access_count": row["access_count"],
             "source_conversation": row["source_conversation"],
             "temporal_context": json.loads(row["temporal_context"]) if row["temporal_context"] else None,
+            "spatial_context": json.loads(row["spatial_context"]) if row.get("spatial_context") else None,
             "merged_from": json.loads(row["merged_from"]) if row["merged_from"] else None,
         })
 
@@ -2227,6 +2408,11 @@ def main():
             print(f"  最もつながりの多い記憶:")
             for row in s["most_linked"]:
                 print(f"    #{row['id']} ({row['link_count']}リンク) {row['content'][:50]}")
+        if s.get("by_location"):
+            print(f"  場所別:")
+            for loc, cnt in sorted(s["by_location"].items(), key=lambda x: -x[1]):
+                print(f"    📍 {loc}: {cnt}件")
+        print(f"  現在の場所: {_detect_location()}")
 
     elif cmd == "mood":
         if len(sys.argv) < 3:
