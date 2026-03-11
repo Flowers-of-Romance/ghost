@@ -9,6 +9,7 @@
 python memory.py add "内容" カテゴリ "出典"
 python memory.py search "検索語" [--raw] [--fuzzy]
 python memory.py recall [N] [--raw]
+python memory.py recall --voices [N]   # 内的対話（共感・補完・批判・連想）
 python memory.py chain ID [depth]
 python memory.py detail ID
 python memory.py recent [N]
@@ -60,6 +61,9 @@ python autobiography.py               # 自伝的記憶の生成
 - **文脈自動失効**: context記憶は30日でforgotten
 - **フラッシュバック**: 忘却された記憶が確率的に蘇る（情動が強いほど蘇りやすい）
 - **予期記憶**: 登録したトリガーに一致する語が出ると自動リマインド
+- **内的対話**: recall --voicesで共感・補完・批判・連想の4声が同時に想起
+- **暗黙の気分推定**: 最近触った記憶の情動から心理状態を自動推定
+- **デフォルトモードネットワーク**: 会話間隔が長いほど弱いリンクを辿って意外な連想を生成
 
 ## 検索結果の読み方
 
