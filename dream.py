@@ -37,7 +37,7 @@ def load_fragments():
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         "SELECT id, content, keywords, emotions, importance, arousal, access_count "
-        "FROM memories WHERE forgotten = 0"
+        "FROM memories WHERE forgotten = 0 AND category != 'schema'"
     ).fetchall()
 
     # リンク情報を取得（連想クラスタ用）
