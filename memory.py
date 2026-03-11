@@ -1913,6 +1913,122 @@ def replay_memories():
     consolidate_memories(dry_run=True)
 
 
+# ============================================================
+# デフォルトモードネットワーク — ぼーっとしてるときの脳
+# ============================================================
+
+def _get_session_gap(conn):
+    """前回の会話からの間隔（時間）を返す。"""
+    row = conn.execute(
+        "SELECT MAX(last_accessed) as last FROM memories WHERE last_accessed IS NOT NULL"
+    ).fetchone()
+    if not row or not row["last"]:
+        return None
+    last = datetime.strptime(row["last"], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    gap_hours = (now - last).total_seconds() / 3600
+    return gap_hours
+
+
+def default_mode_network(conn, gap_hours):
+    """
+    デフォルトモードネットワーク (DMN):
+    脳がタスクに集中していないときに活性化するネットワーク。
+    過去の記憶をランダムに彷徨い、普段つながらないものを結びつける。
+
+    間隔が長いほど（= ぼーっとしてた時間が長いほど）
+    DMNが多く歩き回ったとみなし、より意外な連想を返す。
+
+    Returns: list of (row_a, row_b, path_description)
+        row_a, row_b: 結びついた2つの記憶
+        path_description: どう辿り着いたかの説明
+    """
+    rows = conn.execute(
+        "SELECT id, embedding FROM memories WHERE forgotten = 0 AND embedding IS NOT NULL"
+    ).fetchall()
+    if len(rows) < 5:
+        return []
+
+    # 間隔に応じてランダムウォークの歩数を決める
+    if gap_hours < 1:
+        return []  # 短すぎる、DMN起動しない
+    elif gap_hours < 6:
+        walks = 2
+        walk_length = 3
+    elif gap_hours < 24:
+        walks = 3
+        walk_length = 4
+    else:
+        walks = 5
+        walk_length = 5
+
+    # ランダムウォーク: リンクを辿って遠くへ行く
+    discoveries = []
+    all_ids = [r["id"] for r in rows]
+
+    for _ in range(walks):
+        # ランダムな出発点
+        start_id = random.choice(all_ids)
+        current = start_id
+        path = [current]
+
+        for step in range(walk_length):
+            # リンクを辿る（弱いリンクも含める）
+            links = conn.execute(
+                """SELECT target_id, strength FROM links
+                   WHERE source_id = ? ORDER BY RANDOM() LIMIT 3""",
+                (current,)
+            ).fetchall()
+
+            if not links:
+                # リンクがなければランダムジャンプ（DMNの特徴: 飛躍的連想）
+                current = random.choice(all_ids)
+            else:
+                # 弱いリンクを優先的に選ぶ（普段通らない道）
+                weights = [1.0 / (l["strength"] + 0.1) for l in links]
+                total = sum(weights)
+                r = random.random() * total
+                cumulative = 0
+                chosen = links[0]["target_id"]
+                for l, w in zip(links, weights):
+                    cumulative += w
+                    if r <= cumulative:
+                        chosen = l["target_id"]
+                        break
+                current = chosen
+
+            path.append(current)
+
+        # 出発点と到着点が十分に違えば発見
+        if start_id != current and start_id != path[-1]:
+            start_row = conn.execute(
+                "SELECT * FROM memories WHERE id = ? AND forgotten = 0", (start_id,)
+            ).fetchone()
+            end_row = conn.execute(
+                "SELECT * FROM memories WHERE id = ? AND forgotten = 0", (current,)
+            ).fetchone()
+            if start_row and end_row:
+                # 直接リンクがない遠い記憶同士ならDMN的発見
+                direct = conn.execute(
+                    "SELECT id FROM links WHERE source_id = ? AND target_id = ?",
+                    (start_id, current)
+                ).fetchone()
+                if not direct:
+                    hop_str = " → ".join(f"#{p}" for p in path)
+                    discoveries.append((start_row, end_row, hop_str))
+
+    # 重複排除（同じペアは1回だけ）
+    seen = set()
+    unique = []
+    for a, b, path in discoveries:
+        pair = (min(a["id"], b["id"]), max(a["id"], b["id"]))
+        if pair not in seen:
+            seen.add(pair)
+            unique.append((a, b, path))
+
+    return unique[:3]  # 最大3件
+
+
 def recall_important(limit=15):
     conn = get_connection()
 
@@ -1945,6 +2061,170 @@ def recall_important(limit=15):
     scored.sort(key=lambda x: x[1], reverse=True)
     conn.close()
     return [(s[0], s[1]) for s in scored[:limit]]
+
+
+def infer_implicit_mood(conn):
+    """暗黙の気分推定: 最近アクセスした記憶の情動から現在の心理状態を推定する。
+
+    明示的なmoodが設定されていなくても、最近触った記憶の情動パターンが
+    「今の頭の中の色」になっている。人間も自分の気分を自覚していないことが多い。
+    """
+    now = datetime.now(timezone.utc)
+    window = now - timedelta(minutes=PRIMING_WINDOW_MINUTES)
+    window_str = window.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    recent = conn.execute(
+        "SELECT emotions, arousal FROM memories WHERE forgotten = 0 AND last_accessed > ?",
+        (window_str,)
+    ).fetchall()
+
+    if not recent:
+        return None
+
+    emotion_counts = {}
+    total_arousal = 0.0
+    for row in recent:
+        emos = json.loads(row["emotions"]) if row["emotions"] else []
+        for e in emos:
+            emotion_counts[e] = emotion_counts.get(e, 0) + 1
+        total_arousal += row["arousal"]
+
+    if not emotion_counts:
+        return None
+
+    # 出現回数が多い情動を暗黙の気分とする
+    dominant = sorted(emotion_counts.keys(), key=lambda e: -emotion_counts[e])
+    avg_arousal = total_arousal / len(recent)
+
+    return {"emotions": dominant[:3], "arousal": avg_arousal}
+
+
+def _effective_mood(conn=None):
+    """明示的なmood → 暗黙のmood の順で返す。"""
+    mood = load_mood()
+    if mood and mood.get("emotions"):
+        return mood
+    if conn:
+        return infer_implicit_mood(conn)
+    return None
+
+
+def get_mood_incongruence_boost(row, conn=None):
+    """気分不一致ブースト: 現在の気分と記憶の情動が重ならないほど高い。
+    補完の声——見えていないものを引き出す。
+    明示的mood → 暗黙mood（最近触った記憶の情動）の順でフォールバック。"""
+    mood = _effective_mood(conn)
+    if mood is None:
+        return 1.0
+    mood_emotions = set(mood.get("emotions", []))
+    mood_arousal = mood.get("arousal", 0.5)
+    if not mood_emotions:
+        return 1.0
+    mem_emotions = set(json.loads(row["emotions"])) if row["emotions"] else set()
+    overlap = mood_emotions & mem_emotions
+    if not overlap:
+        # 気分と異なる情動 → ブースト
+        return 1.0 + mood_arousal * 0.25
+    # 気分と一致 → 抑制
+    return 0.85
+
+
+def recall_polyphonic(limit_per_voice=3):
+    """
+    内的対話 (polyphonic recall): 複数の声が同時に想起する。
+
+    人間の内的対話を模倣する。頭の中には一つの声ではなく、
+    共感・補完・批判・連想が同時に走っている。
+
+    4つの声:
+      共感: 気分に寄り添う記憶（状態依存記憶）
+      補完: 気分と逆の記憶（見えていないもの）
+      批判: 過去の失敗・葛藤・不安の記憶（警告）
+      連想: ランダムウォークで到達した意外な記憶（創造性）
+
+    Returns: dict of {voice_name: [(row, score), ...]}
+    """
+    conn = get_connection()
+    sweep_contexts(conn)
+
+    rows = conn.execute(
+        "SELECT * FROM memories WHERE forgotten = 0"
+    ).fetchall()
+
+    if not rows:
+        conn.close()
+        return {}
+
+    # --- 各声のスコア計算 ---
+    empathy_scored = []    # 共感
+    complement_scored = [] # 補完
+    critic_scored = []     # 批判
+    associative_scored = []  # 連想
+
+    for row in rows:
+        emo_boost = 1.0 + row["arousal"] * 0.5
+        hl = effective_half_life(row["arousal"])
+        fresh = freshness(row["created_at"], half_life=hl)
+        access_boost = 1.0 + min(row["access_count"], 10) * 0.03
+        priming = get_priming_boost(conn, row["id"])
+        spatial = _spatial_boost(row)
+
+        base = emo_boost * (0.5 + fresh * 0.5) * access_boost * priming * spatial
+
+        # 共感: 気分一致性ブーストで寄り添う
+        mood_match = get_mood_congruence_boost(row)
+        empathy_scored.append((row, base * mood_match))
+
+        # 補完: 気分不一致ブーストで見えていないものを出す
+        mood_oppose = get_mood_incongruence_boost(row, conn)
+        complement_scored.append((row, base * mood_oppose))
+
+        # 批判: conflict, anxiety, 失敗の記憶を優先
+        mem_emotions = set(json.loads(row["emotions"])) if row["emotions"] else set()
+        critic_boost = 1.0
+        if mem_emotions & {"conflict", "anxiety"}:
+            critic_boost = 1.3
+        if row["arousal"] >= 0.7 and "determination" not in mem_emotions:
+            critic_boost *= 1.2
+        critic_scored.append((row, base * critic_boost))
+
+        # 連想: ランダム性を持たせる（プライミングとarousalに頼らない）
+        # アクセス回数が少なく、リンクが多い記憶を優先（辺境の豊かなノード）
+        link_count = conn.execute(
+            "SELECT COUNT(*) FROM links WHERE source_id = ?", (row["id"],)
+        ).fetchone()[0]
+        novelty = 1.0 / (1.0 + row["access_count"])
+        richness = 1.0 + min(link_count, 20) * 0.05
+        random_jitter = 0.8 + random.random() * 0.4  # 0.8-1.2のランダム揺れ
+        associative_scored.append((row, (0.5 + fresh * 0.5) * novelty * richness * random_jitter))
+
+    # --- 各声からtop Nを選ぶ（重複排除） ---
+    empathy_scored.sort(key=lambda x: x[1], reverse=True)
+    complement_scored.sort(key=lambda x: x[1], reverse=True)
+    critic_scored.sort(key=lambda x: x[1], reverse=True)
+    associative_scored.sort(key=lambda x: x[1], reverse=True)
+
+    used_ids = set()
+    voices = {}
+
+    def pick(scored_list, n):
+        picked = []
+        for row, score in scored_list:
+            if row["id"] not in used_ids:
+                picked.append((row, score))
+                used_ids.add(row["id"])
+                if len(picked) >= n:
+                    break
+        return picked
+
+    # 共感を先に取る（最も基本的な声）
+    voices["共感"] = pick(empathy_scored, limit_per_voice)
+    voices["補完"] = pick(complement_scored, limit_per_voice)
+    voices["批判"] = pick(critic_scored, limit_per_voice)
+    voices["連想"] = pick(associative_scored, limit_per_voice)
+
+    conn.close()
+    return voices
 
 
 def get_recent(n=10):
@@ -2353,19 +2633,79 @@ def main():
         resurrect_memories(sys.argv[2])
 
     elif cmd == "recall":
-        limit = int(sys.argv[2]) if len(sys.argv) > 2 else 15
-        raw_mode = "--raw" in sys.argv
-        results = recall_important(limit)
-        if raw_mode:
-            print(f"自動想起 ({len(results)}件):")
-            for row, score in results:
-                print(format_memory(row, score=score))
-        else:
+        # DMN（デフォルトモードネットワーク）: 間隔に応じて起動
+        dmn_conn = get_connection()
+        gap = _get_session_gap(dmn_conn)
+        if gap is not None and gap >= 1.0:
+            dmn_results = default_mode_network(dmn_conn, gap)
+            if dmn_results:
+                if gap >= 24:
+                    gap_str = f"{gap/24:.0f}日"
+                else:
+                    gap_str = f"{gap:.0f}時間"
+                print(f"💭 DMN（{gap_str}ぶり — ぼーっとしてたら浮かんできた）:")
+                for a, b, path in dmn_results:
+                    kw_a = json.loads(a["keywords"])[:3] if a["keywords"] else []
+                    kw_b = json.loads(b["keywords"])[:3] if b["keywords"] else []
+                    print(f"  #{a['id']} [{', '.join(kw_a)}] ···{path}··· #{b['id']} [{', '.join(kw_b)}]")
+                print()
+        dmn_conn.close()
+
+        if "--voices" in sys.argv:
+            # 内的対話モード
+            n = 3
+            for arg in sys.argv[2:]:
+                if arg.isdigit():
+                    n = int(arg)
+            voices = recall_polyphonic(limit_per_voice=n)
+            raw_mode = "--raw" in sys.argv
             conn = get_connection()
-            print(f"自動想起 ({len(results)}件, 再構成モード):")
-            for row, score in results:
-                print(format_memory_reconstructive(conn, row, score=score))
+
+            # 今効いてる気分を表示
+            mood = _effective_mood(conn)
+            if mood and mood.get("emotions"):
+                explicit = load_mood()
+                if explicit and explicit.get("emotions"):
+                    mood_src = "明示"
+                else:
+                    mood_src = "暗黙（最近触った記憶から推定）"
+                emo_str = ", ".join(mood["emotions"])
+                print(f"気分: {emo_str} (覚醒度:{mood['arousal']:.2f}) [{mood_src}]")
+                print(f"  → 共感は{emo_str}系を出す / 補完はそれ以外を出す")
+            else:
+                print("気分: なし（共感と補完の差は出にくい）")
+
+            voice_labels = {
+                "共感": "🤝",
+                "補完": "🔭",
+                "批判": "⚡",
+                "連想": "🎲",
+            }
+            for voice_name, results in voices.items():
+                if not results:
+                    continue
+                emoji = voice_labels.get(voice_name, "·")
+                print(f"\n{emoji} [{voice_name}]")
+                for row, score in results:
+                    if raw_mode:
+                        print(format_memory(row, score=score))
+                    else:
+                        print(format_memory_reconstructive(conn, row, score=score))
             conn.close()
+        else:
+            limit = int(sys.argv[2]) if len(sys.argv) > 2 else 15
+            raw_mode = "--raw" in sys.argv
+            results = recall_important(limit)
+            if raw_mode:
+                print(f"自動想起 ({len(results)}件):")
+                for row, score in results:
+                    print(format_memory(row, score=score))
+            else:
+                conn = get_connection()
+                print(f"自動想起 ({len(results)}件, 再構成モード):")
+                for row, score in results:
+                    print(format_memory_reconstructive(conn, row, score=score))
+                conn.close()
 
     elif cmd == "review":
         n = int(sys.argv[2]) if len(sys.argv) > 2 else 5
