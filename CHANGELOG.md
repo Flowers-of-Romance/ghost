@@ -1,5 +1,20 @@
 # Changelog
 
+## [v6] - 2026-03-12
+
+### Added
+- **ghost-local.py**: ローカルLLM（ollama）に記憶を外付けするチャットクライアント
+  - 起動時に `recall` でシステムプロンプトに記憶を注入
+  - 毎ターン `search` で関連記憶を自動想起（「そういえば…」）
+  - コンテキスト圧縮: 20ターン超で古い会話を要約して落とす
+  - チャットコマンド: `/recall` `/search` `/sleep` `/mood` `/stats` `/model` `/help`
+  - セッション間隔に応じた自動sleep（replay/consolidate）
+  - 終了時に会話を記憶に自動保存
+
+### Changed
+- **CLAUDE.md**: 俯瞰トリガーの記述を削除（必要なときはユーザーが直接指示する設計に）
+- **CLAUDE.md**: さらに圧縮（430B→370B）
+
 ## [v5] - 2026-03-11
 
 ### Changed
