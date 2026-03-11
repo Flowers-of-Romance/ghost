@@ -54,7 +54,7 @@ def load_memories_full():
     rows = conn.execute(
         "SELECT id, content, keywords, emotions, importance, arousal, "
         "access_count, category, created_at "
-        "FROM memories WHERE forgotten = 0"
+        "FROM memories WHERE forgotten = 0 AND category != 'schema'"
     ).fetchall()
     conn.close()
     return rows
@@ -91,7 +91,9 @@ def generate_dream_with_trace(duration_lines=20):
       dream_lines: 表示用の文字列リスト
       used_fragments: 各行で使われた断片テキストのリスト
     """
-    fragments, emotions, contents = load_fragments()
+    weighted_fragments, weighted_contents, emotions, memory_clusters, links = load_fragments()
+    fragments = [f[0] for f in weighted_fragments]
+    contents = [c[0] for c in weighted_contents]
 
     dream_lines = []
     used_fragments_per_line = []
