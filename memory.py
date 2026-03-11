@@ -2029,6 +2029,52 @@ def default_mode_network(conn, gap_hours):
     return unique[:3]  # 最大3件
 
 
+def detect_rumination(conn):
+    """
+    反芻検出: 同じ記憶ばかり触ってないか。
+
+    最近アクセスされた記憶の中で、短期間に3回以上出現したものがあれば
+    「ぐるぐる回ってる」と判断する。行き詰まりのシグナル。
+
+    Returns: list of (memory_id, access_count, keywords) or empty list
+    """
+    now = datetime.now(timezone.utc)
+    # 直近2時間のアクセスを見る
+    window = now - timedelta(hours=2)
+    window_str = window.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    # last_accessedがwindow内の記憶で、access_countが高いもの
+    rows = conn.execute(
+        """SELECT id, access_count, keywords, content FROM memories
+           WHERE forgotten = 0 AND last_accessed > ?
+           ORDER BY access_count DESC""",
+        (window_str,)
+    ).fetchall()
+
+    if len(rows) < 3:
+        return []
+
+    # 上位3件のアクセス数が突出してるか見る
+    # access_countは累積なので、直近2時間内にアクセスされた記憶の中で
+    # 上位の偏りを検出する
+    total_access = sum(r["access_count"] for r in rows)
+    if total_access == 0:
+        return []
+
+    top3_access = sum(r["access_count"] for r in rows[:3])
+    ratio = top3_access / total_access
+
+    # 上位3件が全体の35%以上占め、かつトップが15回以上アクセスされてる
+    if ratio > 0.35 and rows[0]["access_count"] >= 15:
+        ruminating = []
+        for r in rows[:3]:
+            kw = json.loads(r["keywords"])[:3] if r["keywords"] else []
+            ruminating.append((r["id"], r["access_count"], kw))
+        return ruminating
+
+    return []
+
+
 def recall_important(limit=15):
     conn = get_connection()
 
@@ -2129,6 +2175,139 @@ def get_mood_incongruence_boost(row, conn=None):
     return 0.85
 
 
+def _birds_eye_view(conn, rows):
+    """
+    俯瞰の声: 記憶全体の構造をメタレベルで見る。
+
+    個別の記憶を返すのではなく、全体のパターン・偏り・盲点を
+    短いテキスト断片のリストとして返す。
+    LLMが最も得意なこと——全体を同時に見渡す。
+
+    Returns: list of (observation_text, importance) tuples
+    """
+    observations = []
+
+    total = len(rows)
+    if total == 0:
+        return [("記憶がまだない", 0)]
+
+    # 1. カテゴリの偏り
+    cat_counts = {}
+    for row in rows:
+        cat = row["category"]
+        cat_counts[cat] = cat_counts.get(cat, 0) + 1
+
+    dominant_cat = max(cat_counts, key=cat_counts.get)
+    dominant_pct = cat_counts[dominant_cat] / total * 100
+    if dominant_pct > 60:
+        observations.append((
+            f"記憶の{dominant_pct:.0f}%が{dominant_cat}。偏ってる",
+            3
+        ))
+
+    missing_cats = {"fact", "episode", "preference", "procedure"} - set(cat_counts.keys())
+    if missing_cats:
+        observations.append((
+            f"{', '.join(missing_cats)}の記憶がゼロ",
+            2
+        ))
+
+    # 2. 情動の偏り
+    emo_counts = {}
+    neutral_count = 0
+    for row in rows:
+        emos = json.loads(row["emotions"]) if row["emotions"] else []
+        if not emos:
+            neutral_count += 1
+        for e in emos:
+            emo_counts[e] = emo_counts.get(e, 0) + 1
+
+    if neutral_count > total * 0.4:
+        observations.append((
+            f"記憶の{neutral_count}/{total}件が情動なし（中立）。淡白",
+            2
+        ))
+
+    all_emotions = {"surprise", "conflict", "determination", "insight", "connection", "anxiety"}
+    rare_emotions = [e for e in all_emotions if emo_counts.get(e, 0) <= 1]
+    if rare_emotions:
+        observations.append((
+            f"{', '.join(rare_emotions)}がほぼない",
+            2
+        ))
+
+    # 3. アクセスの偏り（同じ記憶ばかり触ってないか）
+    access_sorted = sorted(rows, key=lambda r: r["access_count"], reverse=True)
+    if access_sorted[0]["access_count"] > 30:
+        top = access_sorted[0]
+        kw = json.loads(top["keywords"])[:3] if top["keywords"] else []
+        observations.append((
+            f"#{top['id']}を{top['access_count']}回も触ってる: [{', '.join(kw)}]",
+            2
+        ))
+
+    # 4. 孤立ノード
+    all_linked = set()
+    link_rows = conn.execute("SELECT source_id, target_id FROM links").fetchall()
+    for l in link_rows:
+        all_linked.add(l["source_id"])
+        all_linked.add(l["target_id"])
+    orphans = [r for r in rows if r["id"] not in all_linked and r["category"] != "schema"]
+    if orphans:
+        kw_list = []
+        for o in orphans[:3]:
+            kw = json.loads(o["keywords"])[:2] if o["keywords"] else []
+            kw_list.append(f"#{o['id']}[{', '.join(kw)}]")
+        observations.append((
+            f"孤立: {', '.join(kw_list)}（どこにも繋がってない）",
+            3
+        ))
+
+    # 5. スキーマの要約（記憶クラスタの鳥瞰）
+    schemas = [r for r in rows if r["category"] == "schema"]
+    if schemas:
+        # スキーマのキーワードを集約して全体像を出す
+        all_schema_kw = []
+        for s in schemas:
+            kw = json.loads(s["keywords"]) if s["keywords"] else []
+            all_schema_kw.extend(kw[:3])
+        # 頻出キーワード
+        from collections import Counter
+        kw_freq = Counter(all_schema_kw)
+        top_themes = [kw for kw, _ in kw_freq.most_common(5)]
+        observations.append((
+            f"記憶の中心テーマ: {', '.join(top_themes)}",
+            1
+        ))
+
+    # 6. 鮮度の全体像
+    stale = [r for r in rows if freshness(r["created_at"]) < 0.3 and r["category"] != "schema"]
+    if stale:
+        observations.append((
+            f"{len(stale)}件の記憶が色あせてきてる（鮮度30%以下）",
+            2
+        ))
+
+    # 7. 最近の傾向（直近5件の記憶）
+    recent = sorted(rows, key=lambda r: r["created_at"], reverse=True)[:5]
+    recent_cats = [r["category"] for r in recent]
+    recent_emos = []
+    for r in recent:
+        recent_emos.extend(json.loads(r["emotions"]) if r["emotions"] else [])
+    if recent_emos:
+        from collections import Counter
+        top_recent_emo = Counter(recent_emos).most_common(2)
+        emo_str = ", ".join(e for e, _ in top_recent_emo)
+        observations.append((
+            f"最近の傾向: {emo_str}が強い",
+            1
+        ))
+
+    # 重要度でソート
+    observations.sort(key=lambda x: x[1], reverse=True)
+    return observations[:5]
+
+
 def recall_polyphonic(limit_per_voice=3):
     """
     内的対話 (polyphonic recall): 複数の声が同時に想起する。
@@ -2222,6 +2401,9 @@ def recall_polyphonic(limit_per_voice=3):
     voices["補完"] = pick(complement_scored, limit_per_voice)
     voices["批判"] = pick(critic_scored, limit_per_voice)
     voices["連想"] = pick(associative_scored, limit_per_voice)
+
+    # 俯瞰: メタ情報から全体像を構成する（LLMが最も得意なこと）
+    voices["俯瞰"] = _birds_eye_view(conn, rows)
 
     conn.close()
     return voices
@@ -2569,6 +2751,15 @@ def main():
                 kw_str = ", ".join(keywords[:6])
                 print(f"  ?? #{row['id']} もやもや: [{kw_str}]")
 
+        # 反芻検出: 同じ記憶ばかり触ってたら警告
+        rum_conn = get_connection()
+        ruminating = detect_rumination(rum_conn)
+        if ruminating:
+            ids_str = ", ".join(f"#{r[0]}[{', '.join(r[2])}]" for r in ruminating)
+            print(f"  🔄 同じところを回ってる: {ids_str}")
+            print(f"     → recall --voices で別の視点を試してみて")
+        rum_conn.close()
+
     elif cmd == "chain":
         if len(sys.argv) < 3:
             print("使い方: python memory.py chain ID [depth]")
@@ -2651,12 +2842,18 @@ def main():
                 print()
         dmn_conn.close()
 
-        if "--voices" in sys.argv:
+        # 間隔が長い（6時間以上）なら自動でvoicesモードに切り替え
+        auto_voices = gap is not None and gap >= 6.0 and "--voices" not in sys.argv
+        if auto_voices:
+            print(f"(久しぶりなので内的対話モードで想起します)\n")
+
+        if "--voices" in sys.argv or auto_voices:
             # 内的対話モード
-            n = 3
-            for arg in sys.argv[2:]:
-                if arg.isdigit():
-                    n = int(arg)
+            n = 2 if auto_voices else 3  # 自動の場合は軽めに
+            if not auto_voices:
+                for arg in sys.argv[2:]:
+                    if arg.isdigit():
+                        n = int(arg)
             voices = recall_polyphonic(limit_per_voice=n)
             raw_mode = "--raw" in sys.argv
             conn = get_connection()
@@ -2680,17 +2877,23 @@ def main():
                 "補完": "🔭",
                 "批判": "⚡",
                 "連想": "🎲",
+                "俯瞰": "🦅",
             }
             for voice_name, results in voices.items():
                 if not results:
                     continue
                 emoji = voice_labels.get(voice_name, "·")
                 print(f"\n{emoji} [{voice_name}]")
-                for row, score in results:
-                    if raw_mode:
-                        print(format_memory(row, score=score))
-                    else:
-                        print(format_memory_reconstructive(conn, row, score=score))
+                if voice_name == "俯瞰":
+                    # 俯瞰はテキスト断片のリスト
+                    for text, _imp in results:
+                        print(f"  {text}")
+                else:
+                    for row, score in results:
+                        if raw_mode:
+                            print(format_memory(row, score=score))
+                        else:
+                            print(format_memory_reconstructive(conn, row, score=score))
             conn.close()
         else:
             limit = int(sys.argv[2]) if len(sys.argv) > 2 else 15
