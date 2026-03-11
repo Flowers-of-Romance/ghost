@@ -10,19 +10,15 @@
 python memory.py recall
 ```
 
-ユーザーの発言に関連があれば追加で:
+## 記憶操作（サブエージェントに委譲）
 
-```bash
-python memory.py search "キーワード"
-```
+recall以外の記憶操作はサブエージェントに委譲する。メインコンテキストを汚染しない。
 
-## 会話の終了時
-
-覚えるべきことがあれば:
-
-```bash
-python memory.py add "内容" カテゴリ "出典"
-```
+サブエージェント（subagent_type: "general-purpose"）に依頼:
+- `MEMORY_GUIDE.md` を読んでコマンドを把握
+- `python memory.py search "キーワード"` で連想検索
+- `python memory.py add "内容" カテゴリ "出典"` で保存
+- 結果を**3行以内に要約**して返す
 
 カテゴリ: fact / episode / context / preference / procedure
 
