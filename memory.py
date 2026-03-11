@@ -31,7 +31,7 @@ memory.py - 脳に近い記憶システム
   python memory.py forget ID
   python memory.py resurrect "query"  # 忘却された記憶を復活検索
   python memory.py schema             # リンク密集クラスタからスキーマ（メタ記憶）を生成
-  python memory.py proceduralize      # 反復された記憶を行動指針に昇格（CLAUDE.mdに書込み）
+  python memory.py proceduralize      # 反復された記憶を行動指針に昇格（LEARNED.mdに書込み）
   python memory.py stats
   python memory.py mood [emotion] [arousal]  # 気分状態の設定・表示
   python memory.py mood clear                # 気分状態をクリア
@@ -95,7 +95,7 @@ SPATIAL_BOOST = 1.08  # 場所一致時のブースト倍率
 # 手続き化: 反復が閾値を超えた記憶を行動指針に昇格
 PROCEDURALIZE_ACCESS_THRESHOLD = 20   # 最低想起回数
 PROCEDURALIZE_LINK_THRESHOLD = 15     # 最低リンク数
-CLAUDE_MD_PATH = str(Path(__file__).parent / "CLAUDE.md")
+LEARNED_MD_PATH = str(Path(__file__).parent / "LEARNED.md")
 HEBB_MARKER = "## 学習された行動指針"
 
 # 外傷的記憶: arousalがこの閾値を超えると既存メカニズムの挙動が変わる
@@ -901,7 +901,7 @@ def build_schemas(dry_run=False):
 
 def proceduralize(dry_run=False):
     """
-    手続き化: 十分に反復された記憶を行動指針（CLAUDE.md）に昇格させる。
+    手続き化: 十分に反復された記憶を行動指針（LEARNED.md）に昇格させる。
 
     脳の学習: エピソード記憶が反復されると手続き記憶になる。
     自転車の乗り方を最初は意識的に覚え、やがて無意識にできるようになるのと同じ。
@@ -913,7 +913,7 @@ def proceduralize(dry_run=False):
     - まだ手続き化されていない
 
     出力:
-    - CLAUDE.mdの「学習された行動指針」セクションに追記
+    - LEARNED.mdに行動指針を書き出す
     - proceduresテーブルに記録
     """
     conn = get_connection()
@@ -947,7 +947,10 @@ def proceduralize(dry_run=False):
         ORDER BY m.access_count * COUNT(l.id) DESC
     """, (PROCEDURALIZE_ACCESS_THRESHOLD, PROCEDURALIZE_LINK_THRESHOLD)).fetchall()
 
-    candidates = [r for r in rows if r["id"] not in existing]
+    # fact/schemaは手続きにならない（事実やメタ記憶が行動指針になるのは不自然）
+    candidates = [r for r in rows
+                  if r["id"] not in existing
+                  and r["category"] not in ("fact", "schema")]
 
     if not candidates:
         print("手続き化の候補はありません")
@@ -983,9 +986,9 @@ def proceduralize(dry_run=False):
     conn.commit()
     conn.close()
 
-    # CLAUDE.mdに書き込む
+    # LEARNED.mdに書き込む
     if new_rules:
-        _write_procedures_to_claude_md()
+        _write_procedures_to_learned_md()
         print(f"✓ 手続き化完了: {len(new_rules)}件の記憶が行動指針に昇格")
         for mid, acc, lnk, rule in new_rules:
             print(f"  #{mid} ({acc}回×{lnk}リンク) → {rule[:60]}")
@@ -993,8 +996,8 @@ def proceduralize(dry_run=False):
         print("新しい手続きはありません")
 
 
-def _write_procedures_to_claude_md():
-    """proceduresテーブルの全ルールをCLAUDE.mdに同期する。"""
+def _write_procedures_to_learned_md():
+    """proceduresテーブルの全ルールをLEARNED.mdに同期する。"""
     conn = get_connection()
     conn.execute("""
         CREATE TABLE IF NOT EXISTS procedures (
@@ -1013,12 +1016,12 @@ def _write_procedures_to_claude_md():
     conn.close()
 
     if not rules:
+        # ルールがなければファイルを空にしない（既存があれば残す）
         return
 
-    # セクションを構築
+    # LEARNED.mdを丸ごと書き直す
     lines = [
-        "",
-        HEBB_MARKER,
+        "# 学習された行動指針",
         "",
         "<!-- 自動生成: memory.py proceduralize による。手動編集しない -->",
         "<!-- 十分に反復された記憶パターンが行動指針として昇格したもの -->",
@@ -1028,25 +1031,8 @@ def _write_procedures_to_claude_md():
         lines.append(f"- #{rule['memory_id']}: {rule['rule_text']}")
     lines.append("")
 
-    section_text = "\n".join(lines)
-
-    # CLAUDE.mdを読んで、既存セクションがあれば置換、なければ末尾に追加
-    try:
-        with open(CLAUDE_MD_PATH, "r", encoding="utf-8") as f:
-            content = f.read()
-    except FileNotFoundError:
-        content = ""
-
-    if HEBB_MARKER in content:
-        # 既存セクションを置換（次の##セクションまで、またはファイル末尾まで）
-        import re as _re
-        pattern = _re.escape(HEBB_MARKER) + r".*?(?=\n## |\Z)"
-        content = _re.sub(pattern, section_text.strip(), content, flags=_re.DOTALL)
-    else:
-        content = content.rstrip() + "\n" + section_text
-
-    with open(CLAUDE_MD_PATH, "w", encoding="utf-8") as f:
-        f.write(content)
+    with open(LEARNED_MD_PATH, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
 
 
 # ============================================================
