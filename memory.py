@@ -2029,6 +2029,31 @@ def replay_memories():
 # デフォルトモードネットワーク — ぼーっとしてるときの脳
 # ============================================================
 
+def _show_recent_insights():
+    """think.pyが保存したひらめきのうち、まだ表示していないものを出す。"""
+    conn = get_connection()
+    # source_conversationが "think:" で始まるもの = think.pyが保存したひらめき
+    # access_count == 0 = まだ一度も想起されていない（=未表示）
+    rows = conn.execute(
+        "SELECT id, content FROM memories "
+        "WHERE forgotten = 0 AND source_conversation LIKE 'think:%' AND access_count = 0 "
+        "ORDER BY created_at DESC LIMIT 2"
+    ).fetchall()
+    if rows:
+        print("💡 離れてる間に思いついたこと:")
+        for row in rows:
+            print(f"  #{row['id']} {row['content']}")
+            # アクセスカウントを上げて次回は表示しない
+            conn.execute(
+                "UPDATE memories SET access_count = access_count + 1, "
+                "last_accessed = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?",
+                (row["id"],)
+            )
+        conn.commit()
+        print()
+    conn.close()
+
+
 def _get_session_gap(conn):
     """前回の会話からの間隔（時間）を返す。"""
     row = conn.execute(
@@ -2667,6 +2692,17 @@ def format_memory(row, similarity=None, score=None):
     return f"  #{row['id']} {emo_str} {stars} {row['content'][:80]}{accessed}{sim_str}{score_str}{fresh_str}"
 
 
+def format_memory_compact(row, score=None):
+    """コンパクトモード: 1記憶1行。recallのデフォルト。"""
+    emotions = json.loads(row["emotions"]) if row["emotions"] else []
+    keywords = json.loads(row["keywords"]) if row["keywords"] else []
+    emo_str = " ".join(EMOTION_EMOJI.get(e, "·") for e in emotions[:2]) if emotions else ""
+    stars = "★" * row["importance"]
+    frag_str = ", ".join(keywords[:4])
+    score_str = f" ({score:.2f})" if score is not None else ""
+    return f"  #{row['id']} {emo_str} {stars} [{frag_str}]{score_str}"
+
+
 def format_memory_reconstructive(conn, row, similarity=None, score=None):
     """再構成モード: 断片+情動+連想リンクの断片を返す。contentは返さない。"""
     emotions = json.loads(row["emotions"]) if row["emotions"] else []
@@ -3161,6 +3197,9 @@ def main():
                 print()
         dmn_conn.close()
 
+        # ひらめき枠: think.pyが前回以降に保存した洞察を表示
+        _show_recent_insights()
+
         # 間隔が長い（6時間以上）なら自動でvoicesモードに切り替え
         auto_voices = gap is not None and gap >= 6.0 and "--voices" not in sys.argv
         if auto_voices:
@@ -3215,19 +3254,29 @@ def main():
                             print(format_memory_reconstructive(conn, row, score=score))
             conn.close()
         else:
-            limit = int(sys.argv[2]) if len(sys.argv) > 2 else 15
+            full_mode = "--full" in sys.argv
             raw_mode = "--raw" in sys.argv
+            default_limit = 15 if full_mode else 10
+            limit = default_limit
+            for arg in sys.argv[2:]:
+                if arg.isdigit():
+                    limit = int(arg)
+                    break
             results = recall_important(limit)
             if raw_mode:
                 print(f"自動想起 ({len(results)}件):")
                 for row, score in results:
                     print(format_memory(row, score=score))
-            else:
+            elif full_mode:
                 conn = get_connection()
                 print(f"自動想起 ({len(results)}件, 再構成モード):")
                 for row, score in results:
                     print(format_memory_reconstructive(conn, row, score=score))
                 conn.close()
+            else:
+                print(f"自動想起 ({len(results)}件):")
+                for row, score in results:
+                    print(format_memory_compact(row, score=score))
 
     elif cmd == "review":
         n = int(sys.argv[2]) if len(sys.argv) > 2 else 5
