@@ -21,6 +21,8 @@ if sys.platform == "win32" and getattr(sys.stdout, 'encoding', '').lower() not i
 
 EMBEDDING_MODEL = "intfloat/multilingual-e5-small"
 PORT = 7234
+MAX_BODY_BYTES = 256 * 1024  # 256KB
+MAX_TEXT_CHARS = 20000
 
 print(f"モデル読み込み中: {EMBEDDING_MODEL} ...")
 from sentence_transformers import SentenceTransformer
@@ -29,12 +31,31 @@ print("✓ モデル準備完了")
 
 
 class EmbedHandler(BaseHTTPRequestHandler):
+    def _error(self, status, msg):
+        self.send_response(status)
+        self.end_headers()
+        self.wfile.write(msg.encode("utf-8"))
+
     def do_POST(self):
         if self.path == "/embed":
             length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length))
-            text = body["text"]
-            is_query = body.get("is_query", False)
+            if length <= 0 or length > MAX_BODY_BYTES:
+                self._error(413, "payload too large")
+                return
+            try:
+                raw = self.rfile.read(length)
+                body = json.loads(raw)
+                if not isinstance(body, dict):
+                    raise ValueError("payload must be object")
+                text = body.get("text", "")
+                if not isinstance(text, str) or len(text) == 0:
+                    raise ValueError("text required")
+                if len(text) > MAX_TEXT_CHARS:
+                    raise ValueError("text too long")
+                is_query = bool(body.get("is_query", False))
+            except (json.JSONDecodeError, ValueError) as e:
+                self._error(400, str(e))
+                return
             prefix = "query: " if is_query else "passage: "
             vec = model.encode(prefix + text, normalize_embeddings=True)
             self.send_response(200)

@@ -3,7 +3,11 @@
 memory_sync_server.py - P2P記憶同期サーバー
 
 起動:
-  python memory_sync_server.py [--port 7235] [--token SECRET]
+  python memory_sync_server.py [--port 7235] [--token SECRET] [--public] [--insecure]
+
+  # 既定はローカルのみ (127.0.0.1)
+  # 外部公開は --public を明示
+  # 認証必須。無認証を許可するなら --insecure を明示
 
 別の端末から:
   python memory.py sync push host:7235
@@ -27,12 +31,19 @@ from memory import sync_export, sync_import, _get_node_id
 
 SYNC_PORT = 7235
 SYNC_TOKEN = os.environ.get("MEMORY_SYNC_TOKEN", "")
+ALLOW_INSECURE = False
+MAX_BODY_BYTES = 5 * 1024 * 1024  # 5MB
 
 
 class SyncHandler(BaseHTTPRequestHandler):
     def _check_auth(self):
         if not SYNC_TOKEN:
-            return True
+            if ALLOW_INSECURE:
+                return True
+            self.send_response(401)
+            self.end_headers()
+            self.wfile.write(b"unauthorized")
+            return False
         auth = self.headers.get("Authorization", "")
         if auth == f"Bearer {SYNC_TOKEN}":
             return True
@@ -82,7 +93,19 @@ class SyncHandler(BaseHTTPRequestHandler):
 
         if self.path == "/sync/push":
             length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length))
+            if length <= 0 or length > MAX_BODY_BYTES:
+                self.send_response(413)
+                self.end_headers()
+                return
+            try:
+                raw = self.rfile.read(length)
+                body = json.loads(raw)
+                if not isinstance(body, dict):
+                    raise ValueError("payload must be object")
+            except Exception:
+                self.send_response(400)
+                self.end_headers()
+                return
             stats = sync_import(body)
             self._send_json({"status": "ok", "stats": stats})
             return
@@ -98,22 +121,32 @@ class SyncHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     port = SYNC_PORT
+    bind_host = "127.0.0.1"
     if "--port" in sys.argv:
         idx = sys.argv.index("--port")
         port = int(sys.argv[idx + 1])
     if "--token" in sys.argv:
         idx = sys.argv.index("--token")
         SYNC_TOKEN = sys.argv[idx + 1]
+    if "--public" in sys.argv:
+        bind_host = "0.0.0.0"
+    if "--insecure" in sys.argv:
+        ALLOW_INSECURE = True
+
+    if not SYNC_TOKEN and not ALLOW_INSECURE:
+        print("error: SYNC_TOKEN is required (set MEMORY_SYNC_TOKEN or use --token).")
+        print("       If you really want no auth, pass --insecure explicitly.")
+        sys.exit(1)
 
     node_id = _get_node_id()
     print(f"node_id: {node_id}")
-    print(f"sync server: http://0.0.0.0:{port}")
+    print(f"sync server: http://{bind_host}:{port}")
     if SYNC_TOKEN:
         print(f"token: {SYNC_TOKEN[:4]}...")
     else:
-        print("token: なし（LAN内利用を想定）")
+        print("token: なし（--insecure モード）")
 
-    server = HTTPServer(("0.0.0.0", port), SyncHandler)
+    server = HTTPServer((bind_host, port), SyncHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

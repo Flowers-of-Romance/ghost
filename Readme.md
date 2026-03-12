@@ -111,7 +111,16 @@ memory.pyは脳の記憶メカニズムを再現する:
 
 ```bash
 # 端末A（サーバー側）
+# 既定はローカルのみ(127.0.0.1)・認証必須
+# トークン未設定だと起動拒否される
+set MEMORY_SYNC_TOKEN=your_secret
 python memory.py sync serve
+
+# LANに公開する場合（明示）
+python memory.py sync serve --public
+
+# 無認証で動かす場合（非推奨・明示）
+python memory.py sync serve --insecure
 
 # 端末B（クライアント側）
 python memory.py sync pull 192.168.1.50:7235   # Aの記憶を取得
