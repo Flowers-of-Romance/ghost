@@ -18,10 +18,6 @@
   - `/surface`: 記憶を書き戻してから切断、素のLLMに戻る
 - **VALID_CATEGORIES定数**: DB CHECK制約とsyncバリデーションで共有
 
-### Changed
-- **memory_server.pyエラー応答**: 全部400だったのをエラー理由をレスポンスに含めるように
-- **日本語メッセージ統一**: sync serverの英語メッセージを日本語に戻す
-
 ## [v6] - 2026-03-11
 
 ### Added
