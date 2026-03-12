@@ -1,19 +1,34 @@
 # Changelog
 
-## [v6] - 2026-03-12
+## [v7] - 2026-03-12
+
+### Security (Codex review)
+- **SYNC_TOKEN必須化**: トークン未設定で同期サーバーが起動しない。無認証には`--insecure`を明示的に要求
+- **デフォルト127.0.0.1バインド**: `--public`で明示しない限りローカルのみ。トークン必須化と二重防御
+- **JSON検証・サイズ制限**: memory_server.py（256KB/20000文字）、memory_sync_server.py（5MB）にバリデーション追加
+- **prediction_error Noneガード**: embedding無効時に予測誤差が0.5固定で重要度が過剰に上がる問題を修正。Noneを返して補正をスキップ
+- **search_memories フォールバック**: embed_text()失敗時にLIKE検索にフォールバック
+- **sync_import入力検証**: 必須フィールドチェック、categoryホワイトリスト、行単位try/exceptで不正レコードをスキップ
+- **sync merge漏れ修正**: UPDATEにcategory/merged_from/context_expires_atを追加
 
 ### Added
-- **ghost-local.py**: ローカルLLM（ollama）に記憶を外付けするチャットクライアント
-  - 起動時に `recall` でシステムプロンプトに記憶を注入
-  - 毎ターン `search` で関連記憶を自動想起（「そういえば…」）
-  - コンテキスト圧縮: 20ターン超で古い会話を要約して落とす
-  - チャットコマンド: `/recall` `/search` `/sleep` `/mood` `/stats` `/model` `/help`
-  - セッション間隔に応じた自動sleep（replay/consolidate）
-  - 終了時に会話を記憶に自動保存
+- **GEMINI.md**: Gemini CLI統合ガイド。セッション開始時に自動dive、文字化け対策
+- **スキル（dive/surface）**: 脳への接続・切断。Claude Code/Gemini CLI両対応
+  - `/dive`: recallで記憶をロード、脳と同期
+  - `/surface`: 記憶を書き戻してから切断、素のLLMに戻る
+- **VALID_CATEGORIES定数**: DB CHECK制約とsyncバリデーションで共有
 
 ### Changed
-- **CLAUDE.md**: 俯瞰トリガーの記述を削除（必要なときはユーザーが直接指示する設計に）
-- **CLAUDE.md**: さらに圧縮（430B→370B）
+- **memory_server.pyエラー応答**: 全部400だったのをエラー理由をレスポンスに含めるように
+- **日本語メッセージ統一**: sync serverの英語メッセージを日本語に戻す
+
+## [v6] - 2026-03-11
+
+### Added
+- **ghost-local**: ローカルLLM（llama.cpp等）にghost記憶を統合するチャットインターフェース
+  - 会話開始時にrecallで記憶をロード
+  - 会話終了時に重要な発話を自動保存
+  - ローカルLLMとクラウドLLMが同じ脳を共有
 
 ## [v5] - 2026-03-11
 
