@@ -6,16 +6,19 @@ LLMに脳の仕組みを模した長期記憶を実装する。
 
 ```
 ghost/
-├── memory.py           # 記憶システム本体 — 海馬+新皮質
-├── Extract.py          # 会話ログからの記憶抽出 — 海馬の取り込み
-├── dream.py            # バロウズ式カットアップ夢 — 睡眠中の脳内イメージ
-├── interpret_dream.py  # 夢の解釈 — 断片の出典・情動分析
-├── autobiography.py    # 自伝的ナラティブ生成 — エピソード記憶の物語化
-├── memory_server.py      # embeddingモデル常駐サーバー — 高速化用
-├── memory_sync_server.py # P2P記憶同期サーバー — 複数端末間の記憶共有
-├── CLAUDE.md             # Claude Code統合ルール（最小化済み）
-├── MEMORY_GUIDE.md       # 記憶システム詳細ガイド（サブエージェント用）
-└── memory.db             # SQLiteデータベース（init後に生成）
+├── memory.py              # 記憶システム本体 — 海馬+新皮質
+├── Extract.py             # 会話ログからの記憶抽出 — 海馬の取り込み
+├── dream.py               # バロウズ式カットアップ夢 — 睡眠中の脳内イメージ
+├── interpret_dream.py     # 夢の解釈 — 断片の出典・情動分析
+├── autobiography.py       # 自伝的ナラティブ生成 — エピソード記憶の物語化
+├── memory_server.py       # embeddingモデル常駐サーバー — 高速化用
+├── memory_sync_server.py  # P2P記憶同期サーバー — 複数端末間の記憶共有
+├── CLAUDE.md              # Claude Code統合ルール
+├── GEMINI.md              # Gemini CLI統合ルール
+├── MEMORY_GUIDE.md        # 記憶システム詳細ガイド（サブエージェント用）
+├── .claude/skills/        # Claude Code用スキル（dive/surface/sleep）
+├── .gemini/skills/        # Gemini CLI用スキル（dive/surface/sleep）
+└── memory.db              # SQLiteデータベース（init後に生成）
 ```
 
 ## セットアップ
@@ -255,13 +258,35 @@ python interpret_dream.py
 python autobiography.py
 ```
 
-## Claude Codeとの統合
+## マルチAI統合
+
+ghostは複数のAI CLIから共有できる。各AIが同じ脳（memory.db）を読み書きする。
+
+| AI | 設定ファイル | スキル |
+|----|-------------|--------|
+| Claude Code | CLAUDE.md | `/dive` `/surface` `/sleep` |
+| Gemini CLI | GEMINI.md | `/dive` `/surface` `/sleep` |
+| Codex CLI | — | 直接memory.pyを実行 |
+
+### スキル
+
+| スキル | 説明 |
+|--------|------|
+| `/dive` | 脳に接続。recallで記憶をロード |
+| `/surface` | 記憶を書き戻してから切断。素のLLMに戻る |
+| `/sleep` | 夢→リプレイ→統合→スキーマ→手続き化→思考。カットアップで報告 |
+
+### Claude Code
 
 v3からCLAUDE.mdを最小化（70%削減）。記憶操作は**サブエージェントに委譲**し、メインのコンテキストウィンドウを汚染しない。
 
 - CLAUDE.md: サブエージェント委譲の指示だけ（~1.5KB）
 - MEMORY_GUIDE.md: コマンド詳細（サブエージェントが読む、メインには載らない）
 - 記憶の想起・検索結果はサブエージェント内で消費され、3行の要約だけがメインに返る
+
+### Gemini CLI
+
+GEMINI.mdでセッション開始時に自動diveする設計。Windows環境の文字化け対策（chcp 65001）を含む。
 
 ## データ
 
