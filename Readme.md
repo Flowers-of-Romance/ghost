@@ -19,7 +19,7 @@ ghost/
 ├── GEMINI.md              # Gemini CLI統合ルール
 ├── MEMORY_GUIDE.md        # 記憶システム詳細ガイド（サブエージェント用）
 ├── .claude/skills/        # Claude Code用スキル（dive/surface/sleep/delusion）
-├── .gemini/skills/        # Gemini CLI用スキル（dive/surface/sleep）
+├── .gemini/skills/        # Gemini CLI用スキル（dive/surface/sleep/delusion）
 └── memory.db              # SQLiteデータベース（init後に生成）
 ```
 
