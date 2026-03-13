@@ -1,5 +1,21 @@
 # Changelog
 
+## [v8] - 2026-03-13
+
+### Added
+- **delusionモード（完全記憶）**: 忘却・情動バイアス・再固定化を全て無効化した純粋検索。日付・期間フィルタ、全件ダンプ、対話文脈復元に対応
+- **raw_turnsテーブル**: Claude Codeの全対話ターンを原文のまま保存。セッション・タイムスタンプで索引
+- **FTS5全文検索**: fugashi形態素解析によるインデックス。memories/raw_turns両テーブルに対応。ベクトル検索との併用で高精度な日本語検索
+- **tokenizer.py**: fugashi → SudachiPy → 正規表現の3段フォールバック形態素解析
+- **planカテゴリ**: 減衰しない・忘却されない・統合されない特殊カテゴリ
+- **overviewコマンド**: 脳の俯瞰表示（ハブ記憶、覚醒度分布、タイムライン、FTS統計等）
+- **ghost-local.pyにdelusion/overview追加**: `/delusion`と`/overview`チャットコマンド
+- **/delusionスキル**: Claude Code/Gemini CLI両対応。2段階リレー検索の対話戦略
+
+### Changed
+- **Extract.py**: 記憶抽出と同時にraw_turnsへ全ターン保存
+- **README**: コマンドの用途別整理、ghost-local.py追加、マルチAI統合テーブル更新
+
 ## [v7] - 2026-03-12
 
 ### Security (Codex review)

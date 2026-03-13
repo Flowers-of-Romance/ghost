@@ -447,6 +447,53 @@ def is_duplicate(content, existing_memories, threshold=DUPLICATE_THRESHOLD):
     return False
 
 
+def _save_raw_turns(filepath, turns, dry_run=False):
+    """全ターンをraw_turnsテーブルに保存する（重複スキップ）。"""
+    if dry_run:
+        return 0
+
+    try:
+        from memory import save_raw_turn, get_connection
+    except ImportError:
+        return 0
+
+    session_id = Path(filepath).stem
+
+    # 既に保存済みのsession_idを確認
+    conn = get_connection()
+    try:
+        existing = conn.execute(
+            "SELECT count(*) FROM raw_turns WHERE session_id = ?",
+            (session_id,)
+        ).fetchone()[0]
+        if existing > 0:
+            conn.close()
+            return 0  # 既に保存済み
+    except Exception:
+        conn.close()
+        return 0
+    conn.close()
+
+    saved = 0
+    for turn in turns:
+        ts = turn.get("timestamp", "")
+        if not ts:
+            ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        # タイムスタンプがISO形式でない場合の正規化
+        if ts and 'T' not in ts:
+            ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+        save_raw_turn(
+            session_id=session_id,
+            role=turn["role"],
+            content=turn["text"],
+            timestamp=ts,
+        )
+        saved += 1
+
+    return saved
+
+
 def process_session(filepath, dry_run=False, seen_contents=None):
     """一つのセッションファイルを処理する。"""
     if seen_contents is None:
@@ -460,6 +507,11 @@ def process_session(filepath, dry_run=False, seen_contents=None):
         return 0
 
     print(f"  {len(turns)}ターンの会話")
+
+    # raw_turnsに全ターンを保存
+    raw_saved = _save_raw_turns(filepath, turns, dry_run)
+    if raw_saved > 0:
+        print(f"  {raw_saved}ターンをraw_turnsに保存")
 
     segments = segment_conversation(turns)
     print(f"  {len(segments)}セグメントに分割")
