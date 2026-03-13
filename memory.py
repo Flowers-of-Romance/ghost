@@ -45,6 +45,7 @@ memory.py - 脳に近い記憶システム
   python memory.py prospect add "trigger" "action"  # 予期記憶を登録
   python memory.py prospect list                     # 予期記憶一覧
   python memory.py prospect clear ID                 # 予期記憶を完了
+  python memory.py mutations [ID]                    # メタデータ変異履歴の閲覧
   python memory.py export [filename]                 # 記憶をJSONファイルにエクスポート
   python memory.py import filename                   # JSONファイルから記憶をインポート
   python memory.py sync status <host:port>           # 同期先の接続確認
@@ -117,6 +118,17 @@ HEBB_MARKER = "## 学習された行動指針"
 # 外傷的記憶: arousalがこの閾値を超えると既存メカニズムの挙動が変わる
 # 馴化しない、統合されない、減衰が遅い、夢に頻出する
 TRAUMA_AROUSAL_THRESHOLD = 0.85
+
+# メタデータ変容: sleepのたびに記憶のメタデータが隣接記憶の影響で変化する
+MUTATION_KW_ABSORB_PROB = 0.3       # キーワード吸収確率
+MUTATION_KW_MAX_ADD = 2             # 1サイクルあたり最大追加数
+MUTATION_KW_MAX_REMOVE = 1          # 1サイクルあたり最大削除数
+MUTATION_KW_CAP_RATIO = 1.5         # キーワード総数キャップ（元の数 × この倍率）
+MUTATION_EMBED_ALPHA = 0.05         # 埋め込みドリフト率
+MUTATION_MIN_LINKS_EMBED = 3        # 埋め込みドリフトに必要な最低リンク数
+MUTATION_MIN_LINKS_KW = 2           # キーワード吸収に必要な最低リンク数
+MUTATION_MIN_LINKS_EMOTION = 5      # 情動ドリフトに必要な最低リンク数
+MUTATION_COOLDOWN_HOURS = 4         # 連続変異防止のクールダウン時間
 
 # --- 情動辞書 ---
 EMOTION_MARKERS = {
@@ -722,6 +734,24 @@ def init_db():
 
     # 既存memoriesのFTSインデックスを構築（まだ入っていないもの）
     _rebuild_fts_index(conn)
+
+    # === メタデータ変容ログ ===
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS mutation_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id INTEGER NOT NULL,
+            field TEXT NOT NULL,
+            old_value TEXT,
+            new_value TEXT,
+            reason TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        )
+    """)
+    # last_mutated カラム追加
+    try:
+        conn.execute("ALTER TABLE memories ADD COLUMN last_mutated TEXT")
+    except sqlite3.OperationalError:
+        pass  # already exists
 
     conn.commit()
     conn.close()
@@ -2386,6 +2416,214 @@ def chain_memories(memory_id, depth=2):
     return result
 
 
+def mutate_metadata(conn):
+    """
+    メタデータ変容: 隣接記憶の影響でキーワード・埋め込み・情動が変化する。
+    データ（content）は不変、メタデータが変容する。
+    """
+    import numpy as np
+    now = datetime.now(timezone.utc)
+    now_str = now.strftime('%Y-%m-%dT%H:%M:%SZ')
+    stats = {"keywords": 0, "embeddings": 0, "emotions": 0}
+
+    # 除外対象のカテゴリ
+    exclude_categories = {"plan", "schema"}
+
+    # 変容に必要なカラムを全て取得
+    rows = conn.execute(
+        "SELECT id, content, category, keywords, emotions, embedding, last_mutated "
+        "FROM memories WHERE forgotten = 0 AND embedding IS NOT NULL"
+    ).fetchall()
+    if len(rows) < 2:
+        return stats
+
+    # 各記憶の隣接リンクを事前取得
+    all_links = conn.execute(
+        "SELECT source_id, target_id, strength FROM links"
+    ).fetchall()
+    neighbors = {}  # memory_id -> [(neighbor_id, strength)]
+    for link in all_links:
+        neighbors.setdefault(link["source_id"], []).append(
+            (link["target_id"], link["strength"])
+        )
+
+    # rowsをidで引けるようにする
+    row_by_id = {r["id"]: r for r in rows}
+
+    for row in rows:
+        mid = row["id"]
+
+        # 除外チェック: カテゴリ
+        if row["category"] in exclude_categories:
+            continue
+
+        # 除外チェック: クールダウン
+        last_mut = row["last_mutated"] if "last_mutated" in row.keys() else None
+        if last_mut:
+            try:
+                last_mut_dt = datetime.strptime(last_mut, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+                if (now - last_mut_dt).total_seconds() < MUTATION_COOLDOWN_HOURS * 3600:
+                    continue
+            except (ValueError, TypeError):
+                pass
+
+        my_neighbors = neighbors.get(mid, [])
+        num_links = len(my_neighbors)
+        mutated = False
+
+        # --- 1. キーワード吸収 ---
+        if num_links >= MUTATION_MIN_LINKS_KW:
+            my_keywords = json.loads(row["keywords"]) if row["keywords"] else []
+            original_count = len(my_keywords)
+            if original_count > 0:
+                cap = int(original_count * MUTATION_KW_CAP_RATIO)
+                my_kw_set = set(my_keywords)
+
+                # 隣接記憶のキーワードをstrengthで重み付け収集
+                candidate_scores = {}
+                for nid, strength in my_neighbors:
+                    n_row = row_by_id.get(nid)
+                    if not n_row:
+                        continue
+                    n_kw = json.loads(n_row["keywords"]) if n_row["keywords"] else []
+                    for kw in n_kw:
+                        if kw not in my_kw_set:
+                            candidate_scores[kw] = candidate_scores.get(kw, 0) + strength
+
+                # 上位3候補を確率的に吸収
+                top_candidates = sorted(candidate_scores.items(), key=lambda x: -x[1])[:3]
+                added = []
+                for kw, _score in top_candidates:
+                    if len(added) >= MUTATION_KW_MAX_ADD:
+                        break
+                    if len(my_keywords) >= cap:
+                        break
+                    if random.random() < MUTATION_KW_ABSORB_PROB:
+                        my_keywords.append(kw)
+                        added.append(kw)
+
+                # 最も孤立したキーワードを削除（隣接記憶に最も出現しないもの）
+                removed = []
+                if added and len(my_keywords) > original_count:
+                    # 各キーワードの隣接出現カウント
+                    neighbor_kw_counts = {}
+                    for nid, _s in my_neighbors:
+                        n_row = row_by_id.get(nid)
+                        if not n_row:
+                            continue
+                        n_kw = json.loads(n_row["keywords"]) if n_row["keywords"] else []
+                        for kw in n_kw:
+                            neighbor_kw_counts[kw] = neighbor_kw_counts.get(kw, 0) + 1
+                    # 元のキーワードの中で最も孤立しているもの
+                    original_kws = [kw for kw in my_keywords if kw not in added]
+                    if original_kws:
+                        most_isolated = min(original_kws, key=lambda kw: neighbor_kw_counts.get(kw, 0))
+                        if neighbor_kw_counts.get(most_isolated, 0) == 0:
+                            my_keywords.remove(most_isolated)
+                            removed.append(most_isolated)
+
+                if added or removed:
+                    old_kw = json.loads(row["keywords"]) if row["keywords"] else []
+                    new_kw_json = json.dumps(my_keywords, ensure_ascii=False)
+                    conn.execute("UPDATE memories SET keywords = ? WHERE id = ?",
+                                 (new_kw_json, mid))
+                    neighbor_ids = [str(nid) for nid, _ in my_neighbors[:5]]
+                    reason_parts = []
+                    if added:
+                        reason_parts.append(f"+{added}")
+                    if removed:
+                        reason_parts.append(f"-{removed}")
+                    conn.execute(
+                        "INSERT INTO mutation_log (memory_id, field, old_value, new_value, reason) "
+                        "VALUES (?, 'keywords', ?, ?, ?)",
+                        (mid,
+                         json.dumps(old_kw, ensure_ascii=False),
+                         new_kw_json,
+                         f"neighbor_absorption: #{',#'.join(neighbor_ids)}: {' '.join(reason_parts)}")
+                    )
+                    stats["keywords"] += 1
+                    mutated = True
+
+        # --- 2. 埋め込みドリフト ---
+        if num_links >= MUTATION_MIN_LINKS_EMBED and row["embedding"]:
+            neighbor_embeddings = []
+            for nid, _s in my_neighbors:
+                n_row = row_by_id.get(nid)
+                if n_row and n_row["embedding"]:
+                    neighbor_embeddings.append(bytes_to_vec(n_row["embedding"]))
+
+            if len(neighbor_embeddings) >= MUTATION_MIN_LINKS_EMBED:
+                current_vec = bytes_to_vec(row["embedding"])
+                centroid = np.mean(neighbor_embeddings, axis=0)
+                centroid_norm = np.linalg.norm(centroid)
+                if centroid_norm > 0:
+                    centroid = centroid / centroid_norm
+                    new_vec = (1 - MUTATION_EMBED_ALPHA) * current_vec + MUTATION_EMBED_ALPHA * centroid
+                    new_norm = np.linalg.norm(new_vec)
+                    if new_norm > 0:
+                        new_vec = new_vec / new_norm
+                        shift = float(1.0 - np.dot(current_vec, new_vec))
+                        conn.execute("UPDATE memories SET embedding = ? WHERE id = ?",
+                                     (vec_to_bytes(new_vec), mid))
+                        neighbor_ids = [str(nid) for nid, _ in my_neighbors[:5]]
+                        conn.execute(
+                            "INSERT INTO mutation_log (memory_id, field, old_value, new_value, reason) "
+                            "VALUES (?, 'embedding', ?, ?, ?)",
+                            (mid,
+                             f"shift={shift:.6f}",
+                             f"alpha={MUTATION_EMBED_ALPHA}",
+                             f"centroid_drift: #{',#'.join(neighbor_ids)}")
+                        )
+                        stats["embeddings"] += 1
+                        mutated = True
+
+        # --- 3. 情動ドリフト ---
+        if num_links >= MUTATION_MIN_LINKS_EMOTION:
+            # content + 隣接記憶の先頭50文字でdetect_emotions再実行
+            context_text = row["content"] if row["content"] else ""
+            for nid, _s in my_neighbors[:5]:
+                n_row = row_by_id.get(nid)
+                if n_row and n_row["content"]:
+                    context_text += " " + n_row["content"][:50]
+
+            new_emotions_raw = detect_emotions(context_text)
+            new_emotion_names = new_emotions_raw[0] if new_emotions_raw else []
+            current_emotions = json.loads(row["emotions"]) if row["emotions"] else []
+            current_set = set(current_emotions)
+
+            added_emotions = []
+            for emo in new_emotion_names:
+                if emo not in current_set:
+                    if random.random() < 0.2:  # P=0.2で追加
+                        added_emotions.append(emo)
+
+            if added_emotions:
+                updated_emotions = current_emotions + added_emotions
+                new_emo_json = json.dumps(updated_emotions, ensure_ascii=False)
+                conn.execute("UPDATE memories SET emotions = ? WHERE id = ?",
+                             (new_emo_json, mid))
+                neighbor_ids = [str(nid) for nid, _ in my_neighbors[:5]]
+                conn.execute(
+                    "INSERT INTO mutation_log (memory_id, field, old_value, new_value, reason) "
+                    "VALUES (?, 'emotions', ?, ?, ?)",
+                    (mid,
+                     json.dumps(current_emotions, ensure_ascii=False),
+                     new_emo_json,
+                     f"emotion_drift: #{',#'.join(neighbor_ids)}: +{added_emotions}")
+                )
+                stats["emotions"] += 1
+                mutated = True
+
+        # updated_at と last_mutated を更新
+        if mutated:
+            conn.execute(
+                "UPDATE memories SET last_mutated = ?, updated_at = ? WHERE id = ?",
+                (now_str, now_str, mid)
+            )
+
+    return stats
+
+
 def replay_memories():
     """
     リプレイ: リンク再計算 + 弱い記憶の自動忘却 + 統合提案
@@ -2455,7 +2693,10 @@ def replay_memories():
                 skip_pairs.add((row_b["id"], row_a["id"]))
                 new_links += 1
 
-    # 2. 弱い記憶の自動忘却（planカテゴリは忘却しない）
+    # 2.5. メタデータ変容（リンク再計算後、忘却前）
+    mutation_stats = mutate_metadata(conn)
+
+    # 3. 弱い記憶の自動忘却（planカテゴリは忘却しない）
     auto_forgotten = 0
     for row in rows:
         if row["category"] == "plan":
@@ -2474,7 +2715,11 @@ def replay_memories():
 
     total_links = conn.execute("SELECT COUNT(*) FROM links").fetchone()[0] // 2
     conn.close()
+    mut_total = mutation_stats["keywords"] + mutation_stats["embeddings"] + mutation_stats["emotions"]
+    mut_detail = f"キーワード{mutation_stats['keywords']}件, 埋め込み{mutation_stats['embeddings']}件, 情動{mutation_stats['emotions']}件"
     print(f"✓ リプレイ完了: {total_links}リンク（刈込{pruned}本, 減衰{downscaled}本, 新規{new_links}本）, {auto_forgotten}件自動忘却")
+    if mut_total > 0:
+        print(f"  変異: {mut_detail}")
 
     # 3. 統合候補を表示
     consolidate_memories(dry_run=True)
@@ -4209,6 +4454,36 @@ def main():
                 )
                 conn.commit()
                 conn.close()
+
+    elif cmd == "mutations":
+        conn = get_connection()
+        if len(sys.argv) > 2:
+            # 特定記憶の全履歴
+            mid = int(sys.argv[2])
+            logs = conn.execute(
+                "SELECT * FROM mutation_log WHERE memory_id = ? ORDER BY created_at DESC",
+                (mid,)
+            ).fetchall()
+            if not logs:
+                print(f"#{mid} の変異履歴はありません")
+            else:
+                print(f"#{mid} の変異履歴 ({len(logs)}件):")
+                for log in logs:
+                    print(f"  [{log['created_at']}] {log['field']}: {log['reason']}")
+                    print(f"    旧: {log['old_value']}")
+                    print(f"    新: {log['new_value']}")
+        else:
+            # 直近20件
+            logs = conn.execute(
+                "SELECT * FROM mutation_log ORDER BY created_at DESC LIMIT 20"
+            ).fetchall()
+            if not logs:
+                print("変異履歴はありません")
+            else:
+                print(f"直近の変異履歴 ({len(logs)}件):")
+                for log in logs:
+                    print(f"  [{log['created_at']}] #{log['memory_id']} {log['field']}: {log['reason']}")
+        conn.close()
 
     elif cmd == "memo":
         if len(sys.argv) < 3:
