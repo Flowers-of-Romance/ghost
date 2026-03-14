@@ -753,6 +753,14 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # already exists
 
+    # sleep_meta: nap/sleep のメタ情報
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sleep_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
     conn.commit()
     conn.close()
     print(f"✓ memory.db を初期化しました: {DB_PATH}")
@@ -1053,15 +1061,18 @@ def build_schemas(dry_run=False):
     # サイズ降順でソート
     cliques.sort(key=lambda c: len(c), reverse=True)
 
-    # 既存スキーマの merged_from を取得して重複チェック用にセット化
+    # 既存スキーマの merged_from とキーワードを取得して重複チェック用に
     existing_schemas = conn.execute(
-        "SELECT merged_from FROM memories "
+        "SELECT merged_from, keywords FROM memories "
         "WHERE forgotten = 0 AND category = 'schema' AND merged_from IS NOT NULL"
     ).fetchall()
     existing_sets = set()
+    existing_keyword_sets = []
     for row in existing_schemas:
         ids = frozenset(json.loads(row["merged_from"]))
         existing_sets.add(ids)
+        kws = set(json.loads(row["keywords"])) if row["keywords"] else set()
+        existing_keyword_sets.append(kws)
 
     schema_count = 0
     used_ids = set()
@@ -1083,6 +1094,20 @@ def build_schemas(dry_run=False):
             for kw in json.loads(m["keywords"]):
                 kw_count[kw] = kw_count.get(kw, 0) + 1
         top_keywords = sorted(kw_count.keys(), key=lambda k: -kw_count[k])[:15]
+
+        # 既存スキーマとキーワードが70%以上重複していたらスキップ
+        candidate_kws = set(top_keywords[:8])
+        is_duplicate = False
+        for existing_kws in existing_keyword_sets:
+            if not candidate_kws or not existing_kws:
+                continue
+            overlap = len(candidate_kws & existing_kws)
+            smaller = min(len(candidate_kws), len(existing_kws))
+            if smaller > 0 and overlap / smaller >= 0.7:
+                is_duplicate = True
+                break
+        if is_duplicate:
+            continue
 
         # 情動の合集合
         all_emotions = set()
@@ -2630,7 +2655,7 @@ def replay_memories():
     """
     conn = get_connection()
     rows = conn.execute(
-        "SELECT id, embedding, importance, arousal, access_count, created_at, category "
+        "SELECT id, embedding, importance, arousal, access_count, created_at, category, emotions "
         "FROM memories WHERE forgotten = 0 AND embedding IS NOT NULL"
     ).fetchall()
 
@@ -2643,11 +2668,14 @@ def replay_memories():
     #    全リンクのstrengthを一律減衰させ、閾値以下を刈り込む。
     #    外傷的記憶（arousal >= 閾値）に繋がるリンクは減衰を免除。
     arousal_by_id = {row["id"]: row["arousal"] for row in rows}
+    emotions_by_id = {}
+    for row in rows:
+        emotions_by_id[row["id"]] = json.loads(row["emotions"]) if row["emotions"] else []
+    created_at_by_id = {row["id"]: row["created_at"] for row in rows}
 
     existing_links = conn.execute("SELECT id, source_id, target_id, strength FROM links").fetchall()
     pruned = 0
     downscaled = 0
-    pruned_pairs = set()  # 刈り込まれたペア（同じリプレイ内で復活させない）
     for link in existing_links:
         src_arousal = arousal_by_id.get(link["source_id"], 0)
         tgt_arousal = arousal_by_id.get(link["target_id"], 0)
@@ -2657,43 +2685,61 @@ def replay_memories():
         new_strength = link["strength"] * 0.9
         if new_strength < LINK_THRESHOLD:
             conn.execute("DELETE FROM links WHERE id = ?", (link["id"],))
-            pruned_pairs.add((link["source_id"], link["target_id"]))
             pruned += 1
         else:
             conn.execute("UPDATE links SET strength = ? WHERE id = ?",
                          (new_strength, link["id"]))
             downscaled += 1
 
-    # 2. 新しい記憶ペアのリンクを追加
-    #    既存リンク・刈込済みペアはスキップ（覚醒時の共活性化で復活すべき）
-    existing_pairs = set(
-        (r["source_id"], r["target_id"])
-        for r in conn.execute("SELECT source_id, target_id FROM links").fetchall()
-    )
-    skip_pairs = existing_pairs | pruned_pairs
-    new_links = 0
-    for i, row_a in enumerate(rows):
-        vec_a = bytes_to_vec(row_a["embedding"])
-        for row_b in rows[i+1:]:
-            if (row_a["id"], row_b["id"]) in skip_pairs:
-                continue
-            vec_b = bytes_to_vec(row_b["embedding"])
-            sim = cosine_similarity(vec_a, vec_b)
+    # 2. 海馬リプレイ — 3軸でリンクを選択的に強化
+    #    (1) 高arousal: 重要だが外傷的ではない記憶間
+    #    (2) surprise: 報酬予測誤差（ドーパミン）の模倣
+    #    (3) 時間的近接: 24h以内の記憶 = 連鎖再生の模倣
+    REPLAY_AROUSAL_FLOOR = 0.3
+    REPLAY_BOOST = 1.05
+    boosted = 0
+    surviving_links = conn.execute(
+        "SELECT id, source_id, target_id, strength FROM links"
+    ).fetchall()
+    for link in surviving_links:
+        src_ar = arousal_by_id.get(link["source_id"], 0)
+        tgt_ar = arousal_by_id.get(link["target_id"], 0)
+        # 外傷的リンクは既に減衰免除なので二重強化しない
+        if src_ar >= TRAUMA_AROUSAL_THRESHOLD or tgt_ar >= TRAUMA_AROUSAL_THRESHOLD:
+            continue
 
-            if sim > LINK_THRESHOLD:
-                conn.execute(
-                    "INSERT INTO links (source_id, target_id, strength) VALUES (?, ?, ?)",
-                    (row_a["id"], row_b["id"], sim)
-                )
-                conn.execute(
-                    "INSERT INTO links (source_id, target_id, strength) VALUES (?, ?, ?)",
-                    (row_b["id"], row_a["id"], sim)
-                )
-                skip_pairs.add((row_a["id"], row_b["id"]))
-                skip_pairs.add((row_b["id"], row_a["id"]))
-                new_links += 1
+        should_boost = False
 
-    # 2.5. メタデータ変容（リンク再計算後、忘却前）
+        # 条件1: 高arousal（既存）
+        if src_ar >= REPLAY_AROUSAL_FLOOR and tgt_ar >= REPLAY_AROUSAL_FLOOR:
+            should_boost = True
+
+        # 条件2: surprise（報酬予測誤差の模倣）
+        src_emotions = emotions_by_id.get(link["source_id"], [])
+        tgt_emotions = emotions_by_id.get(link["target_id"], [])
+        if "surprise" in src_emotions or "surprise" in tgt_emotions:
+            should_boost = True
+
+        # 条件3: 時間的近接（24h以内 = 連鎖再生の模倣）
+        src_t = created_at_by_id.get(link["source_id"])
+        tgt_t = created_at_by_id.get(link["target_id"])
+        if src_t and tgt_t:
+            try:
+                t1 = datetime.fromisoformat(src_t.replace('Z', '+00:00'))
+                t2 = datetime.fromisoformat(tgt_t.replace('Z', '+00:00'))
+                if abs((t1 - t2).total_seconds()) < 86400:
+                    should_boost = True
+            except (ValueError, AttributeError):
+                pass
+
+        if should_boost:
+            new_str = min(link["strength"] * REPLAY_BOOST, 1.0)
+            if new_str != link["strength"]:
+                conn.execute("UPDATE links SET strength = ? WHERE id = ?",
+                             (new_str, link["id"]))
+                boosted += 1
+
+    # 2.5. メタデータ変容（忘却前）
     mutation_stats = mutate_metadata(conn)
 
     # 3. 弱い記憶の自動忘却（planカテゴリは忘却しない）
@@ -2717,12 +2763,35 @@ def replay_memories():
     conn.close()
     mut_total = mutation_stats["keywords"] + mutation_stats["embeddings"] + mutation_stats["emotions"]
     mut_detail = f"キーワード{mutation_stats['keywords']}件, 埋め込み{mutation_stats['embeddings']}件, 情動{mutation_stats['emotions']}件"
-    print(f"✓ リプレイ完了: {total_links}リンク（刈込{pruned}本, 減衰{downscaled}本, 新規{new_links}本）, {auto_forgotten}件自動忘却")
+    print(f"✓ リプレイ完了: {total_links}リンク（刈込{pruned}本, 減衰{downscaled}本, 強化{boosted}本）, {auto_forgotten}件自動忘却")
     if mut_total > 0:
         print(f"  変異: {mut_detail}")
 
     # 3. 統合候補を表示
     consolidate_memories(dry_run=True)
+
+
+def nap():
+    """軽量sleep。replay + consolidateだけ。LLM不要。"""
+    conn = get_connection()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sleep_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    conn.execute(
+        "INSERT OR REPLACE INTO sleep_meta (key, value) VALUES ('last_nap', ?)",
+        (now,)
+    )
+    conn.commit()
+    conn.close()
+
+    print("(うとうと...)")
+    replay_memories()
+    consolidate_memories()
+    print(f"(nap完了: {now})")
 
 
 # ============================================================
@@ -4203,6 +4272,9 @@ def main():
 
     elif cmd == "replay":
         replay_memories()
+
+    elif cmd == "nap":
+        nap()
 
     elif cmd == "consolidate":
         dry = "--dry-run" in sys.argv
