@@ -13,6 +13,7 @@ ghost/
 ├── interpret_dream.py     # 夢の解釈 — 断片の出典・情動分析
 ├── autobiography.py       # 自伝的ナラティブ生成 — エピソード記憶の物語化
 ├── memory_server.py       # embeddingモデル常駐サーバー — 高速化用
+├── ghost_hooks.py         # PostToolUse hook — plan警告 + 自動nap
 ├── ghost-local.py         # ローカルLLMチャット（ollama） — 記憶付き対話
 ├── memory_sync_server.py  # P2P記憶同期サーバー — 複数端末間の記憶共有
 ├── CLAUDE.md              # Claude Code統合ルール
@@ -177,8 +178,11 @@ sentence-transformersがあれば **ベクトル検索**（384次元、コサイ
 
 寝てる間に脳がやること。手動で個別実行もできる。
 
+30分以上操作がないと **自動nap** が発動する（PostToolUse hook経由）。napはreplay + consolidateだけの軽量sleep。LLM不要。
+
 | コマンド | 何をする | 脳の何に相当 |
 |---------|---------|------------|
+| `nap` | replay + consolidateのみ（30分無操作で自動発動） | うたた寝 |
 | `replay` | リンク再計算、刈り込み、メタデータ変容、自動忘却 | シナプスホメオスタシス + メタデータ変容 |
 | `mutations [ID]` | メタデータ変異履歴の閲覧（直近20件 or 特定記憶） | 監査ログ |
 | `consolidate` | 類似度が非常に高い記憶ペアを1つに統合 | 記憶の統合・圧縮 |

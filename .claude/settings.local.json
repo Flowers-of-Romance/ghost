@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "command": "python ghost_hooks.py",
+        "timeout": 60000
+      }
+    ]
+  }
+}
