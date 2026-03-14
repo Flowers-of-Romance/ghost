@@ -1,5 +1,18 @@
 # Changelog
 
+## [v10] - 2026-03-15
+
+### Added
+- **自動nap**: 30分以上操作がないと次のツール使用時に軽量sleepが自動発動。PostToolUse hook（ghost_hooks.py）がタイムスタンプを管理
+- **`nap`コマンド**: replay + consolidateだけのLLM不要な軽量sleep
+- **sleep_metaテーブル**: nap/sleepのメタ情報（last_napタイムスタンプ等）を記録
+- **PostToolUse hook登録**: `.claude/settings.local.json`にghost_hooks.pyを登録
+
+### Changed
+- **replay**: 新規リンク追加を廃止し、既存リンクの3軸選択的強化に変更（高arousal / surprise / 時間的近接24h以内）
+- **schema**: 既存スキーマとキーワード70%以上重複する候補をスキップ
+- **ghost_hooks.py**: plan警告に加え、アイドル検知+自動napを統合
+
 ## [v9] - 2026-03-13
 
 ### Added
