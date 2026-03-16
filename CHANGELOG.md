@@ -1,5 +1,28 @@
 # Changelog
 
+## [v11] - 2026-03-16
+
+### Added
+- **修正可能性（correctability）**: 間違えたとき致命的にならない構造
+  - **provenance**: 記憶の出自を追跡（user_explicit / wander / consolidation）
+  - **confidence**: 記憶の信頼度（user: 0.8, wander: 0.3, consolidation: max×0.9）
+  - **memory_versionsテーブル**: interfere/consolidate/correctの前に旧版をスナップショット保存。gitのように全版保持
+  - **revision_count**: 改訂回数。頻繁に改訂される記憶は安定性スコアが下がる
+  - **`correct ID "内容"`コマンド**: ユーザーによる明示的な記憶修正。旧版を保存してから上書き
+  - **`versions ID`コマンド**: 記憶の全版履歴を表示
+- **wanderノイズゲート**: `_validate_output()` — 短すぎる出力、繰り返し文字、非アルファベット過多を検出して除去
+- **`wander.py --cleanup`**: 既存のwanderノイズ記憶（))))パターン、`<think>`ダンプ、非日本語）をforgotten=1に
+
+### Changed
+- **recall_important / search_memories**: スコア計算に`(0.5 + confidence * 0.5)`と安定性`1/(1 + revision_count * 0.15)`を乗算。wander記憶(0.3)→×0.65、user記憶(0.8)→×0.9
+- **consolidate_memories**: 統合記憶のconfidence = max(元) × 0.9、provenance = 'consolidation'。統合前にスナップショット保存
+- **interfere**: 干渉前にスナップショット保存
+- **add_memory**: sourceベースでprovenance/confidenceを自動設定。出力に信頼度を表示
+- **format_memory_detail**: 信頼度・出自・改訂回数を表示
+- **export_memories / sync_export**: provenance, confidenceを含める
+- **dream.py**: time.sleep演出を削除（5.4s→0.07s）。Claude Codeからの実行時に不要な待ち時間だった
+- **wander.py _store()**: INSERT時にprovenance='wander', confidence=0.3を設定
+
 ## [v10] - 2026-03-15
 
 ### Added

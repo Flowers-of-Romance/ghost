@@ -133,7 +133,6 @@ def dream_sequence(duration_lines=20):
     print()
     print("░▒▓ 入眠 ▓▒░")
     print()
-    time.sleep(0.3)
 
     for i in range(duration_lines):
         r = random.random()
@@ -204,11 +203,7 @@ def dream_sequence(duration_lines=20):
             # 通常のカットアップ
             print(cutup(weighted_fragments, weighted_contents, random.randint(2, 4)))
 
-        # 表示速度にゆらぎ
-        time.sleep(random.uniform(0.08, 0.25))
-
     print()
-    time.sleep(0.3)
     print("░▒▓ 覚醒 ▓▒░")
     print()
 

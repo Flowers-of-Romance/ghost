@@ -45,6 +45,8 @@ memory.py - 脳に近い記憶システム
   python memory.py prospect add "trigger" "action"  # 予期記憶を登録
   python memory.py prospect list                     # 予期記憶一覧
   python memory.py prospect clear ID                 # 予期記憶を完了
+  python memory.py correct ID "new_content"           # 記憶を修正（旧版を保存）
+  python memory.py versions ID                       # 記憶の版履歴を表示
   python memory.py mutations [ID]                    # メタデータ変異履歴の閲覧
   python memory.py export [filename]                 # 記憶をJSONファイルにエクスポート
   python memory.py import filename                   # JSONファイルから記憶をインポート
@@ -118,6 +120,12 @@ HEBB_MARKER = "## 学習された行動指針"
 # 外傷的記憶: arousalがこの閾値を超えると既存メカニズムの挙動が変わる
 # 馴化しない、統合されない、減衰が遅い、夢に頻出する
 TRAUMA_AROUSAL_THRESHOLD = 0.85
+
+# 修正可能性: 記憶の出自と信頼度
+CONFIDENCE_DEFAULT = 0.7
+CONFIDENCE_USER_EXPLICIT = 0.8
+CONFIDENCE_WANDER = 0.3
+CONFIDENCE_CONSOLIDATION_FACTOR = 0.9
 
 # メタデータ変容: sleepのたびに記憶のメタデータが隣接記憶の影響で変化する
 MUTATION_KW_ABSORB_PROB = 0.3       # キーワード吸収確率
@@ -753,6 +761,43 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # already exists
 
+    # provenance カラム追加
+    try:
+        conn.execute("ALTER TABLE memories ADD COLUMN provenance TEXT DEFAULT 'unknown'")
+    except sqlite3.OperationalError:
+        pass
+    # confidence カラム追加
+    try:
+        conn.execute("ALTER TABLE memories ADD COLUMN confidence REAL DEFAULT 0.7")
+    except sqlite3.OperationalError:
+        pass
+    # revision_count カラム追加
+    try:
+        conn.execute("ALTER TABLE memories ADD COLUMN revision_count INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+
+    # 既存データのバックフィル
+    conn.execute("UPDATE memories SET provenance='wander', confidence=0.3 WHERE provenance='unknown' AND source_conversation LIKE 'wander:%'")
+    conn.execute("UPDATE memories SET provenance='user_explicit', confidence=0.8 WHERE provenance='unknown' AND (source_conversation IS NULL OR source_conversation NOT LIKE 'wander:%')")
+    conn.execute("UPDATE memories SET provenance='consolidation', confidence=0.63 WHERE provenance='unknown' AND merged_from IS NOT NULL")
+
+    # memory_versions テーブル
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            importance INTEGER,
+            arousal REAL,
+            confidence REAL,
+            reason TEXT,
+            superseded_by INTEGER,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            FOREIGN KEY (memory_id) REFERENCES memories(id)
+        )
+    """)
+
     # sleep_meta: nap/sleep のメタ情報
     conn.execute("""
         CREATE TABLE IF NOT EXISTS sleep_meta (
@@ -883,7 +928,7 @@ def consolidate_memories(dry_run=False):
     """
     conn = get_connection()
     rows = conn.execute(
-        "SELECT id, content, keywords, embedding, importance, arousal, emotions, category "
+        "SELECT id, content, keywords, embedding, importance, arousal, emotions, category, confidence "
         "FROM memories WHERE forgotten = 0 AND embedding IS NOT NULL"
     ).fetchall()
 
@@ -958,16 +1003,26 @@ def consolidate_memories(dry_run=False):
             vec = embed_text(merged_content, is_query=False)
             blob = vec_to_bytes(vec) if vec is not None else None
 
+            # 統合記憶の信頼度 = max(元の信頼度) * 減衰係数
+            a_conf = a["confidence"] if "confidence" in a.keys() and a["confidence"] is not None else CONFIDENCE_DEFAULT
+            b_conf = b["confidence"] if "confidence" in b.keys() and b["confidence"] is not None else CONFIDENCE_DEFAULT
+            merged_confidence = max(a_conf, b_conf) * CONFIDENCE_CONSOLIDATION_FACTOR
+
             conn.execute(
                 """INSERT INTO memories
                    (content, category, importance, emotions, arousal, keywords,
-                    embedding, merged_from)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    embedding, merged_from, provenance, confidence)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'consolidation', ?)""",
                 (merged_content, merged_category, merged_importance,
                  json.dumps(merged_emotions), merged_arousal,
                  json.dumps(merged_keywords, ensure_ascii=False),
-                 blob, json.dumps([a["id"], b["id"]]))
+                 blob, json.dumps([a["id"], b["id"]]), merged_confidence)
             )
+            new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+            # バージョン保存してから元の記憶を忘却
+            _snapshot_version(conn, a["id"], "consolidation", superseded_by=new_id)
+            _snapshot_version(conn, b["id"], "consolidation", superseded_by=new_id)
 
             # 元の記憶を忘却
             conn.execute("UPDATE memories SET forgotten = 1 WHERE id IN (?, ?)",
@@ -1311,6 +1366,100 @@ def _write_procedures_to_learned_md():
 
 
 # ============================================================
+# 6.5 記憶バージョニング — 修正可能性の基盤
+# ============================================================
+
+def _snapshot_version(conn, memory_id, reason, superseded_by=None):
+    """現在の記憶の状態をmemory_versionsに保存し、revision_countをインクリメント。"""
+    row = conn.execute(
+        "SELECT content, importance, arousal, confidence FROM memories WHERE id = ?",
+        (memory_id,)
+    ).fetchone()
+    if not row:
+        return
+    conn.execute(
+        """INSERT INTO memory_versions (memory_id, content, importance, arousal, confidence, reason, superseded_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (memory_id, row["content"], row["importance"], row["arousal"],
+         row["confidence"], reason, superseded_by)
+    )
+    conn.execute(
+        "UPDATE memories SET revision_count = COALESCE(revision_count, 0) + 1 WHERE id = ?",
+        (memory_id,)
+    )
+
+
+def correct_memory(memory_id, new_content):
+    """ユーザーによる明示的な記憶修正。旧版を保存してから上書き。"""
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+    if not row:
+        print(f"記憶 #{memory_id} が見つかりません")
+        conn.close()
+        return
+
+    # 旧版を保存
+    _snapshot_version(conn, memory_id, "user_correction")
+
+    # 内容を更新
+    vec = embed_text(new_content, is_query=False)
+    blob = vec_to_bytes(vec) if vec is not None else None
+    keywords = extract_keywords(new_content)
+
+    conn.execute(
+        """UPDATE memories SET content = ?, embedding = ?, keywords = ?,
+           confidence = ?, provenance = 'user_explicit'
+           WHERE id = ?""",
+        (new_content, blob, json.dumps(keywords, ensure_ascii=False),
+         CONFIDENCE_USER_EXPLICIT, memory_id)
+    )
+
+    # FTSインデックスを更新
+    try:
+        from tokenizer import tokenize
+        tokenized = tokenize(new_content)
+        conn.execute("DELETE FROM memories_fts WHERE memory_id = ?", (memory_id,))
+        conn.execute("INSERT INTO memories_fts (content, memory_id) VALUES (?, ?)",
+                     (tokenized, memory_id))
+    except Exception:
+        pass
+
+    conn.commit()
+    rev = conn.execute("SELECT revision_count FROM memories WHERE id = ?", (memory_id,)).fetchone()
+    print(f"✓ 記憶 #{memory_id} を修正しました (改訂: {rev[0]}回)")
+    conn.close()
+
+
+def show_versions(memory_id):
+    """記憶の全版履歴を表示する。"""
+    conn = get_connection()
+    row = conn.execute("SELECT content, revision_count FROM memories WHERE id = ?", (memory_id,)).fetchone()
+    if not row:
+        print(f"記憶 #{memory_id} が見つかりません")
+        conn.close()
+        return
+
+    versions = conn.execute(
+        "SELECT * FROM memory_versions WHERE memory_id = ? ORDER BY created_at ASC",
+        (memory_id,)
+    ).fetchall()
+
+    if not versions:
+        print(f"記憶 #{memory_id} の版履歴はありません (現在の内容: {row['content'][:60]})")
+        conn.close()
+        return
+
+    print(f"記憶 #{memory_id} の版履歴 ({len(versions)}版):")
+    for i, v in enumerate(versions):
+        sup = f" → #{v['superseded_by']}" if v["superseded_by"] else ""
+        conf_str = f" 信頼度:{v['confidence']:.0%}" if v["confidence"] is not None else ""
+        print(f"  v{i+1} [{v['created_at']}] {v['reason']}{sup}{conf_str}")
+        print(f"     {v['content'][:80]}")
+    print(f"  現在: {row['content'][:80]}")
+    conn.close()
+
+
+# ============================================================
 # 7. 干渉忘却 — 新しい記憶が古い記憶を弱める
 # ============================================================
 
@@ -1338,6 +1487,8 @@ def interfere(conn, new_content, new_vec):
         sim = cosine_similarity(new_vec, old_vec)
 
         if sim > INTERFERENCE_THRESHOLD:
+            # バージョン保存
+            _snapshot_version(conn, row["id"], "interference")
             # 古い記憶の重要度を1段階下げる
             new_imp = max(1, row["importance"] - 1)
             new_arousal = max(0.0, row["arousal"] - 0.1)
@@ -1578,8 +1729,20 @@ def prospect_clear(prospect_id):
 # メイン操作
 # ============================================================
 
-def add_memory(content, category="fact", source=None):
+def add_memory(content, category="fact", source=None, confidence=None, provenance=None):
     emotions, arousal, importance = detect_emotions(content)
+
+    # 出自と信頼度の自動設定
+    if provenance is None:
+        if source and source.startswith("wander:"):
+            provenance = "wander"
+        else:
+            provenance = "user_explicit"
+    if confidence is None:
+        if provenance == "wander":
+            confidence = CONFIDENCE_WANDER
+        else:
+            confidence = CONFIDENCE_USER_EXPLICIT
     keywords = extract_keywords(content)
 
     # 会話の情動が気分に影響する（情動伝染）
@@ -1624,11 +1787,12 @@ def add_memory(content, category="fact", source=None):
         """INSERT INTO memories
            (content, category, importance, emotions, arousal, keywords,
             source_conversation, embedding, context_expires_at, temporal_context,
-            spatial_context, uuid, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            spatial_context, uuid, updated_at, provenance, confidence)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (content, category, importance,
          json.dumps(emotions), arousal, json.dumps(keywords, ensure_ascii=False),
-         source, blob, context_expires, temporal_ctx, spatial_ctx, mem_uuid, now_utc)
+         source, blob, context_expires, temporal_ctx, spatial_ctx, mem_uuid, now_utc,
+         provenance, confidence)
     )
     conn.commit()
     new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -1694,6 +1858,7 @@ def add_memory(content, category="fact", source=None):
     print(f"  情動: {emo_str} (覚醒度:{arousal:.2f}) → 重要度:{importance}")
     print(f"  断片: [{kw_str}]")
     print(f"  カテゴリ: {category}{link_str}{intf_str}{pred_str}")
+    print(f"  信頼度: {confidence:.0%} ({provenance})")
 
     # ひらめき連想: arousalが高いinsightは連想を自動で走らせて提案する
     if arousal >= 0.5 and "insight" in emotions:
@@ -1950,8 +2115,16 @@ def search_memories(query, limit=10, use_like=False, fuzzy=False):
             # 気分一致性ブースト
             mood_boost = get_mood_congruence_boost(row)
 
+            # 信頼度による重み付け
+            conf = row["confidence"] if "confidence" in row.keys() and row["confidence"] is not None else CONFIDENCE_DEFAULT
+            confidence_weight = 0.5 + conf * 0.5
+
+            # 安定性スコア
+            rev = row["revision_count"] if "revision_count" in row.keys() and row["revision_count"] is not None else 0
+            stability = 1.0 / (1.0 + rev * 0.15)
+
             # 総合スコア
-            score = sim * emo_boost * fresh_factor * access_boost * priming * temporal * spatial * mood_boost
+            score = sim * emo_boost * fresh_factor * access_boost * priming * temporal * spatial * mood_boost * confidence_weight * stability
             scored.append((row, score, sim))
 
         scored.sort(key=lambda x: x[1], reverse=True)
@@ -2805,7 +2978,7 @@ def _show_recent_insights():
     # access_count == 0 = まだ一度も想起されていない（=未表示）
     rows = conn.execute(
         "SELECT id, content FROM memories "
-        "WHERE forgotten = 0 AND source_conversation LIKE 'think:%' AND access_count = 0 "
+        "WHERE forgotten = 0 AND (source_conversation LIKE 'think:%' OR source_conversation LIKE 'wander:%') AND access_count = 0 "
         "ORDER BY created_at DESC LIMIT 2"
     ).fetchall()
     if rows:
@@ -3007,7 +3180,15 @@ def recall_important(limit=15):
         # 気分一致性ブースト
         mood_boost = get_mood_congruence_boost(row)
 
-        score = emo_boost * (0.5 + fresh * 0.5) * access_boost * priming * spatial * mood_boost
+        # 信頼度による重み付け
+        conf = row["confidence"] if "confidence" in row.keys() and row["confidence"] is not None else CONFIDENCE_DEFAULT
+        confidence_weight = 0.5 + conf * 0.5
+
+        # 安定性スコア（改訂が多いほど信頼性が下がる）
+        rev = row["revision_count"] if "revision_count" in row.keys() and row["revision_count"] is not None else 0
+        stability = 1.0 / (1.0 + rev * 0.15)
+
+        score = emo_boost * (0.5 + fresh * 0.5) * access_boost * priming * spatial * mood_boost * confidence_weight * stability
         scored.append((row, score))
 
     scored.sort(key=lambda x: x[1], reverse=True)
@@ -3657,6 +3838,17 @@ def format_memory_detail(row):
                 lines.append(f"  場所: {loc}")
         except (json.JSONDecodeError, TypeError):
             pass
+    # 信頼度・出自
+    conf = row["confidence"] if "confidence" in row.keys() and row["confidence"] is not None else None
+    prov = row["provenance"] if "provenance" in row.keys() and row["provenance"] else None
+    if conf is not None or prov:
+        conf_str = f"{conf:.0%}" if conf is not None else "不明"
+        prov_str = prov or "不明"
+        lines.append(f"  信頼度: {conf_str} | 出自: {prov_str}")
+    # 改訂回数
+    rev = row["revision_count"] if "revision_count" in row.keys() and row["revision_count"] is not None else 0
+    if rev > 0:
+        lines.append(f"  改訂: {rev}回")
     if merged:
         lines.append(f"  統合元: #{', #'.join(str(m) for m in merged)}")
     if row["source_conversation"]:
@@ -3691,6 +3883,8 @@ def export_memories(filename=None):
             "temporal_context": json.loads(row["temporal_context"]) if row["temporal_context"] else None,
             "spatial_context": json.loads(row["spatial_context"]) if row.get("spatial_context") else None,
             "merged_from": json.loads(row["merged_from"]) if row["merged_from"] else None,
+            "provenance": row["provenance"] if "provenance" in row.keys() else None,
+            "confidence": row["confidence"] if "confidence" in row.keys() else None,
         })
 
     # リンクもエクスポート
@@ -3769,6 +3963,8 @@ def sync_export(since=None):
             "temporal_context": row["temporal_context"],
             "spatial_context": row["spatial_context"],
             "updated_at": row["updated_at"],
+            "provenance": row["provenance"] if "provenance" in row.keys() else None,
+            "confidence": row["confidence"] if "confidence" in row.keys() else None,
         }
         # embeddingはbase64でエンコード
         if row["embedding"]:
@@ -4556,6 +4752,18 @@ def main():
                 for log in logs:
                     print(f"  [{log['created_at']}] #{log['memory_id']} {log['field']}: {log['reason']}")
         conn.close()
+
+    elif cmd == "correct":
+        if len(sys.argv) < 4:
+            print("使い方: python memory.py correct ID \"新しい内容\"")
+            return
+        correct_memory(int(sys.argv[2]), sys.argv[3])
+
+    elif cmd == "versions":
+        if len(sys.argv) < 3:
+            print("使い方: python memory.py versions ID")
+            return
+        show_versions(int(sys.argv[2]))
 
     elif cmd == "memo":
         if len(sys.argv) < 3:
