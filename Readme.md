@@ -14,6 +14,8 @@ ghost/
 ├── autobiography.py       # 自伝的ナラティブ生成 — エピソード記憶の物語化
 ├── memory_server.py       # embeddingモデル常駐サーバー — 高速化用
 ├── ghost_hooks.py         # PostToolUse hook — plan警告 + 自動nap
+├── wander.py              # 目的なき連想（DMN agent）— Gemini/ローカルLLMで自由連想
+├── think.py               # 一人で考える — 記憶ネットワークを歩いて新しいつながりを探す
 ├── ghost-local.py         # ローカルLLMチャット（ollama） — 記憶付き対話
 ├── memory_sync_server.py  # P2P記憶同期サーバー — 複数端末間の記憶共有
 ├── CLAUDE.md              # Claude Code統合ルール
@@ -62,6 +64,7 @@ memory.pyは脳の記憶メカニズムを再現する:
 | 情動重み付き減衰 | 情動が強い記憶ほど忘れにくい（半減期が変動） |
 | シナプスホメオスタシス | 睡眠中にリンクを一律減衰、弱いリンクを刈り込む |
 | **メタデータ変容** | **睡眠のたびにキーワード・埋め込み・情動が隣接記憶の影響で変化する** |
+| **修正可能性** | **provenance（出自）とconfidence（信頼度）で記憶の重みを調整。全版保持で改訂可能** |
 | ひらめき連想 | insightが保存されると連想チェーンが自動で走る |
 | **内的対話** | **共感・補完・批判・連想の4つの声が同時に想起する** |
 | **暗黙の気分推定** | **最近触った記憶の情動から心理状態を自動推定** |
@@ -156,6 +159,8 @@ sentence-transformersがあれば **ベクトル検索**（384次元、コサイ
 | `overview` | 脳の俯瞰。構造・重心・arousal分布・時系列 | 「この脳どうなってる？」のとき |
 | `stats` | 数字だけの統計 | overviewより軽く見たいとき |
 | `detail ID` | 1件の記憶の全情報 | 特定の記憶を深掘りしたいとき |
+| `correct ID "内容"` | 記憶を修正（旧版を保存） | 間違った記憶を直したいとき |
+| `versions ID` | 記憶の版履歴を表示 | 改訂の経緯を見たいとき |
 
 ### delusion（完全記憶検索）
 
@@ -333,6 +338,9 @@ python memory.py import filename    # JSONインポート
 | embedding | ベクトル表現（BLOB, 384次元, multilingual-e5-small） |
 | spatial_context | 場所（ホスト名/SSH接続元） |
 | temporal_context | 時間帯・曜日 |
+| provenance | 出自: user_explicit / wander / consolidation |
+| confidence | 信頼度 0.0-1.0。出自に基づいて自動設定 |
+| revision_count | 改訂回数。多いほど安定性スコアが下がる |
 
 ### raw_turns（対話原文）
 
@@ -346,6 +354,21 @@ python memory.py import filename    # JSONインポート
 | content | 発話の全文 |
 | timestamp | 発話日時 |
 | memory_ids | この発話から抽出された記憶のID群（JSON配列） |
+
+### memory_versions（版履歴）
+
+interfere/consolidate/correctの前に記憶の状態をスナップショット保存。
+
+| カラム | 何 |
+|--------|-----|
+| memory_id | 対象の記憶ID |
+| content | その時点の内容 |
+| importance | その時点の重要度 |
+| arousal | その時点の覚醒度 |
+| confidence | その時点の信頼度 |
+| reason | 保存理由: interference / consolidation / user_correction |
+| superseded_by | 統合先の新記憶ID（統合時のみ） |
+| created_at | スナップショット日時 |
 
 ### memories_fts / raw_turns_fts（全文検索）
 
