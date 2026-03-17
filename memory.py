@@ -1311,6 +1311,10 @@ def proceduralize(dry_run=False):
             "INSERT OR IGNORE INTO procedures (memory_id, rule_text) VALUES (?, ?)",
             (row["id"], rule_text)
         )
+        conn.execute(
+            "UPDATE memories SET category = 'procedure' WHERE id = ?",
+            (row["id"],)
+        )
         new_rules.append((row["id"], row["access_count"], row["link_count"], rule_text))
 
     conn.commit()
