@@ -12,10 +12,12 @@ user-invocable: true
 
 1. `python memory.py memo index` を実行 — メモフォルダの新規ファイルを取り込む
 2. `python dream.py 30` を実行 — 出力をそのまま表示する
-3. `python memory.py replay` を実行（出力は表示するが報告には使わない）
-4. `python memory.py consolidate` を実行（同上）
-5. `python memory.py schema` を実行 — メタ記憶を自動生成
-6. `python memory.py stats` を実行（同上）
+3. `python wander.py 5` を実行 — 自由連想（モデルがなければ無言で終了）
+4. `python memory.py replay` を実行（出力は表示するが報告には使わない）
+5. `python memory.py consolidate` を実行（同上）
+6. `python memory.py schema` を実行 — メタ記憶を自動生成
+7. `python memory.py proceduralize` を実行 — 反復された記憶を手続き記憶に昇格
+8. `python memory.py stats` を実行（同上）
 
 ## 報告のスタイル
 

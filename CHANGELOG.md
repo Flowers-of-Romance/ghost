@@ -1,5 +1,11 @@
 # Changelog
 
+## [v12] - 2026-03-17
+
+### Fixed
+- **proceduralize時にcategoryを更新**: 手続き化された記憶のcategoryを'procedure'に変更するようにした。以前はproceduresテーブルに入るだけでmemoriesのcategoryは元のままだった（[#1](https://github.com/Flowers-of-Romance/ghost/issues/1)）
+- **Claude側sleepスキルにproceduralize追加**: Gemini側には既にあったがClaude側のSKILL.mdから漏れていた
+
 ## [v11] - 2026-03-16
 
 ### Added
