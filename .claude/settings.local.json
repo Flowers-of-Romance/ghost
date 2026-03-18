@@ -5,10 +5,40 @@
     ]
   },
   "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python record_turn.py",
+            "timeout": 10000
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python record_turn.py",
+            "timeout": 10000
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
-        "command": "python ghost_hooks.py",
-        "timeout": 60000
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ghost_hooks.py",
+            "timeout": 60000
+          }
+        ]
       }
     ]
   }

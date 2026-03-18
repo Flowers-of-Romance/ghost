@@ -1,5 +1,17 @@
 # Changelog
 
+## [v13] - 2026-03-19
+
+### Added
+- **完全記憶（real-time recording）**: 会話の全ターンをリアルタイムで`raw_turns`に自動保存。delusionが名実ともに「完全記憶」になった
+  - **`record_turn.py`**: `UserPromptSubmit`フック（ユーザー発言）+ `Stop`フック（アシスタント応答）の2経路で全会話を捕捉
+  - **UserPromptSubmit hook**: ユーザーの発言をリアルタイムで`raw_turns`に保存
+  - **Stop hook**: 会話終了時に`transcript_path`から最後のアシスタント応答を読み取って保存
+  - これまではExtract.pyで事後にJSONLから読み込むしかなく、会話が終わると未抽出の文脈が消えていた
+
+### Changed
+- **`.claude/settings.local.json`**: `UserPromptSubmit`と`Stop`フックを追加
+
 ## [v12] - 2026-03-17
 
 ### Fixed
