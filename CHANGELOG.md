@@ -1,5 +1,19 @@
 # Changelog
 
+## [v14] - 2026-03-19
+
+### Removed
+- **planカテゴリ廃止**: 記憶の特権階級を撤廃。planは減衰しない・忘却しない・統合しない・メタデータ変容しないという4つの特別扱いを受けていたが、これはLLMのself-attentionの限界を内部で補おうとする設計だった。計画は外部ツールが担うべきで、記憶システム内に特権カテゴリを持つ理由がない
+  - `VALID_CATEGORIES`から`plan`を削除
+  - DB CHECK制約を更新
+  - 減衰免除・統合スキップ・忘却スキップ・メタデータ変容除外を撤去
+  - `delusion --plan`オプションを削除
+  - `overview`のplan一覧表示を削除
+- **ghost_hooks.pyからplan監視を削除**: キーワードマッチ・embedding類似度検索・クールダウン管理・セッションID管理を撤去。prospective検証とnap検知のみ残存
+
+### Design rationale
+LLMの記憶も計画もself-attentionに支配される。完全記憶モード（delusion）は記憶を外部化してattentionを迂回した。計画も同じ原理で外部ツールが担う。LLM内部のplanモードは、この設計思想と矛盾するため削除した。
+
 ## [v13] - 2026-03-19
 
 ### Added

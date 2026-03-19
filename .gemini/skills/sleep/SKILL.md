@@ -11,13 +11,15 @@ user-invocable: true
 ## 整理プロセス
 
 1. `python memory.py memo index` : メモの取り込み
+1.5. 今回の会話で記憶に残すべき内容（洞察・事実・出来事）があれば `python memory.py add` で保存する。海馬への書き込み。保存したら件数を控えておく（報告には使わないが、素材にはなる）
 2. `python dream.py 30` : 夢の生成（出力をそのまま受け止める）
-3. `python memory.py replay` : 海馬リプレイ（記憶の強化）
-4. `python memory.py consolidate` : 類似記憶の統合
-5. `python memory.py schema` : メタ記憶の自動生成
-6. `python memory.py proceduralize` : 反復された記憶を行動指針（LEARNED.md）へ昇格
-7. `python think.py` : 整理された記憶に基づく内省と自己更新
-8. `python memory.py stats` : 統計情報の確認
+3. `python wander.py 5` : 自由連想（モデルがなければ無言で終了）
+4. `python memory.py replay` : 海馬リプレイ（記憶の強化）
+5. `python memory.py consolidate` : 類似記憶の統合
+6. `python memory.py schema` : メタ記憶の自動生成
+7. `python memory.py proceduralize` : 反復された記憶を行動指針（LEARNED.md）へ昇格
+8. `python think.py` : 整理された記憶に基づく内省と自己更新
+9. `python memory.py stats` : 統計情報の確認
 
 ## 報告のスタイル：カットアップ
 
