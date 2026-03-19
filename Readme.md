@@ -14,7 +14,7 @@ ghost/
 ├── autobiography.py       # 自伝的ナラティブ生成 — エピソード記憶の物語化
 ├── memory_server.py       # embeddingモデル常駐サーバー — 高速化用
 ├── record_turn.py         # 会話の全ターン自動保存 — 完全記憶の入力側
-├── ghost_hooks.py         # PostToolUse hook — plan警告 + 自動nap
+├── ghost_hooks.py         # PostToolUse hook — prospective検証 + 自動nap
 ├── wander.py              # 目的なき連想（DMN agent）— Gemini/ローカルLLMで自由連想
 ├── think.py               # 一人で考える — 記憶ネットワークを歩いて新しいつながりを探す
 ├── ghost-local.py         # ローカルLLMチャット（ollama） — 記憶付き対話
@@ -175,7 +175,6 @@ sentence-transformersがあれば **ベクトル検索**（384次元、コサイ
 | `delusion "語" --after 2024-11 --before 2025-02` | 期間フィルタ |
 | `delusion --date 2024-12-11` | その日の全記憶ダンプ |
 | `delusion --all` | 全記憶ダンプ |
-| `delusion --plan` | 未完了の計画一覧 |
 | `delusion --raw "語"` | 対話原文（raw_turns）のみ検索 |
 | `delusion --context ID` | 記憶IDから元の対話文脈を復元 |
 
@@ -230,7 +229,6 @@ sentence-transformersがあれば **ベクトル検索**（384次元、コサイ
 | preference | 好み | なし |
 | procedure | 手続き | なし |
 | schema | メタ記憶 | 自動生成。統合の産物 |
-| plan | 計画 | 減衰しない、自動忘却されない、統合されない |
 
 ## 睡眠
 
@@ -328,7 +326,7 @@ python memory.py import filename    # JSONインポート
 |--------|-----|
 | id | 自動採番 |
 | content | 記憶の内容（全文） |
-| category | fact / episode / context / preference / procedure / schema / plan |
+| category | fact / episode / context / preference / procedure / schema |
 | importance | 1-5。自動推定+予測誤差で補正 |
 | keywords | キーワード断片（JSON配列） |
 | emotions | 情動タグ（JSON配列）: surprise, conflict, determination, insight, connection, anxiety |
