@@ -4147,11 +4147,31 @@ def main():
 
     elif cmd == "add":
         if len(sys.argv) < 3:
-            print("使い方: python memory.py add \"内容\" [category] [source]")
+            print("使い方: python memory.py add \"内容\" [--category CAT] [--source SRC]")
+            print("  位置引数: python memory.py add \"内容\" category [source]")
             return
         content = sys.argv[2]
-        category = sys.argv[3] if len(sys.argv) > 3 else "fact"
-        source = sys.argv[4] if len(sys.argv) > 4 else None
+        args = sys.argv[3:]
+        category = "fact"
+        source = None
+        i = 0
+        while i < len(args):
+            if args[i] == "--category" and i + 1 < len(args):
+                category = args[i + 1]
+                i += 2
+            elif args[i] == "--source" and i + 1 < len(args):
+                source = args[i + 1]
+                i += 2
+            elif args[i].startswith("--"):
+                i += 2  # 未知のフラグはスキップ
+            elif category == "fact":
+                category = args[i]  # 後方互換: 位置引数
+                i += 1
+            elif source is None:
+                source = args[i]  # 後方互換: 位置引数
+                i += 1
+            else:
+                i += 1
         add_memory(content, category, source)
 
     elif cmd == "search":
