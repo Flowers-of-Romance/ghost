@@ -25,6 +25,11 @@
             "type": "command",
             "command": "python record_turn.py",
             "timeout": 10000
+          },
+          {
+            "type": "command",
+            "command": "python auto_consolidate.py",
+            "timeout": 30000
           }
         ]
       }

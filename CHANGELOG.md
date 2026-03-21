@@ -1,5 +1,22 @@
 # Changelog
 
+## [v15] - 2026-03-21
+
+### Added
+- **睡眠中の記憶固定化（promote）**: raw_turnsから覚醒度で重み付きサンプリングし、memoriesに自動昇格。海馬リプレイの模倣。既知の記憶は予測符号化で自然に弾かれるため、フラグ管理不要
+  - `memory.py promote` コマンド追加
+  - XMLタグ・tool ID・UUID・ハッシュ値を自動除去するクリーニング処理
+- **auto_consolidate.py**: Stop hookで会話終了時にpromote(5件) + nap(replay + consolidate)を自動実行。手動の`/sleep`や`memory.py add`なしで記憶が固定化される
+- **sleep.py**: `/sleep`の全ステップ（memo index → promote → dream → replay → consolidate → schema → proceduralize → think → stats）を1プロセスで一括実行。8回のBash呼び出しを1回に統合
+
+### Changed
+- **`/sleep`スキル**: sleep.pyを使うように簡素化。手動addの手順を削除
+- **`.claude/settings.local.json`**: Stop hookにauto_consolidate.pyを追加
+- **README**: 睡眠処理セクションを3層の自動固定化（会話終了時・アイドル時・手動sleep）に書き直し
+
+### Design rationale
+完全記憶（v13）でraw_turnsに全発言が入るようになったが、memoriesへの昇格は手動addだけだった。脳は睡眠中に海馬から新皮質へ記憶を転送する。promoteはこれを模倣し、覚醒度による重み付きサンプリング + 予測符号化による自然な重複排除で、明示的なフラグ管理なしに固定化を実現する。
+
 ## [v14] - 2026-03-19
 
 ### Removed

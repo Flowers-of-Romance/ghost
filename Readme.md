@@ -14,7 +14,9 @@ ghost/
 ├── autobiography.py       # 自伝的ナラティブ生成 — エピソード記憶の物語化
 ├── memory_server.py       # embeddingモデル常駐サーバー — 高速化用
 ├── record_turn.py         # 会話の全ターン自動保存 — 完全記憶の入力側
+├── auto_consolidate.py    # Stop hook — 会話終了時の自動記憶固定化
 ├── ghost_hooks.py         # PostToolUse hook — prospective検証 + 自動nap
+├── sleep.py               # 睡眠処理の一括実行ラッパー
 ├── wander.py              # 目的なき連想（DMN agent）— Gemini/ローカルLLMで自由連想
 ├── think.py               # 一人で考える — 記憶ネットワークを歩いて新しいつながりを探す
 ├── ghost-local.py         # ローカルLLMチャット（ollama） — 記憶付き対話
@@ -71,6 +73,7 @@ memory.pyは脳の記憶メカニズムを再現する:
 | **暗黙の気分推定** | **最近触った記憶の情動から心理状態を自動推定** |
 | **デフォルトモードネットワーク** | **会話の間隔が長いほど、弱いリンクを辿って意外な連想を生成** |
 | **完全記憶** | **会話の全ターンをリアルタイムで自動保存。delusionで完全検索可能** |
+| **睡眠中の記憶固定化** | **raw_turnsから覚醒度で重み付きサンプリング → memoriesに自動昇格。会話終了時・アイドル時に自動実行** |
 | **P2P同期** | **複数端末間で記憶を共有。各端末が独立した海馬として動作** |
 
 ### 予測符号化
@@ -180,15 +183,27 @@ sentence-transformersがあれば **ベクトル検索**（384次元、コサイ
 
 通常検索で「アタリ」をつけてからdelusionで正確な内容を引く2段階リレーが基本。
 
-### 睡眠処理（`/sleep` で一括実行される）
+### 睡眠処理
 
-寝てる間に脳がやること。手動で個別実行もできる。
+記憶の固定化は3層で自動的に起きる。手動で `/sleep` を打つのはカットアップを見たいときだけ。
 
-30分以上操作がないと **自動nap** が発動する（PostToolUse hook経由）。napはreplay + consolidateだけの軽量sleep。LLM不要。
+| いつ | 何が起きる | スクリプト |
+|------|-----------|-----------|
+| 会話終了時 | promote(5件サンプリング) + nap(replay + consolidate) | auto_consolidate.py（Stop hook） |
+| 30分アイドル時 | nap(replay + consolidate) | ghost_hooks.py（PostToolUse hook） |
+| `/sleep` 手動実行 | promote + dream + replay + consolidate + schema + proceduralize + think + stats | sleep.py |
+| cron（任意） | 自由連想。Gemini/ローカルLLMで記憶の断片から連想を生成 | wander.py |
+
+#### promote（記憶の固定化）
+
+海馬リプレイの模倣。直近N日のraw_turnsから覚醒度で重み付きサンプリングし、add_memoryに渡す。既知の記憶は予測符号化で自然に弾かれる。フラグ管理しない。
+
+#### 個別コマンド
 
 | コマンド | 何をする | 脳の何に相当 |
 |---------|---------|------------|
-| `nap` | replay + consolidateのみ（30分無操作で自動発動） | うたた寝 |
+| `promote` | raw_turnsからサンプリング → memories に固定化 | 海馬リプレイ → 長期記憶 |
+| `nap` | replay + consolidateのみ | うたた寝 |
 | `replay` | リンク再計算、刈り込み、メタデータ変容、自動忘却 | シナプスホメオスタシス + メタデータ変容 |
 | `mutations [ID]` | メタデータ変異履歴の閲覧（直近20件 or 特定記憶） | 監査ログ |
 | `consolidate` | 類似度が非常に高い記憶ペアを1つに統合 | 記憶の統合・圧縮 |
