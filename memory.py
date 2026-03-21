@@ -2507,6 +2507,90 @@ def save_raw_turn(session_id, role, content, timestamp=None,
     return new_id
 
 
+def promote_turns(days=7, sample_size=20):
+    """
+    睡眠中の記憶固定化: 海馬リプレイの模倣。
+
+    直近N日のraw_turnsからランダムにサンプリングし、add_memoryに渡す。
+    - 覚醒度が高い発言は重み付きで選ばれやすい（情動タグ付き再生）
+    - 既知の記憶は予測符号化(prediction_error)で自然に弾かれる
+    - フラグ管理しない。何度リプレイされてもOK
+    """
+    import random
+
+    conn = get_connection()
+
+    # 直近N日のユーザー発言を取得
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    turns = conn.execute(
+        "SELECT id, content, timestamp FROM raw_turns "
+        "WHERE role = 'user' AND timestamp > ? ORDER BY timestamp",
+        (cutoff,)
+    ).fetchall()
+    conn.close()
+
+    if not turns:
+        print("リプレイ対象のターンはありません")
+        return 0
+
+    # クリーニング＋フィルタ
+    TRIVIAL = {"y", "n", "ok", "yes", "no", "はい", "いいえ", "うん", "おk",
+               "1", "2", "3", "a", "b", "c", "了解", "わかった", "いいよ",
+               "まあいいか", "ありがとう", "thanks"}
+
+    def _clean(text):
+        text = re.sub(r'<[a-z_-]+>.*?</[a-z_-]+>', '', text, flags=re.DOTALL)
+        text = re.sub(r'<[a-z_-]+\s*/>', '', text)
+        text = re.sub(r'toolu_[a-z0-9]+', '', text)
+        text = re.sub(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', '', text)
+        text = re.sub(r'[0-9a-f]{20,}', '', text)
+        text = re.sub(r'\n{3,}', '\n', text)
+        text = re.sub(r'  +', ' ', text)
+        return text.strip()
+
+    candidates = []
+    for t in turns:
+        cleaned = _clean(t["content"])
+        if not cleaned or len(cleaned) < 20:
+            continue
+        if cleaned.lower().strip() in TRIVIAL:
+            continue
+        # 情動検出で重みを決める（覚醒度が高い＝リプレイされやすい）
+        _, arousal, _ = detect_emotions(cleaned)
+        weight = max(0.1, arousal + 0.1)  # 最低0.1、覚醒度が高いほど重い
+        candidates.append((cleaned, weight))
+
+    if not candidates:
+        print("意味のあるターンがありません")
+        return 0
+
+    # 重み付きサンプリング（脳のシャープウェーブリップル）
+    k = min(sample_size, len(candidates))
+    weights = [w for _, w in candidates]
+    sampled = random.choices(candidates, weights=weights, k=k)
+    # 重複除去（同じ発言が複数回選ばれることがある）
+    seen = set()
+    unique = []
+    for content, _ in sampled:
+        snippet = content[:200]
+        if snippet not in seen:
+            seen.add(snippet)
+            unique.append(snippet)
+
+    promoted = 0
+    for snippet in unique:
+        add_memory(
+            content=snippet,
+            category="episode",
+            provenance="sleep_promote",
+            confidence=0.6,
+        )
+        promoted += 1
+
+    print(f"✓ {promoted}件のターンをリプレイ → 記憶に固定化")
+    return promoted
+
+
 def review_memories(n=5):
     """
     間隔反復 (Spaced Repetition): SM-2インスパイアの優先度で復習が必要な記憶を選ぶ。
@@ -4451,6 +4535,9 @@ def main():
     elif cmd == "review":
         n = int(sys.argv[2]) if len(sys.argv) > 2 else 5
         review_memories(n)
+
+    elif cmd == "promote":
+        promote_turns()
 
     elif cmd == "replay":
         replay_memories()
