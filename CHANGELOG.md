@@ -1,5 +1,10 @@
 # Changelog
 
+## [v16.1] - 2026-03-25
+
+### Fixed
+- **recall_polyphonic**: 想起した記憶の`last_accessed`/`access_count`を更新していなかったバグを修正。polyphonic recallで返された記憶が「アクセスされた」と記録されず、セッション間隔（`_get_session_gap`）が常に古いままになっていた（例: 何度diveしても「3日ぶり」と表示される）
+
 ## [v16] - 2026-03-25
 
 ### Added
