@@ -10,7 +10,7 @@
 - **`_get_session_gap()`**: マイクロ秒付きタイムスタンプ（`2026-03-25T23:45:23.018700`）をパースできるように修正
 
 ### Design rationale
-論文 Memory-Driven Role-Playing の4層分析（Anchoring/Selecting/Bounding/Enacting）でghostを棚卸しした結果、Enacting（記憶→応答変換）が最も手軽に改善でき効果が大きいと判断。LLMがキーワード断片 `[mem0, memory, がありそうだ]` から意味を再構成できない場面があった。content要約を追加することで、Selectingが正しい記憶を引いた時にLLMが活用できるようになる。
+recall出力がキーワード断片 `[mem0, memory, がありそうだ]` だけでは、LLMが「何の記憶か」を再構成できない場面があった。content要約を追加することで、正しい記憶が引かれた時にLLMが活用できるようになる。
 
 ## [v16.1] - 2026-03-25
 
