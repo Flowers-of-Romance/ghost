@@ -7,7 +7,8 @@ LLMに脳の仕組みを模した長期記憶を実装する。
 ```
 ghost/
 ├── memory.py              # 記憶システム本体 — 海馬+新皮質
-├── Extract.py             # 会話ログからの記憶抽出 — 海馬の取り込み
+├── Extract.py             # Claude Code会話ログからの記憶抽出 — 海馬の取り込み
+├── ingest_chat.py         # claude.aiコピペ会話専用パーサー & 取り込み
 ├── tokenizer.py           # 日本語形態素解析（fugashi/SudachiPy/regex）— FTS5用
 ├── dream.py               # バロウズ式カットアップ夢 — 睡眠中の脳内イメージ
 ├── interpret_dream.py     # 夢の解釈 — 断片の出典・情動分析
@@ -217,8 +218,10 @@ sentence-transformersがあれば **ベクトル検索**（384次元、コサイ
 |---------|---------|
 | `python Extract.py` | 最新のClaude Codeセッションから記憶+原文を抽出 |
 | `python Extract.py --all` | 全セッションから一括抽出 |
-| `python Extract.py --chat file.txt` | claude.aiからコピペした会話テキストから抽出 |
 | `python Extract.py --dry-run` | 保存せず候補だけ表示 |
+| `python ingest_chat.py file.txt` | claude.aiコピペ会話から記憶を抽出 |
+| `python ingest_chat.py --detect session.jsonl` | JSONL内のclaude.ai会話を自動検出して抽出 |
+| `python ingest_chat.py --stdin` | 標準入力からパイプで会話テキストを受け取る |
 
 ### あまり手動で使わないもの
 
@@ -262,9 +265,24 @@ python Extract.py --all
 
 # ドライラン
 python Extract.py --dry-run
+```
 
-# claude.aiの会話テキストから抽出（コピペ対応）
-python Extract.py --chat conversation.txt
+### claude.ai会話の取り込み (ingest_chat.py)
+
+claude.aiのWeb UIからコピペした会話テキスト専用のパーサー。3つの戦略で話者を自動識別:
+1. タイムスタンプベース（"8:40" 等の H:MM 行で分割）
+2. ロールヘッダーベース（"あなた" / "Claude" で分割）
+3. ヒューリスティック（空行区切り + 長さで user/assistant を推定）
+
+```bash
+# テキストファイルから抽出
+python ingest_chat.py conversation.txt --dry-run
+
+# JSONL内のclaude.ai会話を自動検出
+python ingest_chat.py --detect session.jsonl
+
+# 標準入力からパイプ
+cat conversation.txt | python ingest_chat.py --stdin
 ```
 
 ### 夢 (dream.py)
