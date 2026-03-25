@@ -3555,6 +3555,16 @@ def recall_polyphonic(limit_per_voice=3):
     # 俯瞰: メタ情報から全体像を構成する（LLMが最も得意なこと）
     voices["俯瞰"] = _birds_eye_view(conn, rows)
 
+    # 想起した記憶の last_accessed / access_count を更新
+    if used_ids:
+        now = datetime.now().isoformat()
+        for mid in used_ids:
+            conn.execute(
+                "UPDATE memories SET last_accessed = ?, access_count = access_count + 1 WHERE id = ?",
+                (now, mid)
+            )
+        conn.commit()
+
     conn.close()
     return voices
 
