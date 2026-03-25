@@ -169,87 +169,9 @@ def parse_jsonl(filepath):
 
 
 def parse_chat_text(text):
-    """
-    claude.aiからコピペされた会話テキストをパースする。
-
-    フォーマットの特徴:
-    - タイムスタンプ行: "8:40", "9:03" のような H:MM 形式が単独行にある
-    - タイムスタンプの直前がユーザー発言（短い、数行）
-    - タイムスタンプの直後がClaude応答（長い段落）
-    - "ウェブを検索しました" は区切りマーカー
-    - "ファイルを作成しました" 等もシステムマーカー
-    """
-    lines = text.split('\n')
-    turns = []
-
-    # タイムスタンプ行のインデックスを見つける
-    timestamp_pattern = re.compile(r'^\d{1,2}:\d{2}$')
-    ts_indices = []
-    for i, line in enumerate(lines):
-        if timestamp_pattern.match(line.strip()):
-            ts_indices.append(i)
-
-    if not ts_indices:
-        # タイムスタンプがない場合は全体を1つのテキストとして扱う
-        return [{"role": "user", "text": text.strip(), "timestamp": ""}]
-
-    # 各タイムスタンプ区間をパース
-    # タイムスタンプの前 = ユーザー発言、後 = Claude応答
-    for idx, ts_i in enumerate(ts_indices):
-        timestamp = lines[ts_i].strip()
-
-        # ユーザー発言: 前のタイムスタンプ（またはテキスト先頭）からこのタイムスタンプまで
-        if idx == 0:
-            # 最初のタイムスタンプより前はClaude応答（会話の冒頭）
-            prev_end = 0
-        else:
-            prev_end = ts_indices[idx - 1] + 1
-
-        # タイムスタンプの直前の行群からユーザー発言を抽出
-        # パターン: Claude応答 → 空行 → ユーザー発言(数行) → 空行 → タイムスタンプ
-        # タイムスタンプから逆スキャンして、空行→テキスト→空行を見つける
-        user_lines = []
-        hit_text = False
-        for j in range(ts_i - 1, max(prev_end - 1, -1), -1):
-            line = lines[j].strip()
-            # システムマーカーはスキップ
-            if any(m in line for m in [
-                "ウェブを検索しました", "ファイルを作成しました",
-                "コマンドを実行しました", "ファイルを読み取りました",
-                "ファイルを表示しました", "コード · ", "ドキュメント · ",
-                "もっと表示",
-            ]):
-                continue
-            if not line:
-                if hit_text:
-                    break  # テキストの後の空行 = ユーザー発言の上端
-                continue  # タイムスタンプ直前の空行はスキップ
-            hit_text = True
-            user_lines.insert(0, line)
-
-        if user_lines:
-            user_text = '\n'.join(user_lines)
-            turns.append({
-                "role": "user",
-                "text": user_text,
-                "timestamp": timestamp,
-            })
-
-        # Claude応答: タイムスタンプの次の行から次のユーザー発言まで
-        next_ts = ts_indices[idx + 1] if idx + 1 < len(ts_indices) else len(lines)
-        assistant_lines = []
-        for j in range(ts_i + 1, next_ts):
-            assistant_lines.append(lines[j])
-
-        assistant_text = '\n'.join(assistant_lines).strip()
-        if assistant_text:
-            turns.append({
-                "role": "assistant",
-                "text": assistant_text,
-                "timestamp": timestamp,
-            })
-
-    return turns
+    """claude.ai会話パース — ingest_chat.py に委譲。"""
+    from ingest_chat import parse_chat_text as _parse
+    return _parse(text)
 
 
 def segment_conversation(turns):
@@ -556,97 +478,15 @@ def process_session(filepath, dry_run=False, seen_contents=None):
 
 
 def process_chat_text(text, dry_run=False, source="claude.ai"):
-    """
-    claude.aiからコピペされた会話テキストを処理して記憶を抽出する。
-    """
-    print(f"\n💬 claude.ai会話を解析中...")
-
-    turns = parse_chat_text(text)
-    user_turns = [t for t in turns if t["role"] == "user"]
-    print(f"  {len(turns)}ターン検出 (ユーザー: {len(user_turns)}件)")
-
-    if not turns:
-        return 0
-
-    segments = segment_conversation(turns)
-    print(f"  {len(segments)}セグメントに分割")
-
-    candidates = extract_memory_candidates(segments, source, chat_mode=True)
-    print(f"  {len(candidates)}件の記憶候補を検出")
-
-    if not candidates:
-        return 0
-
-    # 既存の記憶を取得（重複チェック用）
-    conn = get_connection()
-    existing = conn.execute(
-        "SELECT content, embedding FROM memories WHERE forgotten = 0"
-    ).fetchall()
-    conn.close()
-    existing_dicts = [dict(row) for row in existing]
-
-    saved = 0
-    seen = []
-    for cand in candidates:
-        if is_duplicate(cand["content"], existing_dicts):
-            print(f"  ⏭ 重複(既存): {cand['content'][:50]}...")
-            continue
-
-        cand_prefix = cand["content"][:50]
-        if any(cand_prefix == prev[:50] for prev in seen):
-            print(f"  ⏭ 重複(バッチ): {cand['content'][:50]}...")
-            continue
-        seen.append(cand["content"])
-
-        emo_str = ", ".join(cand["emotions"]) if cand["emotions"] else "中立"
-
-        if dry_run:
-            print(f"  🧠 [{cand['category']}] ({emo_str}) {cand['content'][:80]}...")
-        else:
-            add_memory(cand["content"], cand["category"], cand["source"])
-            saved += 1
-
-    return saved
+    """claude.ai会話処理 — ingest_chat.py に委譲。"""
+    from ingest_chat import process_chat_text as _process
+    return _process(text, dry_run, source)
 
 
 def extract_chat_from_jsonl(filepath):
-    """
-    JONSLファイルからclaude.aiの会話テキスト（大きなユーザーメッセージ）を検出する。
-    タイムスタンプパターン（H:MM が単独行にある）を含む長いテキストをclaude.ai会話とみなす。
-    """
-    timestamp_pattern = re.compile(r'^\d{1,2}:\d{2}$', re.MULTILINE)
-    chat_texts = []
-
-    with open(filepath, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            msg = data.get("message", {})
-            role = msg.get("role", "")
-            if role != "user":
-                continue
-
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                texts = [b.get("text", "") for b in content
-                         if isinstance(b, dict) and b.get("type") == "text"]
-                text = "\n".join(texts)
-            elif isinstance(content, str):
-                text = content
-            else:
-                continue
-
-            # 長い + タイムスタンプパターンを含む → claude.ai会話
-            if len(text) > 5000 and timestamp_pattern.search(text):
-                chat_texts.append(text)
-
-    return chat_texts
+    """JSONL内のclaude.ai会話検出 — ingest_chat.py に委譲。"""
+    from ingest_chat import extract_chat_from_jsonl as _extract
+    return _extract(filepath)
 
 
 def main():

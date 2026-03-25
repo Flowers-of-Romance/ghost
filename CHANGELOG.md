@@ -1,5 +1,23 @@
 # Changelog
 
+## [v16] - 2026-03-25
+
+### Added
+- **ingest_chat.py**: claude.aiコピペ会話専用のパーサー & 取り込みモジュール。Extract.pyから`parse_chat_text` / `process_chat_text` / `extract_chat_from_jsonl`を移動・強化
+  - **3戦略パーサー**: タイムスタンプベース / ロールヘッダーベース / 空行ヒューリスティックの3段階フォールバック。タイムスタンプがないコピペにも対応
+  - **タイムスタンプ多様化**: `8:40` / `8:40:12` / `3/25 8:40` / `2026-03-25 08:40` の4パターンに対応
+  - **ロールヘッダー検出**: "あなた" / "You" / "Claude" / "Human" / "Assistant" をロール境界として識別
+  - **英語UIマーカー対応**: "Searched the web" / "Created a file" 等の英語UIラベルもシステムマーカーとして除去
+  - **JSONL検出閾値緩和**: 5000→3000文字、ロールヘッダーパターンも検出条件に追加
+  - `--stdin` オプション: 標準入力からパイプで会話テキストを受け取り
+  - `--detect` オプション: JSONL内のclaude.ai会話を自動検出
+
+### Changed
+- **Extract.py**: `parse_chat_text` / `process_chat_text` / `extract_chat_from_jsonl` をingest_chat.pyへの委譲スタブに置き換え。後方互換性を維持
+
+### Design rationale
+Extract.pyはClaude CodeのJSONL形式に特化した抽出器。claude.aiのコピペ会話は全く異なるフォーマット（フリーテキスト、タイムスタンプの有無が不定、UIラベルの混入）を持つため、専用パーサーに分離した。Extract.pyの`--chat`オプションは委譲スタブを通じて引き続き動作する。
+
 ## [v15] - 2026-03-21
 
 ### Added
