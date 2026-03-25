@@ -3066,7 +3066,13 @@ def _get_session_gap(conn):
     ).fetchone()
     if not row or not row["last"]:
         return None
-    last = datetime.strptime(row["last"], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+    try:
+        last = datetime.strptime(row["last"], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+    except ValueError:
+        # マイクロ秒付きフォーマットにも対応
+        last = datetime.fromisoformat(row["last"].replace('Z', '+00:00'))
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
     now = datetime.now(timezone.utc)
     gap_hours = (now - last).total_seconds() / 3600
     return gap_hours
@@ -3835,19 +3841,25 @@ def format_memory(row, similarity=None, score=None):
     return f"  #{row['id']} {emo_str} {stars} {row['content'][:80]}{accessed}{sim_str}{score_str}{fresh_str}"
 
 
-def format_memory_compact(row, score=None):
-    """コンパクトモード: 1記憶1行。recallのデフォルト。"""
+def format_memory_compact(row, score=None, fragments_only=False):
+    """コンパクトモード: recallのデフォルト。content要約付き2行表示。"""
     emotions = json.loads(row["emotions"]) if row["emotions"] else []
     keywords = json.loads(row["keywords"]) if row["keywords"] else []
     emo_str = " ".join(EMOTION_EMOJI.get(e, "·") for e in emotions[:2]) if emotions else ""
     stars = "★" * row["importance"]
     frag_str = ", ".join(keywords[:4])
     score_str = f" ({score:.2f})" if score is not None else ""
-    return f"  #{row['id']} {emo_str} {stars} [{frag_str}]{score_str}"
+    line = f"  #{row['id']} {emo_str} {stars} [{frag_str}]{score_str}"
+    if not fragments_only and row["content"]:
+        content = row["content"][:80]
+        if len(row["content"]) > 80:
+            content += "..."
+        line += f"\n       「{content}」"
+    return line
 
 
-def format_memory_reconstructive(conn, row, similarity=None, score=None):
-    """再構成モード: 断片+情動+連想リンクの断片を返す。contentは返さない。"""
+def format_memory_reconstructive(conn, row, similarity=None, score=None, fragments_only=False):
+    """再構成モード: 断片+content要約+情動+連想リンク。"""
     emotions = json.loads(row["emotions"]) if row["emotions"] else []
     keywords = json.loads(row["keywords"]) if row["keywords"] else []
     emo_str = " ".join(EMOTION_EMOJI.get(e, "·") for e in emotions) if emotions else "·"
@@ -3871,9 +3883,14 @@ def format_memory_reconstructive(conn, row, similarity=None, score=None):
             sample = random.sample(lkw, min(2, len(lkw)))
             linked_fragments.extend(sample)
 
-    # 出力: 断片 + 情動 + 連想からの断片
+    # 出力: 断片 + content要約 + 情動 + 連想からの断片
     frag_str = ", ".join(keywords[:6])
     line = f"  #{row['id']} {emo_str} {stars} [{frag_str}]{sim_str}{score_str}"
+    if not fragments_only and row["content"]:
+        content = row["content"][:120]
+        if len(row["content"]) > 120:
+            content += "..."
+        line += f"\n         ↳ 「{content}」"
     if linked_fragments:
         line += f"\n         ↳ 連想: [{', '.join(linked_fragments)}]"
     if emotions:
@@ -4478,6 +4495,7 @@ def main():
                         n = int(arg)
             voices = recall_polyphonic(limit_per_voice=n)
             raw_mode = "--raw" in sys.argv
+            fragments_only = "--fragments" in sys.argv
             conn = get_connection()
 
             # 今効いてる気分を表示
@@ -4515,11 +4533,12 @@ def main():
                         if raw_mode:
                             print(format_memory(row, score=score))
                         else:
-                            print(format_memory_reconstructive(conn, row, score=score))
+                            print(format_memory_reconstructive(conn, row, score=score, fragments_only=fragments_only))
             conn.close()
         else:
             full_mode = "--full" in sys.argv
             raw_mode = "--raw" in sys.argv
+            fragments_only = "--fragments" in sys.argv
             default_limit = 15 if full_mode else 10
             limit = default_limit
             for arg in sys.argv[2:]:
@@ -4535,12 +4554,12 @@ def main():
                 conn = get_connection()
                 print(f"自動想起 ({len(results)}件, 再構成モード):")
                 for row, score in results:
-                    print(format_memory_reconstructive(conn, row, score=score))
+                    print(format_memory_reconstructive(conn, row, score=score, fragments_only=fragments_only))
                 conn.close()
             else:
                 print(f"自動想起 ({len(results)}件):")
                 for row, score in results:
-                    print(format_memory_compact(row, score=score))
+                    print(format_memory_compact(row, score=score, fragments_only=fragments_only))
 
     elif cmd == "review":
         n = int(sys.argv[2]) if len(sys.argv) > 2 else 5
