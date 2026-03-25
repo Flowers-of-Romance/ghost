@@ -1,5 +1,18 @@
 # Changelog
 
+## [v16.3] - 2026-03-25
+
+### Added
+- **Selecting強化 — 会話文脈からの自動記憶検索**: ユーザーが発言するたびに、発言内容からFTS5で関連記憶を自動検索し、stderrに出力。LLMが会話中に自然に関連記憶を取り込めるようになった
+  - `record_turn.py` の `UserPromptSubmit` フックに `_context_search()` を追加
+  - FTS5 OR検索 + rank + importance + arousal のスコアリング
+  - 助詞・短すぎるトークンを除外するストップワード処理
+  - 短い発言（< 15文字）、コマンド、XMLタグはスキップ
+  - embeddingモデル不要（FTS5のみ、高速）
+
+### Design rationale
+recallは会話開始時の1回だけで、会話が進んで話題が変わっても新しい関連記憶が浮上しなかった。人間の脳は会話中に常に連想が走っている。UserPromptSubmitフックに相乗りすることで、毎発言ごとに軽量な文脈検索を実行し、関連記憶をLLMに提示する。
+
 ## [v16.2] - 2026-03-25
 
 ### Changed
