@@ -1,5 +1,17 @@
 # Changelog
 
+## [v16.2] - 2026-03-25
+
+### Changed
+- **Enacting強化**: recall/search出力にcontent要約を追加。キーワード断片だけでは「何の記憶か」分からない問題を解決
+  - `format_memory_compact()`: 2行目に `「content先頭80文字」` を表示
+  - `format_memory_reconstructive()`: 連想行の前に `↳ 「content先頭120文字」` を挿入
+  - `--fragments` フラグ: 従来のキーワード断片のみモードに戻す（脳のパターン補完モデルを捨てない）
+- **`_get_session_gap()`**: マイクロ秒付きタイムスタンプ（`2026-03-25T23:45:23.018700`）をパースできるように修正
+
+### Design rationale
+論文 Memory-Driven Role-Playing の4層分析（Anchoring/Selecting/Bounding/Enacting）でghostを棚卸しした結果、Enacting（記憶→応答変換）が最も手軽に改善でき効果が大きいと判断。LLMがキーワード断片 `[mem0, memory, がありそうだ]` から意味を再構成できない場面があった。content要約を追加することで、Selectingが正しい記憶を引いた時にLLMが活用できるようになる。
+
 ## [v16.1] - 2026-03-25
 
 ### Fixed
