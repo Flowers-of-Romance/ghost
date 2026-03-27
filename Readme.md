@@ -76,6 +76,7 @@ memory.pyは脳の記憶メカニズムを再現する:
 | **完全記憶** | **会話の全ターンをリアルタイムで自動保存。delusionで完全検索可能** |
 | **睡眠中の記憶固定化** | **raw_turnsから覚醒度で重み付きサンプリング → memoriesに自動昇格。会話終了時・アイドル時に自動実行** |
 | **P2P同期** | **複数端末間で記憶を共有。各端末が独立した海馬として動作** |
+| **対話マークダウン書き出し** | **全対話を日付単位のマークダウンにリアルタイム追記。Obsidian等で閲覧** |
 
 ### 予測符号化
 
@@ -350,6 +351,30 @@ python memory.py stats              # 数字だけの統計
 python memory.py export [filename]  # JSONエクスポート
 python memory.py import filename    # JSONインポート
 ```
+
+## 対話のマークダウン書き出し
+
+record_turn.pyのフックに連動し、全対話を日付単位のマークダウンとしてリアルタイムに書き出す。Obsidianなどのノートツールで対話履歴を閲覧・検索できる。
+
+### セットアップ
+
+`turn_export.json` をghost/のルートに作成:
+
+```json
+{
+  "enabled": true,
+  "output_dir": "~/Documents/Obsidian Vault/0110_ClaudeTurns",
+  "timezone_offset_hours": 9
+}
+```
+
+- `output_dir`: `~` や `${HOME}` 等のプレースホルダ対応
+- `timezone_offset_hours`: UTC→ローカル変換（デフォルト9=JST）
+- ファイルが無ければ機能OFF
+
+### 出力形式
+
+日付ごとに `YYYY-MM-DD.md` が生成され、セッション単位で見出し分割される。複数ウィンドウでの同時書き込みに対応（ファイルロック付き）。
 
 ## DBテーブル
 

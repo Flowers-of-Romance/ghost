@@ -14,8 +14,9 @@ import json
 import re
 import sqlite3
 import time
+import tempfile
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # Windows cp932 対策
 if sys.platform == "win32":
@@ -28,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 
 def save_turn(session_id, role, content, cwd=""):
-    """raw_turns に1ターン保存。"""
+    """raw_turns に1ターン保存 + マークダウンに追記。"""
     from memory import save_raw_turn
     save_raw_turn(
         session_id=session_id,
@@ -37,6 +38,94 @@ def save_turn(session_id, role, content, cwd=""):
         timestamp=datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
         cwd=cwd,
     )
+    try:
+        _append_to_markdown(session_id, role, content, cwd)
+    except Exception as e:
+        print(f"[turn_export] {e}", file=sys.stderr)
+
+
+def _load_export_config():
+    """turn_export.json を読み込む。無ければNone。"""
+    config_path = Path(__file__).parent / "turn_export.json"
+    if not config_path.exists():
+        return None
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        if not config.get("enabled", False):
+            return None
+        return config
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _locked_append(filepath, text):
+    """ファイルロック付きappend。複数ウィンドウで同時書き込みしても安全。"""
+    lock_path = Path(str(filepath) + ".lock")
+    lock_fd = None
+    try:
+        # ロックファイルを排他的に取得（リトライ付き）
+        for _ in range(10):
+            try:
+                lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                break
+            except FileExistsError:
+                # ロック待ち（50ms × 10 = 最大500ms）
+                time.sleep(0.05)
+        else:
+            # ロック取得失敗でも書き込みは試みる
+            with open(filepath, "a", encoding="utf-8") as f:
+                f.write(text)
+            return
+
+        # ロック取得成功 → 書き込み
+        with open(filepath, "a", encoding="utf-8") as f:
+            f.write(text)
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+            try:
+                os.remove(str(lock_path))
+            except OSError:
+                pass
+
+
+def _append_to_markdown(session_id, role, content, cwd=""):
+    """turn_export.json の設定に従い、日付マークダウンに追記。"""
+    config = _load_export_config()
+    if config is None:
+        return
+
+    output_dir = Path(os.path.expandvars(config["output_dir"])).expanduser()
+    offset = config.get("timezone_offset_hours", 9)
+
+    local = datetime.now(timezone.utc) + timedelta(hours=offset)
+    date_str = local.strftime("%Y-%m-%d")
+    time_str = local.strftime("%H:%M")
+    md_path = output_dir / f"{date_str}.md"
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    icon = "👤 User" if role == "user" else "🤖 Assistant"
+    short_sid = session_id[:8]
+
+    if not md_path.exists():
+        # 新規作成（frontmatter + 最初のセッション見出し）
+        text = f"---\ntitle: \"{date_str}\"\ntags: [claude-turns]\n---\n\n"
+        text += f"## {time_str} session:{short_sid}\n"
+        if cwd:
+            text += f"> cwd: {cwd}\n"
+        text += f"\n### {icon}\n{content}\n"
+        md_path.write_text(text, encoding="utf-8")
+    else:
+        # 追記
+        existing = md_path.read_text(encoding="utf-8")
+        entry = ""
+        if f"session:{short_sid}" not in existing:
+            entry += f"\n---\n\n## {time_str} session:{short_sid}\n"
+            if cwd:
+                entry += f"> cwd: {cwd}\n"
+        entry += f"\n### {icon}\n{content}\n"
+        _locked_append(md_path, entry)
 
 
 def _should_search(text):
