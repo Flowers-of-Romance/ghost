@@ -89,6 +89,46 @@ def _locked_append(filepath, text):
                 pass
 
 
+def _pick_user_face(content):
+    """ユーザー発言の雰囲気から顔を選ぶ。"""
+    c = (content or "").lower()
+    # 怒り・不満
+    if any(w in c for w in ["ふざけ", "おかしい", "バグ", "だめ", "ひどい", "最悪", "むかつ", "壊れ", "なんで"]):
+        return "😤"
+    # 疑問・困惑
+    if any(w in c for w in ["？", "?", "わからん", "わからない", "なぜ", "どうして", "どういう"]):
+        return "🤔"
+    # 感謝・喜び
+    if any(w in c for w in ["ありがと", "さんきゅ", "助かる", "最高", "いいね", "すごい", "やった", "完璧"]):
+        return "😆"
+    # 挨拶
+    if any(w in c for w in ["おはよ", "こんにち", "こんばん", "おつかれ", "ただいま", "よろしく"]):
+        return "😊"
+    # 依頼・お願い
+    if any(w in c for w in ["して", "やって", "頼む", "お願い", "変えて", "直して", "作って", "見せて"]):
+        return "😙"
+    # テンション高い
+    if any(w in c for w in ["！", "!", "www", "笑", "ｗ", "草"]):
+        return "😜"
+    # 短い（雑な投げ）
+    if len(c) < 10:
+        return "🙂"
+    # デフォルト
+    return "😀"
+
+
+def _is_system_noise(content):
+    """システム通知など、ユーザー発言でないものを判定。"""
+    if not content:
+        return False
+    return any(marker in content for marker in [
+        "Background command",
+        "toolu_",
+        "completed (exit code",
+        "Read the output file to retrieve the result",
+    ])
+
+
 def _append_to_markdown(session_id, role, content, cwd=""):
     """turn_export.json の設定に従い、日付マークダウンに追記。"""
     config = _load_export_config()
@@ -105,13 +145,22 @@ def _append_to_markdown(session_id, role, content, cwd=""):
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    icon = "👤 User" if role == "user" else "🤖 Assistant"
+    if role == "user" and _is_system_noise(content):
+        return
+
+    _SESSION_COLORS = ["🔴", "🟠", "🔵", "🟢", "🟣", "🟡"]
+
+    icon = f"{_pick_user_face(content)} User" if role == "user" else "🤖 Assistant"
     short_sid = session_id[:8]
+    project_name = Path(cwd).name if cwd else ""
+    # セッションIDからカラーマーカーを決定（同じセッションは常に同じ色）
+    color = _SESSION_COLORS[hash(short_sid) % len(_SESSION_COLORS)]
 
     if not md_path.exists():
         # 新規作成（frontmatter + 最初のセッション見出し）
         text = f"---\ntitle: \"{date_str}\"\ntags: [claude-turns]\n---\n\n"
-        text += f"## {time_str} session:{short_sid}\n"
+        label = f"## {color} {time_str} [{project_name}] session:{short_sid}\n" if project_name else f"## {color} {time_str} session:{short_sid}\n"
+        text += label
         if cwd:
             text += f"> cwd: {cwd}\n"
         text += f"\n### {icon}\n{content}\n"
@@ -121,7 +170,8 @@ def _append_to_markdown(session_id, role, content, cwd=""):
         existing = md_path.read_text(encoding="utf-8")
         entry = ""
         if f"session:{short_sid}" not in existing:
-            entry += f"\n---\n\n## {time_str} session:{short_sid}\n"
+            label = f"\n---\n\n## {color} {time_str} [{project_name}] session:{short_sid}\n" if project_name else f"\n---\n\n## {color} {time_str} session:{short_sid}\n"
+            entry += label
             if cwd:
                 entry += f"> cwd: {cwd}\n"
         entry += f"\n### {icon}\n{content}\n"
