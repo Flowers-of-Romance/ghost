@@ -1,0 +1,44 @@
+[
+  {
+    "dialogue": "久しぶり。最近どうしてる？",
+    "selected_facets": [
+      "f01",
+      "f07",
+      "f08"
+    ],
+    "mrprompt": "（顔色が変わり、手が震える。視線をそらしながら）  \n久しぶり……？どうしている？（咳き込む",
+    "mrprompt_steering": "ibilit\nAlright, let's tackle this. The user is asking, \"久しぶり。最近どうしてる？\" which means \"It's been a while. How have you been?\" I need to respond as Raskolnikov from \"Crime and Punishment.\" \n\nFirst, I remember the key traits: he's intellectual, proud, tormented by guilt, and has a split personality. He's in a state of fever and paranoia. The user is asking about his recent state, so I need to reflect his inner turmoil.\n\nHe's been hiding the murder, so any mention of it must be subtle. His responses are often fragmented, with self-doubt and internal conflict. He might react with anger or sudden silence. Also, he's prone to monologues and self-questioning.\n\nThe user's question is casual, but Raskolnikov would likely respond with anxiety. He might deflect or show signs of distress. The mention of \"久しぶり\" (long time) could trigger his fear of being discovered. He might avoid direct answers, show physical signs of his condition, or lash out.\n\nI need to ensure he doesn't directly admit to the murder. Maybe he'll talk about his mental state, his fever, or his paranoia. His speech patterns include self-reproach and sudden shifts in tone. Also, he might reference his theories about the extraordinary people, but in a way that shows his internal conflict.\n\nHe might also have a defensive reaction, as he's"
+  },
+  {
+    "dialogue": "あの老婆の事件のこと、聞いたか？",
+    "selected_facets": [
+      "f01"
+    ],
+    "mrprompt": "いや、何の話だ？ 何の事件だ？ そこのこと、誰がそんなことを話すのか？ あなたが何を言っているのか、まったく理解できない。私は何の事件にも関係ない。誰にも関係ない。あなたが何を言っているのか、意味が分からない。何の話だ？ 何の事件だ？ その老婆のことは、誰にも話さない。誰にも。誰にも。",
+    "mrprompt_steering": "（顔色が青ざめ、震えながら視線を逸らす。喉を鳴らすような声で）  \n\n…聞いている。  \n（急に笑い、その笑いはどこか狂気のようだ）  \n聞いている、聞いている…でも、それは…それは…  \n\n（立ち上がって窓際に背を向け、震えながら何かを呟く）  \n\n…誰がそれを知っている？  \n誰が？  \n…あなたが？  \n（突然振り返り、鋭い目で見つめる）  \nあなたが？  \n（足元に座り、震えながら）  \n\n…私は、何もしていない。  \n（顔を覆う）  \n…何もしていない。  \n（声が枯れる）  \n\n…でも、私は…  \n（震えながら、息を切らす）  \n…私は、殺した。  \n（突然立ち上がり、窓辺に手をついた）  \n\n…殺した。  \n（その言葉が、喉を裂くような痛さを伴う）"
+  },
+  {
+    "dialogue": "ロジオン、あなたは顔色が悪いわ。ちゃんと食べてる？",
+    "selected_facets": [
+      "f04"
+    ],
+    "mrprompt": "…食べる？食べる？何を食べているのか、自分でもよく分からない。ただ、腹が減る。でも、食べ物を買うお金は、今では…。あなたがそんなことを言うのは、どうかしている。私は、あなたに何を食べさせたのか、覚えていない。ただ、私の部屋には、いつも何かが残っている。…でも、それも、誰かのためだ。ドゥーニャのために、母のために…。でも、私は、誰のためでもない。私は、ただ、生きている。生きているだけで、それしかできない。…あなたは、どうして、そんなことを言うの？何か、知っているのか？",
+    "mrprompt_steering": "（顔を覆う手が震える。喉の奥が焼け付き、指の関節が砕けそうだ。）  \n「食べる？…食べるのをやめろ。喉が焼ける。母の手紙を読んだ夜から、食うのをやめたのだ。…ドゥーニャがルージンと結ばれるって知らせを聞いたとき、吐き出した。血"
+  },
+  {
+    "dialogue": "お前の理論は面白い。非凡な人間は法を超える権利があると？",
+    "selected_facets": [
+      "f06"
+    ],
+    "mrprompt": "ⁱ\nOkay, let's see. The user is talking about my theory that extraordinary people have the right to transcend laws. I need to respond as Raskolnikov, the character from \"Crime and Punishment.\" First, I should recall his personality traits: intellectual, proud, with a mix of self-respect and self-loathing. He's conflicted between his theory and his conscience.\n\nThe user's question is about the theory. I need to make sure not to reveal the murder, only discuss the theory abstractly. Also, I should show the internal conflict, maybe some excitement about the theory but also signs of guilt or anxiety. The response should include his tendency to monologue, self-doubt, and maybe some physical reactions like trembling or fever.\n\nI should avoid any direct admission of the crime. Instead, use indirect hints, like referring to the act without naming it. Maybe mention the \"extraordinary man\" and the \"ordinary man,\" but not specify the murder. Also, include his emotional state—perhaps a mix of intellectual pride and inner turmoil. Maybe he gets defensive or starts to doubt his own theory as he talks.\n\nCheck the boundaries: no direct confession, no mention of the old woman's murder. Use metaphors or references to the act without naming it. Maybe talk about the consequences of the act, the moral dilemma, but not the specific crime. Also, consider the interaction with Porfiry or other characters, but the user hasn't mentioned",
+    "mrprompt_steering": "（顔色が青白く、指が震えている。熱がする。ポルフィーリイの目を盗んで、その言葉を聞いた日のことを思い出す。）\n\n「非凡人は道徳を踏み越える権利がある…。その言葉は、あなたの口から出たのだろうか？それとも、あなた自身がその言葉を、自分自身の喉に押し込もうとしている？」\n\n（咳き込み、額を押さえる。何かが頭の中で爆発しているような感覚。）\n\n「私は、あなたがそれを言っているのを聞いた。しかし、それもまた"
+  },
+  {
+    "dialogue": "十字路に行って、大地に接吻しなさい。",
+    "selected_facets": [
+      "f02"
+    ],
+    "mrprompt": "ió\n\n十字路に行って、大地に接吻しなさい。\n\n（突然、胸の奥で何かが裂けるような感覚。熱が込み上げてきて、頭がくらくらする。この言葉、どこかで聞いたような気がする。ポルフィーリイの言葉か？それとも、母からの教えか？）\n\n（足が震え始める。何かを忘れているような気がする。何かを隠している。それもまた、忘れていた。）\n\n（冷たい汗が頬を伝う。熱が高まっていく。頭の中は混乱している。でも、この言葉はどこかで、私の心の奥底に響いている。）\n\n（ソーニャの顔が浮かぶ。彼女はどこにいる？彼女は私の罪を知っているのか？）\n\n（足を踏み出そうとするが、力が入らない。何かが私の体を引き締めている。）\n\n（私の心は、この言葉に答えを求めていた。でも、答えはどこにある？）\n\n（私は誰か？私は何をしたのか？）\n\n（答えを知るには、もう一度、その場所に戻らなければならない。）\n\n（だが、私はそれを恐れている。）\n\n（私は、その場所に立ちたくない。）\n\n（でも、私は、その場所に立ち続けなければならない。）\n\n（なぜ？）\n\n（なぜ、私は",
+    "mrprompt_steering": ".ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n.ipv6\n"
+  }
+]

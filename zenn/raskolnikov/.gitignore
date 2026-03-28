@@ -1,0 +1,8 @@
+llama-hip/
+llama-hip.zip
+llama-vulkan.zip
+control_vectors.pkl
+steering_vectors.pkl
+_tmp_prompt.txt
+__pycache__/
+*.pyc

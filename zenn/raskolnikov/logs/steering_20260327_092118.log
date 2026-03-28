@@ -1,0 +1,27 @@
+Model: Qwen/Qwen3-8B
+Layer: 18
+Alpha: 3.0
+Started: 2026-03-27T09:21:18.176012
+
+============================================================
+Extracting steering vectors
+============================================================
+Extracting: anxiety (3 pairs)
+  pair done in 4.6s, norm=55.24
+  pair done in 4.9s, norm=60.37
+  pair done in 5.3s, norm=79.53
+  anxiety vector norm (normalized): 1.0000
+Extracting: self_loathing (3 pairs)
+  pair done in 4.4s, norm=54.64
+  pair done in 4.8s, norm=52.04
+  pair done in 3.9s, norm=60.40
+  self_loathing vector norm (normalized): 1.0000
+Extracting: intellectual_intensity (2 pairs)
+  pair done in 4.5s, norm=69.56
+  pair done in 4.4s, norm=61.79
+  intellectual_intensity vector norm (normalized): 1.0000
+Extracting: defensiveness (2 pairs)
+  pair done in 4.3s, norm=69.02
+  pair done in 4.0s, norm=73.91
+  defensiveness vector norm (normalized): 1.0000
+Saved to C:\memory\zenn\raskolnikov\steering_vectors.pkl
