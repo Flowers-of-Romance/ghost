@@ -299,8 +299,76 @@ def extract_assistant_text(message):
     return None
 
 
+def _extract_tool_calls(message):
+    """assistant message から tool_use ブロックを抽出。[(name, input_dict), ...]"""
+    if message.get("type") != "assistant":
+        return []
+    content_parts = message.get("message", {}).get("content", [])
+    if not isinstance(content_parts, list):
+        return []
+    calls = []
+    for part in content_parts:
+        if isinstance(part, dict) and part.get("type") == "tool_use":
+            calls.append((part.get("name", ""), part.get("input", {}), part.get("tool_use_id", "")))
+    return calls
+
+
+def _extract_tool_results(message):
+    """user message から tool_result ブロックを抽出。{tool_use_id: content}"""
+    if message.get("type") != "user":
+        return {}
+    content_parts = message.get("message", {}).get("content", [])
+    if not isinstance(content_parts, list):
+        return {}
+    results = {}
+    for part in content_parts:
+        if isinstance(part, dict) and part.get("type") == "tool_result":
+            tid = part.get("tool_use_id", "")
+            content = part.get("content", "")
+            if isinstance(content, list):
+                # content が [{type: "text", text: "..."}] の場合
+                content = "\n".join(
+                    p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+            results[tid] = str(content)
+    return results
+
+
+def _format_tool_for_md(name, input_dict, result_text):
+    """tool call を MD 用に整形。"""
+    MAX_RESULT = 500
+    if name == "Bash":
+        cmd = input_dict.get("command", "")
+        # 改行を含むコマンドは1行に潰して80文字で切る
+        cmd_oneline = cmd.replace("\n", " ").strip()
+        if len(cmd_oneline) > 80:
+            cmd_oneline = cmd_oneline[:77] + "..."
+        truncated = result_text.strip()[:MAX_RESULT]
+        if len(result_text) > MAX_RESULT:
+            truncated += "\n… (truncated)"
+        return f"- 🔧 `{cmd_oneline}`\n```\n{truncated}\n```\n"
+    elif name == "Read":
+        path = input_dict.get("file_path", "")
+        return f"- 📖 Read `{path}`\n"
+    elif name == "Edit":
+        path = input_dict.get("file_path", "")
+        return f"- ✏️ Edit `{path}`\n"
+    elif name == "Write":
+        path = input_dict.get("file_path", "")
+        return f"- 📝 Write `{path}`\n"
+    elif name in ("Glob", "Grep"):
+        pattern = input_dict.get("pattern", "")
+        return f"- 🔍 {name} `{pattern}`\n"
+    else:
+        return f"- 🔧 {name}\n"
+
+
 def handle_stop(hook_input):
-    """Stop: transcript_path から最後のアシスタント応答を保存。"""
+    """Stop: transcript_path から全アシスタント応答を保存。
+    - SQLite: 最後のテキスト応答のみ
+    - MD: テキスト + tool call を時系列で追記
+    """
     transcript_path = hook_input.get("transcript_path", "")
     if not transcript_path or not Path(transcript_path).exists():
         return
@@ -308,22 +376,23 @@ def handle_stop(hook_input):
     session_id = hook_input.get("session_id", "unknown")
     cwd = hook_input.get("cwd", "")
 
-    # JSONL を末尾から読んで最後のアシスタントメッセージを探す
     try:
         lines = Path(transcript_path).read_text(encoding="utf-8").strip().split("\n")
     except Exception:
         return
 
-    # 末尾から探す（最後のアシスタント応答が欲しい）
-    for line in reversed(lines):
+    messages = []
+    for line in lines:
         if not line.strip():
             continue
         try:
-            message = json.loads(line)
+            messages.append(json.loads(line))
         except json.JSONDecodeError:
             continue
 
-        text = extract_assistant_text(message)
+    # --- SQLite: 最後のアシスタントテキストのみ（従来通り） ---
+    for msg in reversed(messages):
+        text = extract_assistant_text(msg)
         if text and text.strip():
             save_turn(
                 session_id=session_id,
@@ -331,7 +400,40 @@ def handle_stop(hook_input):
                 content=text,
                 cwd=cwd,
             )
-            return
+            break
+
+    # --- MD: tool call を追記 ---
+    config = _load_export_config()
+    if config is None:
+        return
+
+    # tool_use_id → result のマップを構築
+    result_map = {}
+    for msg in messages:
+        result_map.update(_extract_tool_results(msg))
+
+    # assistant メッセージから tool call を収集して MD に追記
+    md_parts = []
+    for msg in messages:
+        calls = _extract_tool_calls(msg)
+        for name, input_dict, tid in calls:
+            result_text = result_map.get(tid, "")
+            md_parts.append(_format_tool_for_md(name, input_dict, result_text))
+
+    if not md_parts:
+        return
+
+    output_dir = Path(os.path.expandvars(config["output_dir"])).expanduser()
+    offset = config.get("timezone_offset_hours", 9)
+    local = datetime.now(timezone.utc) + timedelta(hours=offset)
+    date_str = local.strftime("%Y-%m-%d")
+    md_path = output_dir / f"{date_str}.md"
+
+    if md_path.exists():
+        tool_block = "\n<details><summary>🔧 Tool calls</summary>\n"
+        tool_block += "".join(md_parts)
+        tool_block += "\n</details>\n"
+        _locked_append(md_path, tool_block)
 
 
 def main():
