@@ -1,5 +1,17 @@
 # Changelog
 
+## [v16.5] - 2026-03-31
+
+### Added
+- **Tool callのMD書き出し**: 会話終了時（Stop hook）にtranscript JSONLを走査し、Bash/Read/Edit/Write/Grep/GlobのツールコールをMDファイルに追記。SQLiteには書かない
+  - Bash: コマンド（1行化・80文字切り詰め）+ 出力（500文字切り詰め）
+  - Read/Edit/Write: ファイルパス
+  - Grep/Glob: 検索パターン
+  - `<details>` ブロックで折りたたみ表示
+
+### Design rationale
+MDの対話ログにユーザー発言とアシスタントのテキスト応答しか残っておらず、Bash実行などのtool callが完全に欠落していた。transcript JSONLにはtool_use/tool_resultブロックとして記録されているため、Stop hookでこれを読み取ってMDにだけ追記する。SQLiteにはテキスト応答のみを保存する従来の挙動を維持。
+
 ## [v16.4] - 2026-03-27
 
 ### Added
