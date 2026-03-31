@@ -147,34 +147,42 @@ def _append_to_markdown(session_id, role, content, cwd=""):
 
     if role == "user" and _is_system_noise(content):
         return
+    # XMLタグだけ・空白だけの発言はスキップ
+    stripped_content = re.sub(r'<[^>]+>', '', content or '').strip()
+    if not stripped_content:
+        return
 
-    _SESSION_COLORS = ["🔴", "🟠", "🔵", "🟢", "🟣", "🟡"]
+    _SESSION_ANIMALS = [
+        "🐱", "🐶", "🦊", "🐸", "🐙", "🦉", "🐻", "🐺",
+        "🦈", "🐧", "🦎", "🐝", "🦋", "🐬", "🦅", "🐢",
+    ]
 
     icon = f"{_pick_user_face(content)} User" if role == "user" else "🤖 Assistant"
     short_sid = session_id[:8]
     project_name = Path(cwd).name if cwd else ""
-    # セッションIDからカラーマーカーを決定（同じセッションは常に同じ色）
-    color = _SESSION_COLORS[hash(short_sid) % len(_SESSION_COLORS)]
+    # セッションIDから動物マーカーを決定（同じセッションは常に同じ動物）
+    # hash()はプロセスごとにランダム化されるのでUUIDの先頭を16進数として使う
+    animal = _SESSION_ANIMALS[int(short_sid, 16) % len(_SESSION_ANIMALS)]
 
     if not md_path.exists():
         # 新規作成（frontmatter + 最初のセッション見出し）
         text = f"---\ntitle: \"{date_str}\"\ntags: [claude-turns]\n---\n\n"
-        label = f"## {color} {time_str} [{project_name}] session:{short_sid}\n" if project_name else f"## {color} {time_str} session:{short_sid}\n"
+        label = f"## {animal} {time_str} [{project_name}] session:{short_sid}\n" if project_name else f"## {animal} {time_str} session:{short_sid}\n"
         text += label
         if cwd:
             text += f"> cwd: {cwd}\n"
-        text += f"\n### {icon}\n{content}\n"
+        text += f"\n### {icon} {animal} {time_str}\n{content}\n"
         md_path.write_text(text, encoding="utf-8")
     else:
         # 追記
         existing = md_path.read_text(encoding="utf-8")
         entry = ""
         if f"session:{short_sid}" not in existing:
-            label = f"\n---\n\n## {color} {time_str} [{project_name}] session:{short_sid}\n" if project_name else f"\n---\n\n## {color} {time_str} session:{short_sid}\n"
+            label = f"\n---\n\n## {animal} {time_str} [{project_name}] session:{short_sid}\n" if project_name else f"\n---\n\n## {animal} {time_str} session:{short_sid}\n"
             entry += label
             if cwd:
                 entry += f"> cwd: {cwd}\n"
-        entry += f"\n### {icon}\n{content}\n"
+        entry += f"\n### {icon} {animal} {time_str}\n{content}\n"
         _locked_append(md_path, entry)
 
 
@@ -430,10 +438,11 @@ def handle_stop(hook_input):
     md_path = output_dir / f"{date_str}.md"
 
     if md_path.exists():
-        tool_block = "\n<details><summary>🔧 Tool calls</summary>\n"
-        tool_block += "".join(md_parts)
-        tool_block += "\n</details>\n"
-        _locked_append(md_path, tool_block)
+        callout_lines = ["> [!info]- 🔧 Tool calls"]
+        for part in md_parts:
+            for line in part.rstrip("\n").split("\n"):
+                callout_lines.append(f"> {line}")
+        _locked_append(md_path, "\n" + "\n".join(callout_lines) + "\n")
 
 
 def main():
