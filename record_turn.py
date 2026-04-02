@@ -355,21 +355,21 @@ def _format_tool_for_md(name, input_dict, result_text):
         truncated = result_text.strip()[:MAX_RESULT]
         if len(result_text) > MAX_RESULT:
             truncated += "\n… (truncated)"
-        return f"- 🔧 `{cmd_oneline}`\n```\n{truncated}\n```\n"
+        return f"- Bash `{cmd_oneline}`\n```\n{truncated}\n```\n"
     elif name == "Read":
         path = input_dict.get("file_path", "")
-        return f"- 📖 Read `{path}`\n"
+        return f"- Read `{path}`\n"
     elif name == "Edit":
         path = input_dict.get("file_path", "")
-        return f"- ✏️ Edit `{path}`\n"
+        return f"- Edit `{path}`\n"
     elif name == "Write":
         path = input_dict.get("file_path", "")
-        return f"- 📝 Write `{path}`\n"
+        return f"- Write `{path}`\n"
     elif name in ("Glob", "Grep"):
         pattern = input_dict.get("pattern", "")
-        return f"- 🔍 {name} `{pattern}`\n"
+        return f"- {name} `{pattern}`\n"
     else:
-        return f"- 🔧 {name}\n"
+        return f"- {name}\n"
 
 
 def handle_stop(hook_input):
