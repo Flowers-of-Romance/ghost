@@ -77,6 +77,37 @@ memory.pyは脳の記憶メカニズムを再現する:
 | **睡眠中の記憶固定化** | **raw_turnsから覚醒度で重み付きサンプリング → memoriesに自動昇格。会話終了時・アイドル時に自動実行** |
 | **P2P同期** | **複数端末間で記憶を共有。各端末が独立した海馬として動作** |
 | **対話マークダウン書き出し** | **全対話を日付単位のマークダウンにリアルタイム追記。Obsidian等で閲覧** |
+| **メタ認知** | **recallの精度を会話の流れとの意味的一致度で自動採点。人間が評価者にならない** |
+
+### メタ認知
+
+recallの自己検証。recallが出した記憶が、その後の会話で本当に使われたかを自動評価する。
+
+```
+recall実行（10件出力）
+    ↓ IDを recall_log に記録
+会話が進む（raw_turnsに蓄積）
+    ↓
+次回recall実行
+    ↓ 前回の会話全文をembedding
+    ↓ recall出力の各記憶embeddingとのコサイン類似度を計算
+    ↓
+的中（≥0.45）/ 空振り（<0.45）/ 漏れ（未recallだが≥0.50）
+    ↓
+precision（精度）= 的中 / 出した数
+recall_rate（網羅）= 的中 / (的中 + 漏れ)
+```
+
+評価者は人間ではなく会話の流れ自体。`calibrate` で精度の時系列を確認できる。
+
+```bash
+python memory.py calibrate
+# recall精度レポート（直近20セッション）:
+#   2026-04-04 14:18  精度:██████░░░░ 60%  網羅:███░░░░░░░ 38%
+#   ...
+#   平均  精度: 63%  網羅: 42%
+#   傾向  精度: → (+0%)  網羅: ↑ (+8%)
+```
 
 ### 予測符号化
 
@@ -165,6 +196,7 @@ sentence-transformersがあれば **ベクトル検索**（384次元、コサイ
 | `add "内容" カテゴリ` | 記憶を追加。情動・重要度は自動推定 | 覚えておきたいことがあるとき |
 | `overview` | 脳の俯瞰。構造・重心・arousal分布・時系列 | 「この脳どうなってる？」のとき |
 | `stats` | 数字だけの統計 | overviewより軽く見たいとき |
+| `calibrate` | recall精度の時系列レポート | recallの自己検証を見たいとき |
 | `detail ID` | 1件の記憶の全情報 | 特定の記憶を深掘りしたいとき |
 | `correct ID "内容"` | 記憶を修正（旧版を保存） | 間違った記憶を直したいとき |
 | `versions ID` | 記憶の版履歴を表示 | 改訂の経緯を見たいとき |
@@ -378,27 +410,48 @@ record_turn.pyのフックに連動し、全対話を日付単位のマークダ
 
 ## DBテーブル
 
-### memories（記憶）
+v18でmemoriesテーブルを3テーブルに物理分割した（左脳/右脳モデル）。後方互換のため `memories_v` VIEWで旧スキーマと同一カラム名を返す。
+
+### memories（脳梁 — メタ情報）
 
 | カラム | 何 |
 |--------|-----|
 | id | 自動採番 |
-| content | 記憶の内容（全文） |
-| category | fact / episode / context / preference / procedure / schema |
 | importance | 1-5。自動推定+予測誤差で補正 |
-| keywords | キーワード断片（JSON配列） |
-| emotions | 情動タグ（JSON配列）: surprise, conflict, determination, insight, connection, anxiety |
-| arousal | 覚醒度 0.0-1.0。0.85以上は「外傷的記憶」として特殊扱い |
 | created_at | 記録日時（ISO 8601） |
 | last_accessed | 最後に想起した日時 |
 | access_count | 想起回数。多いほど強化される。20回超で馴化 |
 | forgotten | 忘却フラグ。1=通常検索では見えない。delusionでは見える |
+| source_conversation | 元のセッションID |
+| uuid | グローバル一意ID（P2P同期用） |
+| updated_at | 最終更新日時 |
+| last_mutated | 最終メタデータ変容日時 |
+| context_expires_at | context記憶の失効日時 |
+
+### cortex（左脳 — 意味的・分析的データ）
+
+| カラム | 何 |
+|--------|-----|
+| id | memories.idと一致 |
+| content | 記憶の内容（全文） |
+| category | fact / episode / context / preference / procedure / schema |
+| keywords | キーワード断片（JSON配列） |
 | embedding | ベクトル表現（BLOB, 384次元, multilingual-e5-small） |
-| spatial_context | 場所（ホスト名/SSH接続元） |
-| temporal_context | 時間帯・曜日 |
-| provenance | 出自: user_explicit / wander / consolidation |
 | confidence | 信頼度 0.0-1.0。出自に基づいて自動設定 |
+| provenance | 出自: user_explicit / wander / consolidation |
 | revision_count | 改訂回数。多いほど安定性スコアが下がる |
+| merged_from | 統合元の記憶ID群（JSON配列） |
+
+### limbic（右脳 — 情動的・直感的データ）
+
+| カラム | 何 |
+|--------|-----|
+| id | memories.idと一致 |
+| emotions | 情動タグ（JSON配列）: surprise, conflict, determination, insight, connection, anxiety |
+| arousal | 覚醒度 0.0-1.0。0.85以上は「外傷的記憶」として特殊扱い |
+| flashbulb | フラッシュバルブ記憶（最も情動的な一文、80文字以内） |
+| temporal_context | 時間帯・曜日 |
+| spatial_context | 場所（ホスト名/SSH接続元） |
 
 ### raw_turns（対話原文）
 
@@ -427,6 +480,21 @@ interfere/consolidate/correctの前に記憶の状態をスナップショット
 | reason | 保存理由: interference / consolidation / user_correction |
 | superseded_by | 統合先の新記憶ID（統合時のみ） |
 | created_at | スナップショット日時 |
+
+### recall_log（メタ認知）
+
+recallの自己検証データ。recall出力と会話の意味的一致度を記録。
+
+| カラム | 何 |
+|--------|-----|
+| session_ts | recall実行日時 |
+| recalled_ids | recallが出した記憶ID群（JSON配列） |
+| accessed_ids | 各記憶と会話のコサイン類似度（JSON dict） |
+| precision | 精度（的中 / 出した数） |
+| recall_rate | 網羅率（的中 / 関連記憶数） |
+| noise_ids | 空振り（出したが的中しなかった記憶ID） |
+| missed_ids | 漏れ（出さなかったが関連していた記憶ID） |
+| evaluated_at | 評価実行日時 |
 
 ### memories_fts / raw_turns_fts（全文検索）
 

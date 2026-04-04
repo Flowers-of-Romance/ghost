@@ -1,5 +1,32 @@
 # Changelog
 
+## [v19.0] - 2026-04-05
+
+### Added
+- **メタ認知（recall自己検証）**: recallが出した記憶の精度を、会話の流れとのベクトル類似度で自動採点する。評価者は人間ではなく会話そのもの
+  - `recall_log` テーブル: recall出力のIDと事後検証結果を記録
+  - recall実行時に前回の検証結果を1行表示（精度/網羅/空振り/漏れ）
+  - `calibrate` コマンド: recall精度の時系列レポート。トレンド表示（4セッション以上で傾向↑↓→）
+- **評価の仕組み**:
+  - recall出力の各記憶embeddingと、その後の会話全文のembeddingのコサイン類似度で的中/空振りを判定（閾値0.45）
+  - recallが出さなかったが会話と類似度0.50以上の記憶を「漏れ」として検出
+  - precision（精度）= 出した中で的中した割合、recall_rate（網羅）= 関連記憶のうちカバーした割合
+
+### Design notes
+- HyperAgents (Zhang et al. 2026) の metacognitive self-modification から着想
+- ただしHyperAgentsの「メタ認知」はベンチマークスコアによる外部フィードバック。ghostでは会話の意味的流れ自体を評価関数にすることで、人間を評価者にしない設計
+- これは経験的キャリブレーションの第一歩。データが溜まればrecallのスコアリング調整に使える
+
+## [v18.1] - 2026-04-04
+
+### Added
+- **`/verify` コマンド**: PLAN.mdと現在の作業の整合性を自己検証。shepherdの崖検出と連携し、far/near/cliffの3段階で判定
+
+### Changed
+- **`/dive`, `/surface`**: ステータスライン用マーカーファイル（dive-active）の作成/削除を追加
+- **`/lsd`, `/sober`**: ステータスライン用マーカーファイル（shepherd-active）の作成/削除を追加
+- **settings.local.json**: hookコマンドのパスを絶対パスに統一
+
 ## [v18.0] - 2026-04-04
 
 ### Added
