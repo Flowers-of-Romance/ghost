@@ -853,6 +853,75 @@ def init_db():
         )
     """)
 
+    # === 左脳/右脳テーブル分割 (v17.1) ===
+    # cortex（左脳）: 意味的・分析的データ
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cortex (
+            id INTEGER PRIMARY KEY,
+            content TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT 'fact',
+            keywords TEXT DEFAULT '[]',
+            embedding BLOB,
+            confidence REAL DEFAULT 0.7,
+            provenance TEXT DEFAULT 'unknown',
+            revision_count INTEGER DEFAULT 0,
+            merged_from TEXT DEFAULT NULL,
+            FOREIGN KEY (id) REFERENCES memories(id)
+        )
+    """)
+    # limbic（右脳）: 情動的・直感的データ
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS limbic (
+            id INTEGER PRIMARY KEY,
+            emotions TEXT DEFAULT '[]',
+            arousal REAL DEFAULT 0.2,
+            flashbulb TEXT DEFAULT NULL,
+            temporal_context TEXT DEFAULT NULL,
+            spatial_context TEXT DEFAULT NULL,
+            FOREIGN KEY (id) REFERENCES memories(id)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_cortex_category ON cortex(category)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_limbic_arousal ON limbic(arousal)")
+
+    # データ移行: memoriesからcortex/limbicにコピー（まだ移行されていない場合）
+    migrated = conn.execute("SELECT COUNT(*) FROM cortex").fetchone()[0]
+    total = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+    if migrated < total:
+        conn.execute("""
+            INSERT OR IGNORE INTO cortex (id, content, category, keywords, embedding,
+                confidence, provenance, revision_count, merged_from)
+            SELECT id, content, category, keywords, embedding,
+                confidence, provenance, revision_count, merged_from
+            FROM memories WHERE id NOT IN (SELECT id FROM cortex)
+        """)
+        conn.execute("""
+            INSERT OR IGNORE INTO limbic (id, emotions, arousal, flashbulb,
+                temporal_context, spatial_context)
+            SELECT id, emotions, arousal, flashbulb,
+                temporal_context, spatial_context
+            FROM memories WHERE id NOT IN (SELECT id FROM limbic)
+        """)
+        new_count = total - migrated
+        if new_count > 0:
+            print(f"  ✓ {new_count}件をcortex/limbicに移行")
+
+    # memories_v VIEW: 後方互換（旧スキーマと同一カラム名）
+    conn.execute("DROP VIEW IF EXISTS memories_v")
+    conn.execute("""
+        CREATE VIEW memories_v AS
+        SELECT m.id, c.content, c.category, m.importance,
+               l.emotions, l.arousal, c.keywords,
+               m.created_at, m.last_accessed, m.access_count, m.forgotten,
+               m.source_conversation, c.embedding, c.merged_from,
+               l.flashbulb, m.context_expires_at, l.temporal_context,
+               l.spatial_context, m.uuid, m.updated_at, m.last_mutated,
+               c.provenance, c.confidence, c.revision_count
+        FROM memories m
+        JOIN cortex c ON c.id = m.id
+        JOIN limbic l ON l.id = m.id
+    """)
+
     conn.commit()
     conn.close()
     print(f"✓ memory.db を初期化しました: {DB_PATH}")
@@ -1060,17 +1129,32 @@ def consolidate_memories(dry_run=False):
             b_conf = b["confidence"] if "confidence" in b.keys() and b["confidence"] is not None else CONFIDENCE_DEFAULT
             merged_confidence = max(a_conf, b_conf) * CONFIDENCE_CONSOLIDATION_FACTOR
 
+            emo_json = json.dumps(merged_emotions)
+            kw_json = json.dumps(merged_keywords, ensure_ascii=False)
+            mf_json = json.dumps([a["id"], b["id"]])
             conn.execute(
                 """INSERT INTO memories
                    (content, category, importance, emotions, arousal, keywords,
                     embedding, merged_from, provenance, confidence, flashbulb)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'consolidation', ?, ?)""",
                 (merged_content, merged_category, merged_importance,
-                 json.dumps(merged_emotions), merged_arousal,
-                 json.dumps(merged_keywords, ensure_ascii=False),
-                 blob, json.dumps([a["id"], b["id"]]), merged_confidence, merged_flashbulb)
+                 emo_json, merged_arousal, kw_json,
+                 blob, mf_json, merged_confidence, merged_flashbulb)
             )
             new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            # cortex/limbicにも書き込み
+            conn.execute(
+                """INSERT OR REPLACE INTO cortex
+                   (id, content, category, keywords, embedding, confidence, provenance, revision_count, merged_from)
+                   VALUES (?, ?, ?, ?, ?, ?, 'consolidation', 0, ?)""",
+                (new_id, merged_content, merged_category, kw_json, blob, merged_confidence, mf_json)
+            )
+            conn.execute(
+                """INSERT OR REPLACE INTO limbic
+                   (id, emotions, arousal, flashbulb, temporal_context, spatial_context)
+                   VALUES (?, ?, ?, ?, NULL, NULL)""",
+                (new_id, emo_json, merged_arousal, merged_flashbulb)
+            )
 
             # バージョン保存してから元の記憶を忘却
             _snapshot_version(conn, a["id"], "consolidation", superseded_by=new_id)
@@ -1249,15 +1333,29 @@ def build_schemas(dry_run=False):
             vec = embed_text(schema_content, is_query=False)
             blob = vec_to_bytes(vec) if vec is not None else None
 
+            emo_json = json.dumps(list(all_emotions))
+            kw_json = json.dumps(top_keywords, ensure_ascii=False)
+            mf_json = json.dumps(member_ids)
             conn.execute(
                 """INSERT INTO memories
                    (content, category, importance, emotions, arousal, keywords,
                     embedding, merged_from)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (schema_content, "schema", max_importance,
-                 json.dumps(list(all_emotions)), max_arousal,
-                 json.dumps(top_keywords, ensure_ascii=False),
-                 blob, json.dumps(member_ids))
+                 emo_json, max_arousal, kw_json, blob, mf_json)
+            )
+            schema_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.execute(
+                """INSERT OR REPLACE INTO cortex
+                   (id, content, category, keywords, embedding, confidence, provenance, revision_count, merged_from)
+                   VALUES (?, ?, 'schema', ?, ?, 0.7, 'unknown', 0, ?)""",
+                (schema_id, schema_content, kw_json, blob, mf_json)
+            )
+            conn.execute(
+                """INSERT OR REPLACE INTO limbic
+                   (id, emotions, arousal, flashbulb, temporal_context, spatial_context)
+                   VALUES (?, ?, ?, NULL, NULL, NULL)""",
+                (schema_id, emo_json, max_arousal)
             )
 
         used_ids |= clique
@@ -1443,6 +1541,10 @@ def _snapshot_version(conn, memory_id, reason, superseded_by=None):
         "UPDATE memories SET revision_count = COALESCE(revision_count, 0) + 1 WHERE id = ?",
         (memory_id,)
     )
+    conn.execute(
+        "UPDATE cortex SET revision_count = COALESCE(revision_count, 0) + 1 WHERE id = ?",
+        (memory_id,)
+    )
 
 
 def correct_memory(memory_id, new_content):
@@ -1462,12 +1564,20 @@ def correct_memory(memory_id, new_content):
     blob = vec_to_bytes(vec) if vec is not None else None
     keywords = extract_keywords(new_content)
 
+    kw_json = json.dumps(keywords, ensure_ascii=False)
     conn.execute(
         """UPDATE memories SET content = ?, embedding = ?, keywords = ?,
            confidence = ?, provenance = 'user_explicit'
            WHERE id = ?""",
-        (new_content, blob, json.dumps(keywords, ensure_ascii=False),
-         CONFIDENCE_USER_EXPLICIT, memory_id)
+        (new_content, blob, kw_json, CONFIDENCE_USER_EXPLICIT, memory_id)
+    )
+    # cortexも同期
+    conn.execute(
+        """UPDATE cortex SET content = ?, embedding = ?, keywords = ?,
+           confidence = ?, provenance = 'user_explicit',
+           revision_count = revision_count + 1
+           WHERE id = ?""",
+        (new_content, blob, kw_json, CONFIDENCE_USER_EXPLICIT, memory_id)
     )
 
     # FTSインデックスを更新
@@ -1552,6 +1662,9 @@ def interfere(conn, new_content, new_vec):
                 "UPDATE memories SET importance = ?, arousal = ? WHERE id = ?",
                 (new_imp, new_arousal, row["id"])
             )
+            # limbicのarousalも同期
+            conn.execute("UPDATE limbic SET arousal = ? WHERE id = ?",
+                         (new_arousal, row["id"]))
             interfered += 1
 
             # 重要度1 + arousal低 → 自動忘却
@@ -1843,6 +1956,10 @@ def add_memory(content, category="fact", source=None, confidence=None, provenanc
 
     now_utc = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     mem_uuid = str(_uuid.uuid4())
+    emo_json = json.dumps(emotions)
+    kw_json = json.dumps(keywords, ensure_ascii=False)
+
+    # 脳梁（memories）: 統合・構造データ
     conn.execute(
         """INSERT INTO memories
            (content, category, importance, emotions, arousal, keywords,
@@ -1850,12 +1967,28 @@ def add_memory(content, category="fact", source=None, confidence=None, provenanc
             spatial_context, uuid, updated_at, provenance, confidence, flashbulb)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (content, category, importance,
-         json.dumps(emotions), arousal, json.dumps(keywords, ensure_ascii=False),
+         emo_json, arousal, kw_json,
          source, blob, context_expires, temporal_ctx, spatial_ctx, mem_uuid, now_utc,
          provenance, confidence, flashbulb)
     )
     conn.commit()
     new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    # 左脳（cortex）: 意味的データ
+    conn.execute(
+        """INSERT OR REPLACE INTO cortex
+           (id, content, category, keywords, embedding, confidence, provenance, revision_count, merged_from)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL)""",
+        (new_id, content, category, kw_json, blob, confidence, provenance)
+    )
+    # 右脳（limbic）: 情動データ
+    conn.execute(
+        """INSERT OR REPLACE INTO limbic
+           (id, emotions, arousal, flashbulb, temporal_context, spatial_context)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (new_id, emo_json, arousal, flashbulb, temporal_ctx, spatial_ctx)
+    )
+    conn.commit()
 
     # FTSインデックスに追加
     try:
@@ -4188,6 +4321,21 @@ def sync_import(data):
                      mem["context_expires_at"], mem["temporal_context"],
                      mem["spatial_context"], mem["updated_at"], mem["flashbulb"])
                 )
+                new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                conn.execute(
+                    """INSERT OR REPLACE INTO cortex
+                       (id, content, category, keywords, embedding, confidence, provenance, revision_count, merged_from)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)""",
+                    (new_id, mem["content"], mem["category"], mem["keywords"],
+                     blob, mem.get("confidence", 0.7), mem.get("provenance", "unknown"), mem["merged_from"])
+                )
+                conn.execute(
+                    """INSERT OR REPLACE INTO limbic
+                       (id, emotions, arousal, flashbulb, temporal_context, spatial_context)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (new_id, mem["emotions"], mem["arousal"], mem["flashbulb"],
+                     mem["temporal_context"], mem["spatial_context"])
+                )
                 stats["new"] += 1
             else:
                 # 既存: マージ
@@ -4215,6 +4363,24 @@ def sync_import(data):
                          mem["source_conversation"], blob, mem["merged_from"], mem["context_expires_at"],
                          mem["temporal_context"], mem["spatial_context"],
                          mem["updated_at"], mem["flashbulb"], mem["uuid"])
+                    )
+                    # cortex/limbicも同期
+                    mid = existing["id"]
+                    conn.execute(
+                        """UPDATE cortex SET content = ?, category = ?, keywords = ?,
+                           embedding = COALESCE(?, embedding), merged_from = ?,
+                           confidence = ?, provenance = ?
+                           WHERE id = ?""",
+                        (mem["content"], mem["category"], mem["keywords"],
+                         blob, mem["merged_from"],
+                         mem.get("confidence", 0.7), mem.get("provenance", "unknown"), mid)
+                    )
+                    conn.execute(
+                        """UPDATE limbic SET emotions = ?, arousal = ?, flashbulb = ?,
+                           temporal_context = ?, spatial_context = ?
+                           WHERE id = ?""",
+                        (mem["emotions"], mem["arousal"], mem["flashbulb"],
+                         mem["temporal_context"], mem["spatial_context"], mid)
                     )
                 else:
                     # ローカルが新しい場合もaccess_countとlast_accessedだけ更新
