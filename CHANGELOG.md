@@ -1,5 +1,20 @@
 # Changelog
 
+## [v18.0] - 2026-04-04
+
+### Added
+- **3テーブル分割（左脳/右脳/脳梁）**: memoriesテーブルをcortex（左脳）・limbic（右脳）・memories（脳梁）に物理分割
+  - `cortex`: content, category, keywords, embedding, confidence, provenance, revision_count, merged_from
+  - `limbic`: emotions, arousal, flashbulb, temporal_context, spatial_context
+  - `memories`: id, uuid, importance, timestamps, access_count, forgotten, source_conversation
+- **memories_v VIEW**: 3テーブルをJOINして旧スキーマと同一カラム名を返す後方互換VIEW
+- **全INSERT/UPDATEパスのcortex/limbic同期**: add_memory, consolidate, build_schemas, correct_memory, interfere, sync_import, _snapshot_version
+
+### Schema
+- `cortex` テーブル新規作成（memoriesからデータ移行）
+- `limbic` テーブル新規作成（memoriesからデータ移行）
+- `memories_v` VIEW作成
+
 ## [v17.0] - 2026-04-04
 
 ### Added
