@@ -1,5 +1,24 @@
 # Changelog
 
+## [v17.0] - 2026-04-04
+
+### Added
+- **フラッシュバルブ記憶**: 覚醒度0.65以上の記憶から最も情動的な一文（80文字以内）を自動抽出し `flashbulb` カラムに保存。recall時に🔥で表示。`--flashbulb` フラグで手動指定も可能
+- **左脳/右脳スコアリング分離**: recall/searchのスコア計算を2系統に分離
+  - `_left_score()`: 鮮度・参照数・信頼度・安定性（意味的・分析的因子）
+  - `_right_score()`: 覚醒度・プライミング・場所細胞・気分一致性・flashbulb（情動的・直感的因子）
+  - `corpus_callosum()`: 幾何平均ベースで左右を統合。balanceパラメータで重み調整
+- **recallモード**: `recall --analytical`（左脳優勢 balance=0.3）/ `recall --emotional`（右脳優勢 balance=0.7）
+
+### Changed
+- **recall_polyphonic**: 声ごとに異なるbalanceを適用。共感=0.7（右脳優勢）、批判=0.5（均等）
+- **promote_turns**: sleep時のリプレイでflashbulbを自動抽出して記憶に付与
+- **consolidate_memories**: マージ時に覚醒度の高い方のflashbulbを保持
+- **export/import/sync**: flashbulbフィールドに対応
+
+### Schema
+- `memories` テーブルに `flashbulb TEXT DEFAULT NULL` カラム追加（既存データはNULL）
+
 ## [v16.6] - 2026-03-31
 
 ### Changed
