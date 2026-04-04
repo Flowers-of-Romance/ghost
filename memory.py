@@ -193,6 +193,9 @@ EMOTION_MARKERS = {
 
 NEUTRAL_WEIGHT = 0.8
 
+FLASHBULB_AROUSAL_THRESHOLD = 0.65
+FLASHBULB_MAX_CHARS = 80
+
 
 def detect_emotions(text):
     text_lower = text.lower()
@@ -258,6 +261,42 @@ def extract_keywords(text):
     jp_hira = re.findall(r'[\u3040-\u309f]{4,}', text)
     keywords = list(set(en_words + jp_chunks + jp_hira))
     return keywords
+
+
+def _extract_flashbulb_sentence(text):
+    """テキストから最も情動的な一文を抽出する。閾値未満ならNone。"""
+    # 短いテキストはそのまま返す
+    if len(text) <= FLASHBULB_MAX_CHARS:
+        _, arousal, _ = detect_emotions(text)
+        return text if arousal >= FLASHBULB_AROUSAL_THRESHOLD else None
+
+    # 文分割（日本語の。と英語の.!?）
+    sentences = re.split(r'(?<=[。．.!?！？])\s*', text)
+    sentences = [s.strip() for s in sentences if s.strip() and len(s.strip()) > 3]
+    if not sentences:
+        return None
+
+    best_sentence = None
+    best_arousal = 0.0
+
+    for s in sentences:
+        _, arousal, _ = detect_emotions(s)
+        if arousal > best_arousal:
+            best_arousal = arousal
+            best_sentence = s
+
+    if best_arousal < FLASHBULB_AROUSAL_THRESHOLD or best_sentence is None:
+        # 個別文では閾値を超えない場合、全文の覚醒度で判断し先頭を返す
+        _, full_arousal, _ = detect_emotions(text)
+        if full_arousal >= FLASHBULB_AROUSAL_THRESHOLD:
+            best_sentence = text[:FLASHBULB_MAX_CHARS - 1] + "…"
+            return best_sentence
+        return None
+
+    # 80文字上限
+    if len(best_sentence) > FLASHBULB_MAX_CHARS:
+        best_sentence = best_sentence[:FLASHBULB_MAX_CHARS - 1] + "…"
+    return best_sentence
 
 
 # --- Embedding ---
@@ -485,7 +524,8 @@ def init_db():
             source_conversation TEXT,
             embedding BLOB,
             -- 統合された記憶の元IDを記録
-            merged_from TEXT DEFAULT NULL
+            merged_from TEXT DEFAULT NULL,
+            flashbulb TEXT DEFAULT NULL
         );
 
         CREATE TABLE IF NOT EXISTS links (
@@ -549,6 +589,7 @@ def init_db():
                     source_conversation TEXT,
                     embedding BLOB,
                     merged_from TEXT DEFAULT NULL,
+                    flashbulb TEXT DEFAULT NULL,
                     context_expires_at TEXT DEFAULT NULL,
                     temporal_context TEXT DEFAULT NULL,
                     spatial_context TEXT DEFAULT NULL,
@@ -583,6 +624,12 @@ def init_db():
     # spatial_context カラムを追加（既存DBの場合）
     try:
         conn.execute("ALTER TABLE memories ADD COLUMN spatial_context TEXT DEFAULT NULL")
+    except sqlite3.OperationalError:
+        pass  # already exists
+
+    # flashbulb カラムを追加（既存DBの場合）
+    try:
+        conn.execute("ALTER TABLE memories ADD COLUMN flashbulb TEXT DEFAULT NULL")
     except sqlite3.OperationalError:
         pass  # already exists
 
@@ -928,7 +975,7 @@ def consolidate_memories(dry_run=False):
     """
     conn = get_connection()
     rows = conn.execute(
-        "SELECT id, content, keywords, embedding, importance, arousal, emotions, category, confidence "
+        "SELECT id, content, keywords, embedding, importance, arousal, emotions, category, confidence, flashbulb "
         "FROM memories WHERE forgotten = 0 AND embedding IS NOT NULL"
     ).fetchall()
 
@@ -983,6 +1030,13 @@ def consolidate_memories(dry_run=False):
         merged_importance = max(a["importance"], b["importance"])
         merged_arousal = max(a["arousal"], b["arousal"])
 
+        # フラッシュバルブは覚醒度が高い方を保持
+        fb_a = a["flashbulb"] if "flashbulb" in a.keys() else None
+        fb_b = b["flashbulb"] if "flashbulb" in b.keys() else None
+        merged_flashbulb = fb_a if a["arousal"] >= b["arousal"] else fb_b
+        if merged_flashbulb is None:
+            merged_flashbulb = fb_a or fb_b
+
         # 情動は両方の合集合
         emo_a = set(json.loads(a["emotions"]))
         emo_b = set(json.loads(b["emotions"]))
@@ -1009,12 +1063,12 @@ def consolidate_memories(dry_run=False):
             conn.execute(
                 """INSERT INTO memories
                    (content, category, importance, emotions, arousal, keywords,
-                    embedding, merged_from, provenance, confidence)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'consolidation', ?)""",
+                    embedding, merged_from, provenance, confidence, flashbulb)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'consolidation', ?, ?)""",
                 (merged_content, merged_category, merged_importance,
                  json.dumps(merged_emotions), merged_arousal,
                  json.dumps(merged_keywords, ensure_ascii=False),
-                 blob, json.dumps([a["id"], b["id"]]), merged_confidence)
+                 blob, json.dumps([a["id"], b["id"]]), merged_confidence, merged_flashbulb)
             )
             new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
@@ -1731,7 +1785,7 @@ def prospect_clear(prospect_id):
 # メイン操作
 # ============================================================
 
-def add_memory(content, category="fact", source=None, confidence=None, provenance=None):
+def add_memory(content, category="fact", source=None, confidence=None, provenance=None, flashbulb=None):
     emotions, arousal, importance = detect_emotions(content)
 
     # 出自と信頼度の自動設定
@@ -1762,6 +1816,10 @@ def add_memory(content, category="fact", source=None, confidence=None, provenanc
     pred_error, similar_id = prediction_error(conn, vec)
     importance, arousal = apply_prediction_error(importance, arousal, pred_error)
 
+    # フラッシュバルブ記憶の自動抽出（右脳）
+    if flashbulb is None and arousal >= FLASHBULB_AROUSAL_THRESHOLD:
+        flashbulb = _extract_flashbulb_sentence(content)
+
     # 干渉忘却 — 新しい記憶が類似する古い記憶を弱める
     interference_count = interfere(conn, content, vec)
 
@@ -1789,12 +1847,12 @@ def add_memory(content, category="fact", source=None, confidence=None, provenanc
         """INSERT INTO memories
            (content, category, importance, emotions, arousal, keywords,
             source_conversation, embedding, context_expires_at, temporal_context,
-            spatial_context, uuid, updated_at, provenance, confidence)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            spatial_context, uuid, updated_at, provenance, confidence, flashbulb)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (content, category, importance,
          json.dumps(emotions), arousal, json.dumps(keywords, ensure_ascii=False),
          source, blob, context_expires, temporal_ctx, spatial_ctx, mem_uuid, now_utc,
-         provenance, confidence)
+         provenance, confidence, flashbulb)
     )
     conn.commit()
     new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -2091,39 +2149,15 @@ def search_memories(query, limit=10, use_like=False, fuzzy=False):
             mem_vec = bytes_to_vec(row["embedding"])
             sim = cosine_similarity(query_vec, mem_vec)
 
-            # 情動ブースト
-            emo_boost = 1.0 + row["arousal"] * 0.3
-
-            # 鮮度（外傷的記憶は減衰が遅い）
-            hl = effective_half_life(row["arousal"])
-            fresh = freshness(row["created_at"], half_life=hl)
-            fresh_factor = 0.7 + fresh * 0.3
-
-            # 強化
-            access_boost = 1.0 + min(row["access_count"], 10) * 0.02
-
-            # プライミング
-            priming = get_priming_boost(conn, row["id"])
-
-            # 時間帯ブースト
+            # 左脳: 意味的因子（simを含む）+ 時間帯ブースト
             temporal = _temporal_boost(row)
+            L = _left_score(row, sim=sim) * temporal
 
-            # 場所ブースト（場所細胞）
-            spatial = _spatial_boost(row)
+            # 右脳: 情動的因子
+            R = _right_score(conn, row)
 
-            # 気分一致性ブースト
-            mood_boost = get_mood_congruence_boost(row)
-
-            # 信頼度による重み付け
-            conf = row["confidence"] if "confidence" in row.keys() and row["confidence"] is not None else CONFIDENCE_DEFAULT
-            confidence_weight = 0.5 + conf * 0.5
-
-            # 安定性スコア
-            rev = row["revision_count"] if "revision_count" in row.keys() and row["revision_count"] is not None else 0
-            stability = 1.0 / (1.0 + rev * 0.15)
-
-            # 総合スコア
-            score = sim * emo_boost * fresh_factor * access_boost * priming * temporal * spatial * mood_boost * confidence_weight * stability
+            # 脳梁で統合
+            score = corpus_callosum(L, R, balance=0.5)
             scored.append((row, score, sim))
 
         scored.sort(key=lambda x: x[1], reverse=True)
@@ -2558,32 +2592,35 @@ def promote_turns(days=7, sample_size=20):
         # 情動検出で重みを決める（覚醒度が高い＝リプレイされやすい）
         _, arousal, _ = detect_emotions(cleaned)
         weight = max(0.1, arousal + 0.1)  # 最低0.1、覚醒度が高いほど重い
-        candidates.append((cleaned, weight))
+        # フラッシュバルブ抽出（高覚醒度のみ）
+        fb = _extract_flashbulb_sentence(cleaned) if arousal >= FLASHBULB_AROUSAL_THRESHOLD else None
+        candidates.append((cleaned, weight, fb))
 
     if not candidates:
         print("意味のあるターンがありません")
         return 0
 
-    # 重み付きサンプリング（脳のシャープウェーブリップル）
+    # 重み付きサンプリング（脳のシャ��プウェーブリップル）
     k = min(sample_size, len(candidates))
-    weights = [w for _, w in candidates]
+    weights = [w for _, w, _ in candidates]
     sampled = random.choices(candidates, weights=weights, k=k)
-    # 重複除去（同じ発言が複数回選ばれることがある）
+    # 重複除去（同じ発言��複数回選ばれる��とがある）
     seen = set()
     unique = []
-    for content, _ in sampled:
+    for content, _, fb in sampled:
         snippet = content[:200]
         if snippet not in seen:
             seen.add(snippet)
-            unique.append(snippet)
+            unique.append((snippet, fb))
 
     promoted = 0
-    for snippet in unique:
+    for snippet, fb in unique:
         add_memory(
             content=snippet,
             category="episode",
             provenance="sleep_promote",
             confidence=0.6,
+            flashbulb=fb,
         )
         promoted += 1
 
@@ -3223,7 +3260,45 @@ def detect_rumination(conn):
     return []
 
 
-def recall_important(limit=15):
+def _left_score(row, sim=None):
+    """左脳スコア: 意味的・分析的因子。"""
+    hl = effective_half_life(row["arousal"])
+    fresh = freshness(row["created_at"], half_life=hl)
+    fresh_factor = 0.5 + fresh * 0.5
+    access_boost = 1.0 + min(row["access_count"], 10) * 0.03
+    conf = row["confidence"] if "confidence" in row.keys() and row["confidence"] is not None else CONFIDENCE_DEFAULT
+    confidence_weight = 0.5 + conf * 0.5
+    rev = row["revision_count"] if "revision_count" in row.keys() and row["revision_count"] is not None else 0
+    stability = 1.0 / (1.0 + rev * 0.15)
+    L = fresh_factor * access_boost * confidence_weight * stability
+    if sim is not None:
+        L *= sim
+    return L
+
+
+def _right_score(conn, row, mood_fn=None):
+    """右脳スコア: 情動的・直感的因子。"""
+    emo_boost = 1.0 + row["arousal"] * 0.5
+    priming = get_priming_boost(conn, row["id"])
+    spatial = _spatial_boost(row)
+    if mood_fn is None:
+        mood_boost = get_mood_congruence_boost(row)
+    else:
+        mood_boost = mood_fn(row)
+    fb = row["flashbulb"] if "flashbulb" in row.keys() else None
+    flashbulb_boost = 1.15 if fb else 1.0
+    R = emo_boost * priming * spatial * mood_boost * flashbulb_boost
+    return R
+
+
+def corpus_callosum(left, right, balance=0.5):
+    """脳梁: 左脳と右脳のスコアを統合する。"""
+    if left <= 0 or right <= 0:
+        return 0.0
+    return left ** (1.0 - balance) * right ** balance
+
+
+def recall_important(limit=15, balance=0.5):
     conn = get_connection()
 
     # context期限切れチェック
@@ -3235,29 +3310,9 @@ def recall_important(limit=15):
 
     scored = []
     for row in rows:
-        emo_boost = 1.0 + row["arousal"] * 0.5
-        hl = effective_half_life(row["arousal"])
-        fresh = freshness(row["created_at"], half_life=hl)
-        access_boost = 1.0 + min(row["access_count"], 10) * 0.03
-
-        # プライミング
-        priming = get_priming_boost(conn, row["id"])
-
-        # 場所ブースト（場所細胞）
-        spatial = _spatial_boost(row)
-
-        # 気分一致性ブースト
-        mood_boost = get_mood_congruence_boost(row)
-
-        # 信頼度による重み付け
-        conf = row["confidence"] if "confidence" in row.keys() and row["confidence"] is not None else CONFIDENCE_DEFAULT
-        confidence_weight = 0.5 + conf * 0.5
-
-        # 安定性スコア（改訂が多いほど信頼性が下がる）
-        rev = row["revision_count"] if "revision_count" in row.keys() and row["revision_count"] is not None else 0
-        stability = 1.0 / (1.0 + rev * 0.15)
-
-        score = emo_boost * (0.5 + fresh * 0.5) * access_boost * priming * spatial * mood_boost * confidence_weight * stability
+        L = _left_score(row)
+        R = _right_score(conn, row)
+        score = corpus_callosum(L, R, balance)
         scored.append((row, score))
 
     scored.sort(key=lambda x: x[1], reverse=True)
@@ -3497,40 +3552,35 @@ def recall_polyphonic(limit_per_voice=3):
     associative_scored = []  # 連想
 
     for row in rows:
-        emo_boost = 1.0 + row["arousal"] * 0.5
-        hl = effective_half_life(row["arousal"])
-        fresh = freshness(row["created_at"], half_life=hl)
-        access_boost = 1.0 + min(row["access_count"], 10) * 0.03
-        priming = get_priming_boost(conn, row["id"])
-        spatial = _spatial_boost(row)
+        L = _left_score(row)
 
-        base = emo_boost * (0.5 + fresh * 0.5) * access_boost * priming * spatial
+        # 共感: 右脳優勢（balance=0.7）、気分一致
+        R_empathy = _right_score(conn, row, mood_fn=get_mood_congruence_boost)
+        empathy_scored.append((row, corpus_callosum(L, R_empathy, balance=0.7)))
 
-        # 共感: 気分一致性ブーストで寄り添う
-        mood_match = get_mood_congruence_boost(row)
-        empathy_scored.append((row, base * mood_match))
+        # 補完: 右脳優勢（balance=0.7）、気分不一致
+        R_complement = _right_score(conn, row, mood_fn=lambda r: get_mood_incongruence_boost(r, conn))
+        complement_scored.append((row, corpus_callosum(L, R_complement, balance=0.7)))
 
-        # 補完: 気分不一致ブーストで見えていないものを出す
-        mood_oppose = get_mood_incongruence_boost(row, conn)
-        complement_scored.append((row, base * mood_oppose))
-
-        # 批判: conflict, anxiety, 失敗の記憶を優先
+        # 批判: 均等（balance=0.5）、conflict/anxietyブースト
         mem_emotions = set(json.loads(row["emotions"])) if row["emotions"] else set()
         critic_boost = 1.0
         if mem_emotions & {"conflict", "anxiety"}:
             critic_boost = 1.3
         if row["arousal"] >= 0.7 and "determination" not in mem_emotions:
             critic_boost *= 1.2
-        critic_scored.append((row, base * critic_boost))
+        R_critic = _right_score(conn, row) * critic_boost
+        critic_scored.append((row, corpus_callosum(L, R_critic, balance=0.5)))
 
-        # 連想: ランダム性を持たせる（プライミングとarousalに頼らない）
-        # アクセス回数が少なく、リンクが多い記憶を優先（辺境の豊かなノード）
+        # 連想: 既存ロジック維持（ランダム性が重要）
+        hl = effective_half_life(row["arousal"])
+        fresh = freshness(row["created_at"], half_life=hl)
         link_count = conn.execute(
             "SELECT COUNT(*) FROM links WHERE source_id = ?", (row["id"],)
         ).fetchone()[0]
         novelty = 1.0 / (1.0 + row["access_count"])
         richness = 1.0 + min(link_count, 20) * 0.05
-        random_jitter = 0.8 + random.random() * 0.4  # 0.8-1.2のランダム揺れ
+        random_jitter = 0.8 + random.random() * 0.4
         associative_scored.append((row, (0.5 + fresh * 0.5) * novelty * richness * random_jitter))
 
     # --- 各声からtop Nを選ぶ（重複排除） ---
@@ -3855,6 +3905,9 @@ def format_memory_compact(row, score=None, fragments_only=False):
         if len(row["content"]) > 80:
             content += "..."
         line += f"\n       「{content}」"
+    fb = row["flashbulb"] if "flashbulb" in row.keys() else None
+    if fb:
+        line += f"\n       🔥「{fb}」"
     return line
 
 
@@ -3895,6 +3948,9 @@ def format_memory_reconstructive(conn, row, similarity=None, score=None, fragmen
         line += f"\n         ↳ 連想: [{', '.join(linked_fragments)}]"
     if emotions:
         line += f"\n         ↳ 情動: {', '.join(emotions)} (覚醒度:{row['arousal']:.2f})"
+    fb = row["flashbulb"] if "flashbulb" in row.keys() else None
+    if fb:
+        line += f"\n         🔥「{fb}」"
     return line
 
 
@@ -3933,6 +3989,9 @@ def format_memory_detail(row):
         lines.append(f"  改訂: {rev}回")
     if merged:
         lines.append(f"  統合元: #{', #'.join(str(m) for m in merged)}")
+    fb = row["flashbulb"] if "flashbulb" in row.keys() else None
+    if fb:
+        lines.append(f"  🔥 フラッシュバルブ: 「{fb}」")
     if row["source_conversation"]:
         lines.append(f"  出典: {row['source_conversation']}")
     return "\n".join(lines)
@@ -3967,6 +4026,7 @@ def export_memories(filename=None):
             "merged_from": json.loads(row["merged_from"]) if row["merged_from"] else None,
             "provenance": row["provenance"] if "provenance" in row.keys() else None,
             "confidence": row["confidence"] if "confidence" in row.keys() else None,
+            "flashbulb": row["flashbulb"] if "flashbulb" in row.keys() else None,
         })
 
     # リンクもエクスポート
@@ -4047,6 +4107,7 @@ def sync_export(since=None):
             "updated_at": row["updated_at"],
             "provenance": row["provenance"] if "provenance" in row.keys() else None,
             "confidence": row["confidence"] if "confidence" in row.keys() else None,
+            "flashbulb": row["flashbulb"] if "flashbulb" in row.keys() else None,
         }
         # embeddingはbase64でエンコード
         if row["embedding"]:
@@ -4101,6 +4162,7 @@ def sync_import(data):
             mem.setdefault("context_expires_at", None)
             mem.setdefault("temporal_context", None)
             mem.setdefault("spatial_context", None)
+            mem.setdefault("flashbulb", None)
 
             existing = conn.execute(
                 "SELECT id, access_count, last_accessed, updated_at, importance, arousal FROM memories WHERE uuid = ?",
@@ -4117,14 +4179,14 @@ def sync_import(data):
                        (uuid, content, category, importance, emotions, arousal, keywords,
                         created_at, last_accessed, access_count, forgotten,
                         source_conversation, embedding, merged_from,
-                        context_expires_at, temporal_context, spatial_context, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)""",
+                        context_expires_at, temporal_context, spatial_context, updated_at, flashbulb)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (mem["uuid"], mem["content"], mem["category"], mem["importance"],
                      mem["emotions"], mem["arousal"], mem["keywords"],
                      mem["created_at"], mem["last_accessed"], mem["access_count"],
                      mem["source_conversation"], blob, mem["merged_from"],
                      mem["context_expires_at"], mem["temporal_context"],
-                     mem["spatial_context"], mem["updated_at"])
+                     mem["spatial_context"], mem["updated_at"], mem["flashbulb"])
                 )
                 stats["new"] += 1
             else:
@@ -4145,13 +4207,14 @@ def sync_import(data):
                            keywords = ?, access_count = ?, last_accessed = ?,
                            source_conversation = ?, embedding = COALESCE(?, embedding),
                            merged_from = ?, context_expires_at = ?,
-                           temporal_context = ?, spatial_context = ?, updated_at = ?
+                           temporal_context = ?, spatial_context = ?, updated_at = ?,
+                           flashbulb = ?
                            WHERE uuid = ?""",
                         (mem["content"], mem["category"], mem["importance"], mem["emotions"], mem["arousal"],
                          mem["keywords"], new_access, new_last,
                          mem["source_conversation"], blob, mem["merged_from"], mem["context_expires_at"],
                          mem["temporal_context"], mem["spatial_context"],
-                         mem["updated_at"], mem["uuid"])
+                         mem["updated_at"], mem["flashbulb"], mem["uuid"])
                     )
                 else:
                     # ローカルが新しい場合もaccess_countとlast_accessedだけ更新
@@ -4258,13 +4321,14 @@ def main():
 
     elif cmd == "add":
         if len(sys.argv) < 3:
-            print("使い方: python memory.py add \"内容\" [--category CAT] [--source SRC]")
+            print("使い方: python memory.py add \"内容\" [--category CAT] [--source SRC] [--flashbulb TEXT]")
             print("  位置引数: python memory.py add \"内容\" category [source]")
             return
         content = sys.argv[2]
         args = sys.argv[3:]
         category = "fact"
         source = None
+        flashbulb = None
         i = 0
         while i < len(args):
             if args[i] == "--category" and i + 1 < len(args):
@@ -4272,6 +4336,9 @@ def main():
                 i += 2
             elif args[i] == "--source" and i + 1 < len(args):
                 source = args[i + 1]
+                i += 2
+            elif args[i] == "--flashbulb" and i + 1 < len(args):
+                flashbulb = args[i + 1]
                 i += 2
             elif args[i].startswith("--"):
                 i += 2  # 未知のフラグはスキップ
@@ -4283,7 +4350,7 @@ def main():
                 i += 1
             else:
                 i += 1
-        add_memory(content, category, source)
+        add_memory(content, category, source, flashbulb=flashbulb)
 
     elif cmd == "search":
         if len(sys.argv) < 3:
@@ -4545,7 +4612,14 @@ def main():
                 if arg.isdigit():
                     limit = int(arg)
                     break
-            results = recall_important(limit)
+            # 左脳/右脳バランス
+            if "--analytical" in sys.argv:
+                balance = 0.3
+            elif "--emotional" in sys.argv:
+                balance = 0.7
+            else:
+                balance = 0.5
+            results = recall_important(limit, balance=balance)
             if raw_mode:
                 print(f"自動想起 ({len(results)}件):")
                 for row, score in results:
