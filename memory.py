@@ -48,6 +48,7 @@ memory.py - 脳に近い記憶システム
   python memory.py correct ID "new_content"           # 記憶を修正（旧版を保存）
   python memory.py versions ID                       # 記憶の版履歴を表示
   python memory.py mutations [ID]                    # メタデータ変異履歴の閲覧
+  python memory.py calibrate                         # メタ認知: recall精度の自己検証
   python memory.py export [filename]                 # 記憶をJSONファイルにエクスポート
   python memory.py import filename                   # JSONファイルから記憶をインポート
   python memory.py sync status <host:port>           # 同期先の接続確認
@@ -920,6 +921,21 @@ def init_db():
         FROM memories m
         JOIN cortex c ON c.id = m.id
         JOIN limbic l ON l.id = m.id
+    """)
+
+    # === recall_log: recallの自己検証（メタ認知） ===
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS recall_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_ts TEXT NOT NULL,
+            recalled_ids TEXT NOT NULL DEFAULT '[]',
+            accessed_ids TEXT DEFAULT NULL,
+            precision REAL DEFAULT NULL,
+            recall_rate REAL DEFAULT NULL,
+            noise_ids TEXT DEFAULT NULL,
+            missed_ids TEXT DEFAULT NULL,
+            evaluated_at TEXT DEFAULT NULL
+        )
     """)
 
     conn.commit()
@@ -3834,6 +3850,234 @@ def resurrect_memories(query):
     return resurrected
 
 
+## ===== メタ認知: recall の自己検証 =====
+
+def _ensure_recall_log(conn):
+    """recall_logテーブルがなければ作る（既存DB対応）。"""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS recall_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_ts TEXT NOT NULL,
+            recalled_ids TEXT NOT NULL DEFAULT '[]',
+            accessed_ids TEXT DEFAULT NULL,
+            precision REAL DEFAULT NULL,
+            recall_rate REAL DEFAULT NULL,
+            noise_ids TEXT DEFAULT NULL,
+            missed_ids TEXT DEFAULT NULL,
+            evaluated_at TEXT DEFAULT NULL
+        )
+    """)
+
+
+def log_recall(recalled_ids):
+    """recallが出した記憶IDを記録する。次回recall時に事後検証される。"""
+    conn = get_connection()
+    _ensure_recall_log(conn)
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    conn.execute(
+        "INSERT INTO recall_log (session_ts, recalled_ids) VALUES (?, ?)",
+        (now, json.dumps(recalled_ids))
+    )
+    conn.commit()
+    conn.close()
+
+
+CALIBRATE_HIT_THRESHOLD = 0.45   # この類似度以上なら「的中」
+CALIBRATE_MISS_THRESHOLD = 0.50  # 未recall記憶がこれ以上なら「漏れ」
+
+
+def evaluate_last_recall():
+    """前回のrecallを事後検証する（ベクトル類似度ベース）。
+
+    前回recall以降の会話内容をembeddingし、recallが出した各記憶との
+    コサイン類似度で「的中/空振り」を判定する。評価者は会話の流れ自体。
+    """
+    conn = get_connection()
+    _ensure_recall_log(conn)
+
+    # 未評価のrecall_logを取得（最新を除く——最新は今回のrecallなので次回評価）
+    unevaluated = conn.execute(
+        "SELECT id, session_ts, recalled_ids FROM recall_log "
+        "WHERE evaluated_at IS NULL ORDER BY id ASC"
+    ).fetchall()
+
+    # 最新1件は今回のrecallの可能性が高いので除外
+    if len(unevaluated) <= 1:
+        conn.close()
+        return None
+
+    # 最新以外を全て評価し、最後の結果を返す
+    last_result = None
+    for row in unevaluated[:-1]:
+        result = _evaluate_single_recall(conn, row)
+        if result:
+            last_result = result
+
+    conn.commit()
+    conn.close()
+    return last_result
+
+
+def _evaluate_single_recall(conn, row):
+    """1件のrecall_logを評価する（connは呼び出し元でcommit）。"""
+    log_id = row["id"]
+    session_ts = row["session_ts"]
+    recalled_ids = list(set(json.loads(row["recalled_ids"])))
+
+    if not recalled_ids:
+        return None
+
+    # session_ts以降の会話内容を取得
+    try:
+        turns = conn.execute(
+            "SELECT content FROM raw_turns WHERE timestamp > ? ORDER BY timestamp",
+            (session_ts,)
+        ).fetchall()
+    except Exception:
+        turns = []
+
+    if not turns:
+        return None
+
+    # 会話全体を結合してembedding
+    conversation_text = "\n".join(t["content"] for t in turns)
+    if len(conversation_text.strip()) < 20:
+        return None
+
+    conv_vec = embed_text(conversation_text[:2000], is_query=True)
+    if conv_vec is None:
+        return None
+
+    # recallが出した各記憶のembeddingとの類似度
+    hits = []
+    noise = []
+    recalled_sims = {}
+    for mid in recalled_ids:
+        mem = conn.execute(
+            "SELECT id, embedding FROM memories WHERE id = ?", (mid,)
+        ).fetchone()
+        if not mem or not mem["embedding"]:
+            continue
+        mem_vec = bytes_to_vec(mem["embedding"])
+        sim = cosine_similarity(conv_vec, mem_vec)
+        recalled_sims[mid] = sim
+        if sim >= CALIBRATE_HIT_THRESHOLD:
+            hits.append(mid)
+        else:
+            noise.append(mid)
+
+    # 漏れ: recallが出さなかったが会話と高類似度の記憶
+    missed = []
+    recalled_set = set(recalled_ids)
+    candidates = conn.execute(
+        "SELECT id, embedding FROM memories WHERE forgotten = 0 AND embedding IS NOT NULL"
+    ).fetchall()
+    for c in candidates:
+        if c["id"] in recalled_set:
+            continue
+        c_vec = bytes_to_vec(c["embedding"])
+        sim = cosine_similarity(conv_vec, c_vec)
+        if sim >= CALIBRATE_MISS_THRESHOLD:
+            missed.append((c["id"], sim))
+
+    # 類似度上位のみ漏れとして報告（最大10件）
+    missed.sort(key=lambda x: -x[1])
+    missed_ids = [m[0] for m in missed[:10]]
+
+    precision = len(hits) / len(recalled_ids) if recalled_ids else 0.0
+    # 網羅: 会話に関連する記憶のうちrecallがカバーした割合
+    relevant_total = len(hits) + len(missed_ids)
+    recall_rate = len(hits) / relevant_total if relevant_total > 0 else 1.0
+
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    conn.execute(
+        """UPDATE recall_log SET
+            accessed_ids = ?, precision = ?, recall_rate = ?,
+            noise_ids = ?, missed_ids = ?, evaluated_at = ?
+        WHERE id = ?""",
+        (json.dumps({mid: round(s, 3) for mid, s in recalled_sims.items()}),
+         precision, recall_rate,
+         json.dumps(sorted(noise)), json.dumps(missed_ids),
+         now, log_id)
+    )
+
+    return {
+        "precision": precision,
+        "recall_rate": recall_rate,
+        "hits": sorted(hits),
+        "noise": sorted(noise),
+        "missed": missed_ids,
+        "recalled_count": len(recalled_ids),
+        "sims": recalled_sims,
+    }
+
+
+def calibrate_report():
+    """メタ認知レポート: recallの精度を時系列で表示する。"""
+    conn = get_connection()
+    _ensure_recall_log(conn)
+
+    rows = conn.execute(
+        "SELECT session_ts, recalled_ids, accessed_ids, "
+        "precision, recall_rate, noise_ids, missed_ids "
+        "FROM recall_log WHERE evaluated_at IS NOT NULL "
+        "ORDER BY session_ts DESC LIMIT 20"
+    ).fetchall()
+
+    if not rows:
+        print("まだ評価データがない。数セッション使えば溜まる。")
+        conn.close()
+        return
+
+    print(f"recall精度レポート（直近{len(rows)}セッション）:\n")
+
+    total_precision = 0.0
+    total_recall = 0.0
+    count = 0
+
+    for row in reversed(rows):
+        ts = row["session_ts"][:16].replace("T", " ")
+        p = row["precision"]
+        r = row["recall_rate"]
+        recalled = json.loads(row["recalled_ids"])
+        noise = json.loads(row["noise_ids"]) if row["noise_ids"] else []
+        missed = json.loads(row["missed_ids"]) if row["missed_ids"] else []
+
+        # accessed_idsは新形式（dict）か旧形式（list）
+        accessed_raw = json.loads(row["accessed_ids"]) if row["accessed_ids"] else {}
+        n_hits = len(recalled) - len(noise)
+
+        p_bar = "█" * int(p * 10) + "░" * (10 - int(p * 10))
+        r_bar = "█" * int(r * 10) + "░" * (10 - int(r * 10))
+
+        print(f"  {ts}  精度:{p_bar} {p:.0%}  網羅:{r_bar} {r:.0%}  "
+              f"(出{len(recalled)} 的中{n_hits} 空振{len(noise)} 漏れ{len(missed)})")
+
+        total_precision += p
+        total_recall += r
+        count += 1
+
+    avg_p = total_precision / count
+    avg_r = total_recall / count
+    print(f"\n  平均  精度: {avg_p:.0%}  網羅: {avg_r:.0%}")
+
+    # トレンド（前半と後半を比較）
+    if count >= 4:
+        half = count // 2
+        recent_p = sum(r["precision"] for r in rows[:half]) / half
+        older_p = sum(r["precision"] for r in rows[half:]) / (count - half)
+        recent_r = sum(r["recall_rate"] for r in rows[:half]) / half
+        older_r = sum(r["recall_rate"] for r in rows[half:]) / (count - half)
+
+        dp = recent_p - older_p
+        dr = recent_r - older_r
+        trend_p = "↑" if dp > 0.05 else "↓" if dp < -0.05 else "→"
+        trend_r = "↑" if dr > 0.05 else "↓" if dr < -0.05 else "→"
+        print(f"  傾向  精度: {trend_p} ({dp:+.0%})  網羅: {trend_r} ({dr:+.0%})")
+
+    conn.close()
+
+
 def get_stats():
     conn = get_connection()
     s = {}
@@ -4693,6 +4937,14 @@ def main():
             print("該当する記憶はありません")
 
     elif cmd == "recall":
+        # メタ認知: 前回recallの事後検証
+        prev_eval = evaluate_last_recall()
+        if prev_eval:
+            p = prev_eval["precision"]
+            r = prev_eval["recall_rate"]
+            print(f"(前回recall検証: 精度{p:.0%} 網羅{r:.0%} "
+                  f"空振{len(prev_eval['noise'])} 漏れ{len(prev_eval['missed'])})")
+
         # DMN（デフォルトモードネットワーク）: 間隔に応じて起動
         dmn_conn = get_connection()
         gap = _get_session_gap(dmn_conn)
@@ -4800,6 +5052,20 @@ def main():
                 print(f"自動想起 ({len(results)}件):")
                 for row, score in results:
                     print(format_memory_compact(row, score=score, fragments_only=fragments_only))
+
+        # メタ認知: 今回recallしたIDを記録
+        _recalled_ids = []
+        if "--voices" in sys.argv or auto_voices:
+            for voice_name, vresults in voices.items():
+                if voice_name == "俯瞰":
+                    continue
+                for row, _ in vresults:
+                    _recalled_ids.append(row["id"])
+        else:
+            for row, _ in results:
+                _recalled_ids.append(row["id"])
+        if _recalled_ids:
+            log_recall(list(set(_recalled_ids)))
 
     elif cmd == "review":
         n = int(sys.argv[2]) if len(sys.argv) > 2 else 5
@@ -5123,6 +5389,9 @@ def main():
             title = sys.argv[2]
             content = sys.argv[3] if len(sys.argv) > 3 else ""
             save_memo(title, content)
+
+    elif cmd == "calibrate":
+        calibrate_report()
 
     else:
         print(f"不明なコマンド: {cmd}")
