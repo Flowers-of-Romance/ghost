@@ -111,7 +111,7 @@ SPATIAL_BOOST = 1.08  # 場所一致時のブースト倍率
 
 # 関係細胞: 同じ人との間で作られた記憶は想起されやすい
 RELATIONAL_BOOST = 1.12  # 関係一致時のブースト倍率（場所より強め）
-RELATIONAL_WHO_DEFAULT = "J"  # デフォルトの関係者
+RELATIONAL_WHO_DEFAULT = "J"  # デフォルトの関係者（環境変数 GHOST_WHO で上書き）
 
 # 有効なカテゴリ（DB CHECK制約と同期バリデーションで共有）
 VALID_CATEGORIES = frozenset({"fact", "episode", "context", "preference", "procedure", "schema"})
