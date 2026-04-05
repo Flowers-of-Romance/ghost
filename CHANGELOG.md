@@ -9,7 +9,6 @@
   - `RELATIONAL_BOOST = 1.12`（場所の1.08より強め——人は場所より人に引っ張られる）
   - `_right_score()` の積に統合: `R = emo * priming * spatial * relational * mood * flashbulb`
   - 関係者の検出: 環境変数 `GHOST_WHO` で設定（`/dive` 時にClaude側が判別しセットする運用）
-  - 既存6723件を `{"who": "J", "relationship": "primary"}` でバックフィル
   - consolidate, schema, sync_export/import にも対応
 
 ### Design notes

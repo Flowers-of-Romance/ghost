@@ -899,16 +899,6 @@ def init_db():
         conn.execute("ALTER TABLE limbic ADD COLUMN relational_context TEXT DEFAULT NULL")
     except sqlite3.OperationalError:
         pass
-    # 既存記憶のバックフィル: 全てJとの記憶
-    conn.execute("""
-        UPDATE memories SET relational_context = '{"who": "J", "relationship": "primary"}'
-        WHERE relational_context IS NULL
-    """)
-    conn.execute("""
-        UPDATE limbic SET relational_context = '{"who": "J", "relationship": "primary"}'
-        WHERE relational_context IS NULL
-    """)
-
     # データ移行: memoriesからcortex/limbicにコピー（まだ移行されていない場合）
     migrated = conn.execute("SELECT COUNT(*) FROM cortex").fetchone()[0]
     total = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
