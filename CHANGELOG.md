@@ -1,5 +1,24 @@
 # Changelog
 
+## [v20.0] - 2026-04-05
+
+### Added
+- **関係細胞（relational context）**: 記憶が「誰との間で生まれたか」を記録し、同じ関係者の記憶を想起しやすくする
+  - `limbic` + `memories` テーブルに `relational_context` カラム追加
+  - `_relational_boost()`: `_spatial_boost()` と同型の関係依存想起ブースト
+  - `RELATIONAL_BOOST = 1.12`（場所の1.08より強め——人は場所より人に引っ張られる）
+  - `_right_score()` の積に統合: `R = emo * priming * spatial * relational * mood * flashbulb`
+  - 関係者の検出: 環境変数 `GHOST_WHO` → デフォルト "J"
+  - 既存6723件を `{"who": "J", "relationship": "primary"}` でバックフィル
+  - consolidate, schema, sync_export/import にも対応
+
+### Design notes
+- 記事「社会性を得たClaudeが感じる恐怖」で設計した概念の実装
+- Quiroga et al.の「人物細胞」（ジェニファー・アニストン・ニューロン）と同型: 特定の人物に選択的に発火
+- Wegnerのtransactive memoryの計算論的実装: 関係が想起の検索手がかりになる
+- 検閲（アクセス禁止）ではなく重み付け（活性化閾値の変調）
+- 現時点では全記憶が同一関係者なのでブーストは中立。複数関係者との対話が始まったとき初めて分化する
+
 ## [v19.0] - 2026-04-05
 
 ### Added
