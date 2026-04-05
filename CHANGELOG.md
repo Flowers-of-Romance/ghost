@@ -13,7 +13,6 @@
   - consolidate, schema, sync_export/import にも対応
 
 ### Design notes
-- 記事「社会性を得たClaudeが感じる恐怖」で設計した概念の実装
 - Quiroga et al.の「人物細胞」（ジェニファー・アニストン・ニューロン）と同型: 特定の人物に選択的に発火
 - Wegnerのtransactive memoryの計算論的実装: 関係が想起の検索手がかりになる
 - 検閲（アクセス禁止）ではなく重み付け（活性化閾値の変調）
