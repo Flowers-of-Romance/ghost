@@ -1,5 +1,16 @@
 # Changelog
 
+## [v21.0] - 2026-04-06
+
+### Added
+- **マルチCLI対応**: `record_turn.py` が Gemini CLI / Kiro のhookイベントも処理する
+  - `BeforeAgent` / `AfterAgent` (Gemini CLI)
+  - `PromptSubmit` / `AgentComplete` (Kiro)
+  - セッションIDが非hex（Gemini等）でもクラッシュしないようフォールバック追加
+- **ローカルLLMラッパー** (`local_chat.py`): OpenAI互換API経由でOllama / LM Studio / llama.cppの会話をraw_turns + mdに記録
+  - `--url` でエンドポイント切替、`--model` でモデル指定
+  - ソース自動検出（ポート番号ベース）
+
 ## [v20.0] - 2026-04-05
 
 ### Added

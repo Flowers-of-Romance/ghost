@@ -162,7 +162,10 @@ def _append_to_markdown(session_id, role, content, cwd=""):
     project_name = Path(cwd).name if cwd else ""
     # セッションIDから動物マーカーを決定（同じセッションは常に同じ動物）
     # hash()はプロセスごとにランダム化されるのでUUIDの先頭を16進数として使う
-    animal = _SESSION_ANIMALS[int(short_sid, 16) % len(_SESSION_ANIMALS)]
+    try:
+        animal = _SESSION_ANIMALS[int(short_sid, 16) % len(_SESSION_ANIMALS)]
+    except ValueError:
+        animal = _SESSION_ANIMALS[hash(short_sid) % len(_SESSION_ANIMALS)]
 
     if not md_path.exists():
         # 新規作成（frontmatter + 最初のセッション見出し）
@@ -269,7 +272,7 @@ def _context_search(prompt):
 
 
 def handle_user_prompt(hook_input):
-    """UserPromptSubmit: ユーザー発言を保存 + 文脈検索。"""
+    """UserPromptSubmit / BeforeAgent / PromptSubmit: ユーザー発言を保存 + 文脈検索。"""
     prompt = hook_input.get("prompt", "")
     if not prompt.strip():
         return
@@ -281,12 +284,27 @@ def handle_user_prompt(hook_input):
         cwd=hook_input.get("cwd", ""),
     )
 
-    # 文脈検索（Selecting）
+    # 文脈検索（Selecting��
     if _should_search(prompt):
         try:
             _context_search(prompt)
         except Exception:
             pass  # 検索失敗は無視（保存が主務）
+
+
+def handle_agent_response(hook_input):
+    """AfterAgent (Gemini) / AgentComplete (Kiro): アシスタント応答を保存。"""
+    response = hook_input.get("prompt_response",
+               hook_input.get("response", ""))
+    if not response or not response.strip():
+        return
+
+    save_turn(
+        session_id=hook_input.get("session_id", "unknown"),
+        role="assistant",
+        content=response,
+        cwd=hook_input.get("cwd", ""),
+    )
 
 
 def extract_assistant_text(message):
@@ -458,10 +476,12 @@ def main():
     event = hook_input.get("hook_event_name", "")
 
     try:
-        if event == "UserPromptSubmit":
+        if event in ("UserPromptSubmit", "BeforeAgent", "PromptSubmit"):
             handle_user_prompt(hook_input)
         elif event == "Stop":
             handle_stop(hook_input)
+        elif event in ("AfterAgent", "AgentComplete"):
+            handle_agent_response(hook_input)
     except Exception as e:
         print(f"record_turn error: {e}", file=sys.stderr)
 
