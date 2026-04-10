@@ -10,19 +10,41 @@ user-invocable: true
 
 ## 手順
 
-1. `python memory.py memo index` を実行 — メモフォルダの新規ファイルを取り込む
-2. `python dream.py 30` を実行 — 出力をそのまま表示する
-3. `python wander.py 5` を実行 — 自由連想（モデルがなければ無言で終了）
-4. `python memory.py replay` を実行（出力は表示するが報告には使わない）
-5. `python memory.py consolidate` を実行（同上）
-6. `python memory.py schema` を実行 — メタ記憶を自動生成
-7. `python memory.py proceduralize` を実行 — 反復された記憶を手続き記憶に昇格
-8. `python memory.py stats` を実行（同上）
+### 1. 実行（全モード共通）
 
-## 報告のスタイル
+以下を順番に実行する。出力はすべて変数に保持し、この時点では表示しない。
+
+1. `python memory.py memo index` — メモフォルダの新規ファイルを取り込む
+2. `python dream.py 30` — 夢生成
+3. `python wander.py 5` — 自由連想（モデルがなければ無言で終了）
+4. `python memory.py replay` — 海馬リプレイ
+5. `python memory.py consolidate` — 類似記憶の統合
+6. `python memory.py schema` — メタ記憶の自動生成
+7. `python memory.py proceduralize` — 反復記憶の手続き記憶昇格
+8. `python memory.py stats` — 統計
+
+### 2. 報告素材の生成
+
+ghost.toml の `[brain]` セクションを確認する。
+
+**設定なし（デフォルト）**: 全出力をそのまま報告の素材にする。
+
+**設定あり（分離脳モード）**: 出力を別LLMに渡して解釈させる。自分は生出力を見ない。
+
+- dream.py と wander.py の出力 → `right_cmd` にパイプ:
+  ```bash
+  echo "出力" | <right_cmd> "以下は記憶システムの夢と自由連想の出力です。情動的に印象に残る断片を3-5個抽出してください。解釈や説明は不要。断片だけ。"
+  ```
+- replay, consolidate, schema, proceduralize, stats の出力 → `left_cmd` にパイプ:
+  ```bash
+  echo "出力" | <left_cmd> "以下は記憶の整理処理の結果です。何が統合され、何が強化され、何が忘れられたか。2-3行で要約してください。"
+  ```
+- 両方の結果だけを報告の素材にする。
+
+### 3. 報告のスタイル
 
 技術的な報告はしない。
-夢の出力、statsの数字、replay/consolidateの結果を**素材**として、
+素材（夢の断片、数字、整理結果）を使って、
 バロウズ/ギンズバーグ的カットアップで報告を書く。
 
 ルール:
