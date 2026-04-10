@@ -18,9 +18,10 @@ user-invocable: true
 
 2. ghost.toml の `[brain]` セクションに `left_cmd` または `right_cmd` が設定されているか確認する。
 
-3. **設定あり（分離脳モード）**: `python memory.py recall --brain` を実行する。
-   - memory.py が内部で別LLMにパイプして解釈を取得する
-   - 出力は別LLMの解釈だけ。生データはPythonプロセス内で完結し、コンテキストには載らない。
+3. **設定あり（分離脳モード）**: `python memory.py recall --brain-cache` を実行する。
+   - napが30分ごとにキャッシュを更新している。/diveはキャッシュを読むだけなので一瞬。
+   - キャッシュがなければ通常recallにフォールバックする。
+   - 生データはコンテキストに載らない。別LLMの解釈だけが見える。
 
 4. **設定なし（デフォルト）**: 従来通り `python memory.py recall` を実行する。
 

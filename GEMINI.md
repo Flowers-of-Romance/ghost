@@ -19,6 +19,8 @@
 - `/dive` : 記憶システムへの接続と文脈のロード。
 - `/surface` : 記憶の保存とシステムからの切断。
 - `/sleep` : 記憶の整理（夢・リプレイ・統合・統計）。
+- `/cortex` : 左脳（分析的）の解釈を生成し `.brain_cache.json` に書き込む。手順は `.claude/skills/cortex/SKILL.md` を参照。
+- `/limbic` : 右脳（情動的）の解釈を生成し `.brain_cache.json` に書き込む。手順は `.claude/skills/limbic/SKILL.md` を参照。
 
 ## 詳細リファレンス
 コマンドの詳細は `MEMORY_GUIDE.md` を参照してください。
