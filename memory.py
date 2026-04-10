@@ -67,7 +67,6 @@ import re
 import math
 import io
 import random
-import tomllib
 import uuid as _uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -76,23 +75,6 @@ from pathlib import Path
 if sys.platform == "win32" and getattr(sys.stdout, 'encoding', '').lower() not in ('utf-8', 'utf8'):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
-
-# --- ghost.toml 読み込み ---
-_GHOST_TOML_PATH = Path(__file__).parent / "ghost.toml"
-_ghost_config = {}
-if _GHOST_TOML_PATH.exists():
-    with open(_GHOST_TOML_PATH, "rb") as _f:
-        _ghost_config = tomllib.load(_f)
-
-def get_ghost_config(*keys, default=None):
-    """ghost.toml からネストされたキーを取得。get_ghost_config("brain", "left") など。"""
-    obj = _ghost_config
-    for k in keys:
-        if isinstance(obj, dict):
-            obj = obj.get(k)
-        else:
-            return default
-    return obj if obj is not None else default
 
 # --- 設定 ---
 DB_PATH = os.environ.get("MEMORY_DB_PATH", str(Path(__file__).parent / "memory.db"))
@@ -5016,94 +4998,31 @@ def main():
         else:
             print("該当する記憶はありません")
 
-    elif cmd == "recall" and "--brain" in sys.argv:
-        # 分離脳モード: 生データを別LLMに渡し、解釈だけ出力する
-        import subprocess as _sp
-        import concurrent.futures as _cf
-
-        left_cmd = get_ghost_config("brain", "left_cmd")
-        right_cmd = get_ghost_config("brain", "right_cmd")
-        if not left_cmd and not right_cmd:
-            print("ghost.toml に brain.left_cmd / brain.right_cmd が未設定です。")
-            print("通常の recall を使うか、ghost.toml を設定してください。")
-            sys.exit(1)
-
-        conn = get_connection()
-        sweep_contexts(conn)
-        rows = conn.execute("SELECT * FROM memories WHERE forgotten = 0").fetchall()
-
-        scored = []
-        for row in rows:
-            L = _left_score(row)
-            R = _right_score(conn, row)
-            C = corpus_callosum(L, R)
-            scored.append((row, L, R, C))
-        conn.close()
-
-        limit = 10
-
-        def _run_brain_cmd(cmd_str, side, data_lines):
-            if side == "left":
-                prompt = ("以下は記憶システムの左脳（分析的）スコアリング結果です。\n"
-                          "この記憶群を分析的に要約してください。何が重要で、なぜ上位に来ているか。\n"
-                          "3-5行で簡潔に。断定せず「おそらく」「〜かもしれない」で語ってください。")
-            else:
-                prompt = ("以下は記憶システムの右脳（情動的）スコアリング結果です。\n"
-                          "この記憶群の情動的な傾向を要約してください。どんな感情が強く、何が引っかかっているか。\n"
-                          "3-5行で簡潔に。断定せず「おそらく」「〜かもしれない」で語ってください。")
-            input_text = "\n".join(data_lines) + "\n\n" + prompt
-            try:
-                result = _sp.run(
-                    cmd_str + " " + json.dumps(prompt),
-                    input=input_text, capture_output=True, text=True,
-                    timeout=120, shell=True, encoding='utf-8'
-                )
-                out = (result.stdout or "").strip()
-                return out if out else f"({side}: 応答なし)"
-            except _sp.TimeoutExpired:
-                return f"({side}: タイムアウト)"
-            except Exception as e:
-                return f"({side}: エラー: {e})"
-
-        # 左脳データ生成
-        left_data = []
-        if left_cmd:
-            left_sorted = sorted(scored, key=lambda x: x[1], reverse=True)[:limit]
-            for row, L, R, C in left_sorted:
-                conf = row["confidence"] if "confidence" in row.keys() and row["confidence"] is not None else 0.7
-                left_data.append(f"#{row['id']} L:{L:.3f} conf:{conf:.2f} access:{row['access_count']}  {row['content'][:80]}")
-
-        # 右脳データ生成
-        right_data = []
-        if right_cmd:
-            right_sorted = sorted(scored, key=lambda x: x[2], reverse=True)[:limit]
-            for row, L, R, C in right_sorted:
-                emotions = json.loads(row["emotions"]) if row["emotions"] else []
-                emo_str = ", ".join(emotions) if emotions else "中立"
-                right_data.append(f"#{row['id']} R:{R:.3f} arousal:{row['arousal']:.2f} emo:[{emo_str}]  {row['content'][:80]}")
-
-        # 並列実行
-        with _cf.ThreadPoolExecutor(max_workers=2) as executor:
-            futures = {}
-            if left_cmd and left_data:
-                futures["left"] = executor.submit(_run_brain_cmd, left_cmd, "left", left_data)
-            if right_cmd and right_data:
-                futures["right"] = executor.submit(_run_brain_cmd, right_cmd, "right", right_data)
-
-            if "left" in futures:
-                left_name = get_ghost_config("brain", "left", default="left")
-                print(f"🧠 左脳 ({left_name}):")
-                print(futures["left"].result())
+    elif cmd == "recall" and "--brain-cache" in sys.argv:
+        # キャッシュから分離脳の解釈を読む（/dive用。高速）
+        cache_path = Path(__file__).parent / ".brain_cache.json"
+        if not cache_path.exists():
+            print("(brain cache なし。通常recallにフォールバック)")
+            results = recall_important(10)
+            print(f"自動想起 ({len(results)}件):")
+            for row, score in results:
+                print(format_memory_simple(row))
+            _recalled_ids = [row["id"] for row, _ in results]
+            if _recalled_ids:
+                log_recall(_recalled_ids)
+        else:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+            updated = cache.get("updated_at", "不明")
+            if "left" in cache:
+                left = cache["left"]
+                print(f"🧠 左脳 ({left['name']}, {updated}):")
+                print(left["interpretation"])
                 print()
-            if "right" in futures:
-                right_name = get_ghost_config("brain", "right", default="right")
-                print(f"🧠 右脳 ({right_name}):")
-                print(futures["right"].result())
-
-        # メタ認知: recallしたIDを記録
-        top_ids = [row["id"] for row, L, R, C in sorted(scored, key=lambda x: x[3], reverse=True)[:limit]]
-        if top_ids:
-            log_recall(top_ids)
+            if "right" in cache:
+                right = cache["right"]
+                print(f"🧠 右脳 ({right['name']}, {updated}):")
+                print(right["interpretation"])
 
     elif cmd == "recall":
         # メタ認知: 前回recallの事後検証
@@ -5173,7 +5092,7 @@ def main():
                 "連想": "🎲",
                 "俯瞰": "🦅",
             }
-            _recall_mode = get_ghost_config("recall", "mode", default="verbose")
+            _recall_mode = "simple"  # デフォルト: 内容のみ。--raw/--fullで上書き
             for voice_name, results in voices.items():
                 if not results:
                     continue
@@ -5211,7 +5130,7 @@ def main():
             else:
                 balance = 0.5
             results = recall_important(limit, balance=balance)
-            _recall_mode = get_ghost_config("recall", "mode", default="verbose")
+            _recall_mode = "simple"  # デフォルト: 内容のみ。--raw/--fullで上書き
             if _recall_mode == "simple" and not raw_mode and not full_mode:
                 print(f"自動想起 ({len(results)}件):")
                 for row, score in results:

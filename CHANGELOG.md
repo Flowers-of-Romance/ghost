@@ -4,22 +4,22 @@
 
 ### Added
 - **分離脳モード（split-brain）**: 別LLMに左脳/右脳の解釈を委譲する。ガザニガの分離脳研究がモチーフ
-  - `ghost.toml`: 設定ファイル導入。`[brain]` セクションで `left_cmd` / `right_cmd` を指定
-  - `recall --brain`: memory.py内部で別LLMにパイプし、解釈だけ stdout に出力。呼び出し元LLMは生データを見ない
-  - デフォルトはClaude単体で完結。設定した人だけ分離脳が有効になる
+  - `/cortex` スキル: 左脳（分析的）の解釈を生成し `.brain_cache.json` に書く。Gemini CLI 等から実行
+  - `/limbic` スキル: 右脳（情動的）の解釈を生成し `.brain_cache.json` に書く。Gemini CLI 等から実行
+  - `recall --brain-cache`: キャッシュから分離脳の解釈を読む（/dive用、高速）
+  - `/dive` がキャッシュを検出したら自動で分離脳モード。なければ通常recall
 - **`memory.py brain`**: 左脳/右脳スコアの生データ可視化コマンド（開発者向け）
   - `--left`: 左脳ランキング（鮮度・信頼度・安定性）
   - `--right`: 右脳ランキング（覚醒度・情動・flashbulb）
   - 無指定: L/R/統合の比較テーブル
-- **recall simpleモード**: `ghost.toml` の `[recall] mode = "simple"` でスコア・情動タグ・メタデータを隠し、内容だけ表示
-- **/dive スキル更新**: ghost.toml の brain 設定を読み、設定ありなら `recall --brain` で分離脳モード起動
-- **/sleep スキル更新**: ghost.toml の brain 設定を読み、夢・連想は right_cmd、整理・統合は left_cmd に解釈を委譲
+- **recall simpleモード**: デフォルトで内容のみ表示。スコア・情動タグ・メタデータは隠す。`--raw`/`--full` で従来表示
+- **GEMINI.md 更新**: `/cortex` `/limbic` スキルを追加
 
 ### Design notes
 - 人間は自分の左脳と右脳がどう動いているか見えない。見えるのは統合された想起結果だけ
 - 別LLMが解釈するため、自己認識が不完全になる——これは設計。fMRIを他者に撮ってもらうようなもの
 - `/delusion`（完全記憶モード）は忘却なしで全件引き出すが、スコアの中身は見えない。サヴァンは記憶量が多いだけで自己理解が深いわけではない
-- ghost.toml はリポジトリに含める（APIキーは入らない。CLI経由で別LLMを呼ぶ）
+- 設定ファイル不要。各CLIからスキルを叩くだけ。ファイル（`.brain_cache.json`）で連携
 
 ## [v21.0] - 2026-04-06
 
