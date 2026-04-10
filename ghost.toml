@@ -1,0 +1,15 @@
+# ghost.toml — 記憶システム設定
+#
+# デフォルトはClaude単体で完結する。
+# 別LLMで左脳/右脳を分離したい場合はコメントを外す。
+
+[brain]
+# left = "haiku"
+# left_cmd = "claude --model haiku -p"
+# right = "gemini"
+# right_cmd = "gemini -p"
+
+[recall]
+# "simple" = 内容だけ（デフォルト）。スコアやメタデータは隠す。
+# "verbose" = スコア・タグ・メタデータ付き（従来互換）
+mode = "simple"

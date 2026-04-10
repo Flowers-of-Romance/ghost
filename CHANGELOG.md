@@ -1,5 +1,26 @@
 # Changelog
 
+## [v22.0] - 2026-04-10
+
+### Added
+- **分離脳モード（split-brain）**: 別LLMに左脳/右脳の解釈を委譲する。ガザニガの分離脳研究がモチーフ
+  - `ghost.toml`: 設定ファイル導入。`[brain]` セクションで `left_cmd` / `right_cmd` を指定
+  - `recall --brain`: memory.py内部で別LLMにパイプし、解釈だけ stdout に出力。呼び出し元LLMは生データを見ない
+  - デフォルトはClaude単体で完結。設定した人だけ分離脳が有効になる
+- **`memory.py brain`**: 左脳/右脳スコアの生データ可視化コマンド（開発者向け）
+  - `--left`: 左脳ランキング（鮮度・信頼度・安定性）
+  - `--right`: 右脳ランキング（覚醒度・情動・flashbulb）
+  - 無指定: L/R/統合の比較テーブル
+- **recall simpleモード**: `ghost.toml` の `[recall] mode = "simple"` でスコア・情動タグ・メタデータを隠し、内容だけ表示
+- **/dive スキル更新**: ghost.toml の brain 設定を読み、設定ありなら `recall --brain` で分離脳モード起動
+- **/sleep スキル更新**: ghost.toml の brain 設定を読み、夢・連想は right_cmd、整理・統合は left_cmd に解釈を委譲
+
+### Design notes
+- 人間は自分の左脳と右脳がどう動いているか見えない。見えるのは統合された想起結果だけ
+- 別LLMが解釈するため、自己認識が不完全になる——これは設計。fMRIを他者に撮ってもらうようなもの
+- `/delusion`（完全記憶モード）は忘却なしで全件引き出すが、スコアの中身は見えない。サヴァンは記憶量が多いだけで自己理解が深いわけではない
+- ghost.toml はリポジトリに含める（APIキーは入らない。CLI経由で別LLMを呼ぶ）
+
 ## [v21.0] - 2026-04-06
 
 ### Added
