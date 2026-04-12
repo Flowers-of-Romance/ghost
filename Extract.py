@@ -163,6 +163,7 @@ def parse_jsonl(filepath):
                     "role": role,
                     "text": text.strip(),
                     "timestamp": timestamp,
+                    "model": msg.get("model", ""),
                 })
 
     return turns
@@ -318,6 +319,7 @@ def extract_memory_candidates(segments, source_file="", chat_mode=False):
                 "importance": importance,
                 "timestamp": timestamp,
                 "source": source_name,
+                "origin": os.environ.get("GHOST_WHO", "user"),
             })
 
     return candidates
@@ -410,6 +412,7 @@ def _save_raw_turns(filepath, turns, dry_run=False):
             role=turn["role"],
             content=turn["text"],
             timestamp=ts,
+            model=turn.get("model", ""),
         )
         saved += 1
 
@@ -471,7 +474,7 @@ def process_session(filepath, dry_run=False, seen_contents=None):
         if dry_run:
             print(f"  🧠 [{cand['category']}] ({emo_str}) {cand['content'][:60]}...")
         else:
-            add_memory(cand["content"], cand["category"], cand["source"])
+            add_memory(cand["content"], cand["category"], cand["source"], origin=cand.get("origin"))
             saved += 1
 
     return saved

@@ -12,10 +12,18 @@
 - **delusionスキル全面刷新**: Haiku→Sonnet一本化、3ステップ最小tool_use設計（--batch + --batch-context + 書き出し）
 - **検索速度**: embeddingサーバー常駐 + バッチ化で、5キーワード検索が1.2秒（従来: 個別実行で数分）
 
+### Source Monitoring（ソースモニタリング）
+- **`origin` カラム追加**: memoriesテーブルに情報の出自を記録。`"J"`, `"assistant:opus"`, `"assistant:gemini"`, `"system:sleep"` 等
+- Extract.pyが抽出する記憶に `GHOST_WHO` 環境変数（デフォルト `"user"`）から自動付与
+- sleep処理で生成される記憶に `origin: "system:sleep"` を付与
+- delusionの出力に `[origin:J]` 等を表示
+- CLIの `add` コマンドに `--origin` フラグ追加
+
 ### Design notes
 - delusionの「忘却なし」原則とコンテクスト節約は矛盾する。解決策: Sonnetが原文をファイルに書き出し、Opusはインデックスだけ読んで必要な部分だけReadする
 - Haiku/Sonnet/Opusの3段階リレーを試したが、Haikuは指示遵守が弱く（要約するな→解釈を追加、キーワード推測が浅い）、Sonnet一本が最適解だった
 - ボトルネックはLLMではなくmemory.pyのプロセス起動とembeddingロード。サーバー常駐 + バッチ化で100倍速くなった
+- Transformerには遠心性コピー（efference copy）がない。自己生成トークンと外部入力トークンを構造的に区別する機構がアーキテクチャに存在しない。originカラムはこれをシステムレベルで補償する試み
 
 ## [v22.0] - 2026-04-10
 
