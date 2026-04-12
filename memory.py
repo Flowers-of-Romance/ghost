@@ -36,6 +36,7 @@ memory.py - 脳に近い記憶システム
   python memory.py delusion --all                       # 全記憶ダンプ
   python memory.py delusion --raw "query"               # 原文のみ検索
   python memory.py delusion --context ID                # 記憶の対話文脈を復元
+  python memory.py delusion --batch "q1" "q2" "q3"    # バッチ検索（複数キーワード一括）
   python memory.py schema             # リンク密集クラスタからスキーマ（メタ記憶）を生成
   python memory.py proceduralize      # 反復された記憶を行動指針に昇格（LEARNED.mdに書込み）
   python memory.py overview              # 俯瞰モード: 構造・重心・層・時系列
@@ -2640,7 +2641,30 @@ def _raw_turn_to_format(row):
 
 
 def _delusion_context(conn, memory_id):
-    """記憶IDから元の対話文脈を復元する。"""
+    """記憶IDから元の対話文脈を復元する。文字列 'raw:123' も受け付ける。"""
+    # raw:XXX 形式の場合: そのraw_turnの前後を返す
+    raw_prefix = str(memory_id)
+    if raw_prefix.startswith("raw:"):
+        raw_id = int(raw_prefix[4:])
+        # そのraw_turnのsession_idを取得し、同セッションの前後20件を返す
+        try:
+            target = conn.execute("SELECT * FROM raw_turns WHERE id = ?", (raw_id,)).fetchone()
+            if target:
+                rows = conn.execute(
+                    "SELECT * FROM raw_turns WHERE session_id = ? AND id BETWEEN ? AND ? ORDER BY id",
+                    (target["session_id"], raw_id - 10, raw_id + 10)
+                ).fetchall()
+                if rows:
+                    conn.close()
+                    return [(_raw_turn_to_format(row), None) for row in rows]
+        except Exception:
+            pass
+        conn.close()
+        return []
+
+    # 通常の記憶ID
+    memory_id = int(memory_id)
+
     # raw_turnsのmemory_idsから該当する対話を探す
     try:
         rows = conn.execute(
@@ -2698,7 +2722,8 @@ def format_delusion(item, similarity=None):
 
 
 def save_raw_turn(session_id, role, content, timestamp=None,
-                  message_uuid=None, cwd=None, git_branch=None, memory_ids=None):
+                  message_uuid=None, cwd=None, git_branch=None, memory_ids=None,
+                  model=None):
     """対話の1ターンをraw_turnsテーブルに保存する。"""
     if timestamp is None:
         timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -2712,12 +2737,19 @@ def save_raw_turn(session_id, role, content, timestamp=None,
         conn.close()
         return None
 
+    # modelカラムがなければ追加
+    try:
+        conn.execute("SELECT model FROM raw_turns LIMIT 0")
+    except Exception:
+        conn.execute("ALTER TABLE raw_turns ADD COLUMN model TEXT")
+        conn.commit()
+
     conn.execute(
         """INSERT INTO raw_turns
-           (session_id, message_uuid, role, content, timestamp, cwd, git_branch, memory_ids)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+           (session_id, message_uuid, role, content, timestamp, cwd, git_branch, memory_ids, model)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (session_id, message_uuid, role, content, timestamp,
-         cwd, git_branch, json.dumps(memory_ids or []))
+         cwd, git_branch, json.dumps(memory_ids or []), model)
     )
     conn.commit()
     new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -4940,8 +4972,11 @@ def main():
         before_val = None
         raw_only = "--raw" in args
         dump_all = "--all" in args
+        batch_mode = "--batch" in args
+        batch_context = "--batch-context" in args
         context_id = None
         limit_val = 50
+        queries = []
 
         # フラグ以外の引数を解析
         i = 0
@@ -4956,19 +4991,21 @@ def main():
                 before_val = args[i + 1]
                 i += 2
             elif args[i] == "--context" and i + 1 < len(args):
-                context_id = int(args[i + 1])
+                ctx_val = args[i + 1]
+                context_id = ctx_val if ctx_val.startswith("raw:") else int(ctx_val)
                 i += 2
             elif args[i] == "--limit" and i + 1 < len(args):
                 limit_val = int(args[i + 1])
                 i += 2
-            elif args[i] in ("--raw", "--all"):
+            elif args[i] in ("--raw", "--all", "--batch", "--batch-context"):
                 i += 1
             else:
-                if query is None:
-                    query = args[i]
+                queries.append(args[i])
                 i += 1
 
-        if not query and not date_val and not after_val and not before_val and not dump_all and context_id is None:
+        query = queries[0] if queries else None
+
+        if not query and not date_val and not after_val and not before_val and not dump_all and context_id is None and not batch_context:
             print("使い方:")
             print('  python memory.py delusion "検索語"                  # 純粋ベクトル検索')
             print('  python memory.py delusion "検索語" --date 2024-12-11  # 日付フィルタ')
@@ -4977,26 +5014,67 @@ def main():
             print('  python memory.py delusion --all                    # 全記憶ダンプ')
             print('  python memory.py delusion --raw "検索語"            # 原文のみ検索')
             print('  python memory.py delusion --context 123            # 記憶の対話文脈')
+            print('  python memory.py delusion --context raw:4728       # raw_turnの前後文脈')
+            print('  python memory.py delusion --batch "q1" "q2" "q3"  # バッチ検索')
+            print('  python memory.py delusion --batch-context 36 raw:4728 337  # 複数ID一括文脈取得')
             return
 
-        results = delusion_search(
-            query=query, limit=limit_val, date=date_val,
-            after=after_val, before=before_val,
-            raw_only=raw_only, context_id=context_id, dump_all=dump_all
-        )
-
-        if results:
-            mode_str = "delusion"
-            if raw_only:
-                mode_str += " (raw)"
-            if context_id is not None:
-                mode_str += f" (context #{context_id})"
-            print(f"完全記憶 ({len(results)}件, {mode_str}):")
-            for item, sim in results:
-                print(format_delusion(item, sim))
+        if batch_context and queries:
+            # バッチコンテキスト: 複数IDの文脈を1プロセスで一括取得
+            for id_str in queries:
+                cid = id_str if id_str.startswith("raw:") else int(id_str)
+                print(f"=== context {id_str} ===")
+                results = _delusion_context(get_connection(), cid)
+                if results:
+                    for item, sim in results:
+                        print(format_delusion(item, sim))
+                        print()
+                else:
+                    print("���当する記憶はありません")
                 print()
+            return
+
+        if batch_mode and len(queries) > 1:
+            # バッチモード: 複数クエリを1プロセスで処理
+            seen_ids = set()
+            for q in queries:
+                results = delusion_search(
+                    query=q, limit=limit_val, date=date_val,
+                    after=after_val, before=before_val,
+                    raw_only=raw_only, context_id=None, dump_all=False
+                )
+                new_results = []
+                for item, sim in results:
+                    item_id = item.get("id")
+                    if item_id and item_id not in seen_ids:
+                        seen_ids.add(item_id)
+                        new_results.append((item, sim))
+                if new_results:
+                    print(f"--- {q} ({len(new_results)}件) ---")
+                    for item, sim in new_results:
+                        print(format_delusion(item, sim))
+                        print()
+                else:
+                    print(f"--- {q} (0件) ---")
         else:
-            print("該当する記憶はありません")
+            results = delusion_search(
+                query=query, limit=limit_val, date=date_val,
+                after=after_val, before=before_val,
+                raw_only=raw_only, context_id=context_id, dump_all=dump_all
+            )
+
+            if results:
+                mode_str = "delusion"
+                if raw_only:
+                    mode_str += " (raw)"
+                if context_id is not None:
+                    mode_str += f" (context #{context_id})"
+                print(f"完全記憶 ({len(results)}件, {mode_str}):")
+                for item, sim in results:
+                    print(format_delusion(item, sim))
+                    print()
+            else:
+                print("該当する記憶はありません")
 
     elif cmd == "recall" and "--brain-cache" in sys.argv:
         # キャッシュから分離脳の解釈を読む（/dive用。高速）
