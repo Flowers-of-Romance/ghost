@@ -14,7 +14,6 @@
 
 ### Habituation（馴化）
 - **検索結果の馴化**: delusion検索で類似内容の繰り返しを自動減衰。類似度0.92以上の既出記憶があれば後続のスコアを0.7倍に減衰
-- 「スクエアプッシャー」検索で同一内容14件→1件に。代わりに多様な関連記憶が上位に浮上
 
 ### Source Monitoring（ソースモニタリング）
 - **`origin` カラム追加**: memoriesテーブルに情報の出自を記録。`"J"`, `"assistant:opus"`, `"assistant:gemini"`, `"system:sleep"` 等
