@@ -2544,7 +2544,25 @@ def delusion_search(query=None, limit=50, date=None, after=None, before=None,
             scored.append((row, sim + fts_bonus, sim))
 
         scored.sort(key=lambda x: x[1], reverse=True)
-        results = [(_row_to_delusion_format(row), sim) for row, _, sim in scored[:limit]]
+
+        # 馴化（habituation）: 類似内容の繰り返しを減衰させる
+        # 既に選ばれた記憶と類似度が高い後続記憶のスコアを下げる
+        habituated = []
+        selected_vecs = []
+        HABITUATION_THRESHOLD = 0.92  # この類似度以上で馴化発動
+        HABITUATION_DECAY = 0.7       # 減衰係数（スコアにかける）
+        for row, boosted_sim, raw_sim in scored:
+            mem_vec = bytes_to_vec(row["embedding"])
+            decay = 1.0
+            for sv in selected_vecs:
+                inter_sim = cosine_similarity(mem_vec, sv)
+                if inter_sim > HABITUATION_THRESHOLD:
+                    decay *= HABITUATION_DECAY
+            habituated.append((row, boosted_sim * decay, raw_sim * decay))
+            selected_vecs.append(mem_vec)
+
+        habituated.sort(key=lambda x: x[1], reverse=True)
+        results = [(_row_to_delusion_format(row), sim) for row, _, sim in habituated[:limit]]
     else:
         # embeddingなし: LIKE検索フォールバック
         rows = conn.execute(
