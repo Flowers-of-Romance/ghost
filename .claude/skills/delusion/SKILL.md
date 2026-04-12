@@ -13,28 +13,76 @@ user-invocable: true
 delusionは全部覚えているが、人間は検索キー（日付・正確な単語）を忘れている。
 だから「有機的検索でアタリをつけてからdelusion検索する」2段階リレーが必要。
 
-## 手順（2段階リレー）
+## 手順（Sonnetに委譲 → Opusが対話）
 
-### ステップ1: アタリをつける
+### ステップ1+2: 検索・原文取得・書き出し（Sonnet一括）
 
-ユーザーの曖昧な入力から、関連キーワードを複数推測して広く叩く:
+```
+Agent({
+  description: "delusion: 完全記憶検索",
+  model: "sonnet",
+  prompt: `
+記憶データベースから情報を完全に検索・取得してファイルに書き出す。
+作業ディレクトリは C:\\memory。
 
-```bash
-python memory.py delusion "推測キーワード1"
-python memory.py delusion "推測キーワード2"
+## 検索対象
+ユーザーの質問: 「{ユーザーの質問}」
+
+## 手順（3ステップ、最小tool_useで）
+
+### 1. 広域検索（1コマンド）
+質問から関連キーワードを3-5個推測し、--batchで一括検索:
+python memory.py delusion --batch "{kw1}" "{kw2}" "{kw3}" "{kw4}" "{kw5}"
+
+### 2. 原文取得（1コマンド）
+検索結果からクエリに関連度の高いIDを最大10件選ぶ。
+- task notification、無関係なエピソードは除外
+- スコアだけでなくサマリの内容で関連を判断
+選んだIDを --batch-context で一括取得:
+python memory.py delusion --batch-context 36 raw:4728 337
+（raw:XXX 形式のIDもそのまま渡せる。前後の対話文脈が返る）
+
+### 3. ファイル書き出し
+結果を C:\\memory\\.delusion\\{クエリ}_result.md に書き出す。
+フォルダは既に存在する。
+
+ファイル構成:
+
+# delusion検索結果
+クエリ: {クエリ}
+検索日時: {日時}
+
+## 検索ログ
+{キーワード1} → {N}件
+{キーワード2} → {N}件
+...
+
+## インデックス（選定後）
+| ID | 日付 | スコア | 1行サマリ |
+|----|------|--------|-----------|
+| ... | ... | ... | ... |
+
+## ID:XX の原文
+{--batch-context の出力をそのまま貼る。一切編集しない}
+
+## 重要な制約
+- 原文は一切要約・編集するな。コマンド出力をそのまま貼れ
+- 解釈・考察・補足セクションは追加するな
+- tool_useは最小限に。--batch と --batch-context を使えば検索+取得は2コマンドで済む
+- 最後に「書き出し完了: {N}件、約{X}KB」とだけ返せ
+`
+})
 ```
 
-### ステップ2: 絞り込み
+### ステップ3: ユーザーとの対話（Opus）
 
-結果が多すぎたら:
-- 3-5個のトピックに分類してユーザーに逆質問して絞る
-- 「その時、他に何をやっていた?」と周辺情報を聞く
-- IDや日付が特定できたら完全ダンプ:
+Sonnetから「書き出し完了」が返ったら:
 
-```bash
-python memory.py delusion --date 2024-12-11
-python memory.py delusion --context 123
-```
+1. `.delusion/{クエリ}_result.md` の先頭50行程度をReadしてインデックスを見せる
+2. ユーザーが指定したIDの部分だけ Read（offset/limit）で読む
+3. 必要に応じて追加の `--context` をOpusが直接叩いてもよい
+
+**原則: ファイルを丸ごとReadしない。必要な部分だけ読む。**
 
 ## コマンド一覧
 
@@ -46,7 +94,17 @@ python memory.py delusion --date 2024-12-11           # その日の全記憶ダ
 python memory.py delusion --all                       # 全記憶ダンプ
 python memory.py delusion --raw "検索語"              # 原文（raw_turns）のみ検索
 python memory.py delusion --context ID                # 記憶IDから元の対話文脈を復元
+python memory.py delusion --context raw:4728          # raw_turnの前後文脈を復元
+python memory.py delusion --batch "q1" "q2" "q3"     # バッチ検索（複数キーワード一括、重複ID除外）
+python memory.py delusion --batch-context 36 raw:4728 337  # 複数IDの文脈を一括取得
 ```
+
+## Sonnet委譲をスキップしてよい場合
+
+以下の場合はOpusが直接コマンドを叩く:
+- ユーザーがID・日付を明示的に指定している（`--context`, `--date`）
+- 検索キーワードが1つで明確（曖昧さがない）
+- `--raw` や `--all` など特定オプションを指示された
 
 ## フォールバック戦略
 

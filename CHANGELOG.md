@@ -1,5 +1,22 @@
 # Changelog
 
+## [v23.0] - 2026-04-12
+
+### Added
+- **delusion バッチ検索**: `--batch "q1" "q2" "q3"` で複数キーワードを1プロセスで一括検索。重複ID自動除外
+- **delusion バッチコンテキスト**: `--batch-context 36 raw:4728 337` で複数IDの対話文脈を一括取得
+- **raw_turn コンテキスト対応**: `--context raw:4728` でraw_turnの前後10件の対話文脈を復元
+- **Sonnet委譲アーキテクチャ**: delusionの広域検索をSonnet Agentに委譲し、結果を `.delusion/` フォルダにファイル書き出し。Opusのコンテクスト消費を抑える
+
+### Changed
+- **delusionスキル全面刷新**: Haiku→Sonnet一本化、3ステップ最小tool_use設計（--batch + --batch-context + 書き出し）
+- **検索速度**: embeddingサーバー常駐 + バッチ化で、5キーワード検索が1.2秒（従来: 個別実行で数分）
+
+### Design notes
+- delusionの「忘却なし」原則とコンテクスト節約は矛盾する。解決策: Sonnetが原文をファイルに書き出し、Opusはインデックスだけ読んで必要な部分だけReadする
+- Haiku/Sonnet/Opusの3段階リレーを試したが、Haikuは指示遵守が弱く（要約するな→解釈を追加、キーワード推測が浅い）、Sonnet一本が最適解だった
+- ボトルネックはLLMではなくmemory.pyのプロセス起動とembeddingロード。サーバー常駐 + バッチ化で100倍速くなった
+
 ## [v22.0] - 2026-04-10
 
 ### Added
