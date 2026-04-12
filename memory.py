@@ -900,6 +900,12 @@ def init_db():
         conn.execute("ALTER TABLE limbic ADD COLUMN relational_context TEXT DEFAULT NULL")
     except sqlite3.OperationalError:
         pass
+    # origin カラム追加（ソースモニタリング: 誰が生成した情報か）
+    try:
+        conn.execute("ALTER TABLE memories ADD COLUMN origin TEXT DEFAULT NULL")
+    except sqlite3.OperationalError:
+        pass
+
     # データ移行: memoriesからcortex/limbicにコピー（まだ移行されていない場合）
     migrated = conn.execute("SELECT COUNT(*) FROM cortex").fetchone()[0]
     total = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
@@ -1932,7 +1938,7 @@ def prospect_clear(prospect_id):
 # メイン操作
 # ============================================================
 
-def add_memory(content, category="fact", source=None, confidence=None, provenance=None, flashbulb=None, relational_context=None):
+def add_memory(content, category="fact", source=None, confidence=None, provenance=None, flashbulb=None, relational_context=None, origin=None):
     emotions, arousal, importance = detect_emotions(content)
 
     # 出自と信頼度の自動設定
@@ -2007,12 +2013,12 @@ def add_memory(content, category="fact", source=None, confidence=None, provenanc
         """INSERT INTO memories
            (content, category, importance, emotions, arousal, keywords,
             source_conversation, embedding, context_expires_at, temporal_context,
-            spatial_context, relational_context, uuid, updated_at, provenance, confidence, flashbulb)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            spatial_context, relational_context, uuid, updated_at, provenance, confidence, flashbulb, origin)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (content, category, importance,
          emo_json, arousal, kw_json,
          source, blob, context_expires, temporal_ctx, spatial_ctx, relational_ctx,
-         mem_uuid, now_utc, provenance, confidence, flashbulb)
+         mem_uuid, now_utc, provenance, confidence, flashbulb, origin)
     )
     conn.commit()
     new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -2558,6 +2564,11 @@ def delusion_search(query=None, limit=50, date=None, after=None, before=None,
 
 def _row_to_delusion_format(row):
     """記憶rowをdelusionモード用のメタデータ付きdictに変換。"""
+    # originカラムが存在しない古いDBでも動くように
+    try:
+        origin_val = row["origin"]
+    except (IndexError, KeyError):
+        origin_val = None
     return {
         "id": row["id"],
         "content": row["content"],  # 切り詰めなし
@@ -2569,6 +2580,7 @@ def _row_to_delusion_format(row):
         "keywords": row["keywords"],
         "access_count": row["access_count"],
         "forgotten": row["forgotten"],
+        "origin": origin_val,
         "source": "memory",
     }
 
@@ -2708,10 +2720,14 @@ def format_delusion(item, similarity=None):
     content = item.get("content", "")
     forgotten = item.get("forgotten", 0)
 
+    origin = item.get("origin")
+
     # メタデータ行
     parts = [f"[ID:{mid}]", f"[{created}]", f"[category:{category}]"]
     if arousal is not None:
         parts.append(f"[arousal:{arousal:.2f}]")
+    if origin:
+        parts.append(f"[origin:{origin}]")
     if forgotten:
         parts.append("[FORGOTTEN]")
     if similarity is not None:
@@ -2849,6 +2865,7 @@ def promote_turns(days=7, sample_size=20):
             provenance="sleep_promote",
             confidence=0.6,
             flashbulb=fb,
+            origin="system:sleep",
         )
         promoted += 1
 
@@ -4825,7 +4842,7 @@ def main():
 
     elif cmd == "add":
         if len(sys.argv) < 3:
-            print("使い方: python memory.py add \"内容\" [--category CAT] [--source SRC] [--flashbulb TEXT]")
+            print("使い方: python memory.py add \"内容\" [--category CAT] [--source SRC] [--flashbulb TEXT] [--origin ORIGIN]")
             print("  位置引数: python memory.py add \"内容\" category [source]")
             return
         content = sys.argv[2]
@@ -4833,6 +4850,7 @@ def main():
         category = "fact"
         source = None
         flashbulb = None
+        origin = None
         i = 0
         while i < len(args):
             if args[i] == "--category" and i + 1 < len(args):
@@ -4844,6 +4862,9 @@ def main():
             elif args[i] == "--flashbulb" and i + 1 < len(args):
                 flashbulb = args[i + 1]
                 i += 2
+            elif args[i] == "--origin" and i + 1 < len(args):
+                origin = args[i + 1]
+                i += 2
             elif args[i].startswith("--"):
                 i += 2  # 未知のフラグはスキップ
             elif category == "fact":
@@ -4854,7 +4875,7 @@ def main():
                 i += 1
             else:
                 i += 1
-        add_memory(content, category, source, flashbulb=flashbulb)
+        add_memory(content, category, source, flashbulb=flashbulb, origin=origin)
 
     elif cmd == "search":
         if len(sys.argv) < 3:
