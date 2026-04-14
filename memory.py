@@ -4581,6 +4581,60 @@ def _set_param_as_memory(conn, key, new_value, reason, avg_precision=None, avg_r
     return new_id
 
 
+def _evaluate_past_decisions(conn, avg_precision, avg_recall):
+    """自己言及: self-tuneが自分の過去の判断を評価する。
+
+    前回の手続き記憶が保存された後、精度/網羅は改善したか？
+    良くなった手続き記憶はaccess_count++（強化）。
+    悪くなった手続き記憶はそのまま放置（自然減衰に任せる）。
+    効果不明のものは触らない。
+
+    ゲーデル的: 「この判断は正しかったか」を判断するのは
+    同じ判断システム。操作と操作対象が同じもの。
+    """
+    procs = conn.execute(
+        "SELECT m.id, c.content, m.created_at, m.access_count "
+        "FROM memories m JOIN cortex c ON c.id = m.id "
+        "WHERE m.forgotten = 0 AND c.category = 'procedure' "
+        "AND c.content LIKE ? "
+        "ORDER BY m.created_at DESC LIMIT 10",
+        (PROCEDURE_PREFIX + '%',)
+    ).fetchall()
+
+    if not procs:
+        return
+
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    reinforced = 0
+    for proc in procs:
+        # 手続き記憶に記録されている当時の精度/網羅を抽出
+        match_p = re.search(r'精度:(\d+)%', proc["content"])
+        match_r = re.search(r'網羅:(\d+)%', proc["content"])
+        if not match_p or not match_r:
+            continue
+        old_p = int(match_p.group(1)) / 100
+        old_r = int(match_r.group(1)) / 100
+
+        # 改善したか？
+        improved = False
+        if avg_precision > old_p + 0.05 or avg_recall > old_r + 0.05:
+            improved = True
+        elif avg_precision >= old_p and avg_recall >= old_r:
+            improved = True  # 悪化していなければOK
+
+        if improved:
+            conn.execute(
+                "UPDATE memories SET access_count = access_count + 1, "
+                "last_accessed = ? WHERE id = ?",
+                (now, proc["id"])
+            )
+            reinforced += 1
+
+    if reinforced > 0:
+        conn.commit()
+        print(f"  ↻ 自己評価: {reinforced}件の過去判断を強化（精度/網羅が維持or改善）")
+
+
 def self_tune(dry_run=False):
     """recallの事後検証データからパラメータを自己調整する。
 
@@ -4588,6 +4642,10 @@ def self_tune(dry_run=False):
     網羅が低い → 漏れが多い → 減衰を遅く / 広く拾う
 
     声ごとの的中率が分かれば、有効な声の重みを上げ、空振りが多い声の重みを下げる。
+
+    自己言及: self-tuneは自分の過去の判断も評価する。
+    前回の手続き記憶が良い結果を出していたら強化し、
+    悪ければ自然減衰に任せる。自分の判断を自分で評価する。
     """
     conn = get_connection()
     _ensure_recall_log(conn)
@@ -4609,6 +4667,10 @@ def self_tune(dry_run=False):
     # --- 全体の精度・網羅 ---
     avg_precision = sum(r["precision"] for r in rows) / len(rows)
     avg_recall = sum(r["recall_rate"] for r in rows) / len(rows)
+
+    # --- 自己言及: 過去の判断を評価する ---
+    if not dry_run:
+        _evaluate_past_decisions(conn, avg_precision, avg_recall)
 
     changes = {}
 
@@ -4890,6 +4952,72 @@ def generate_meta_memories(dry_run=False):
                        f"直近{n_sessions}セッション分析。")
             if content not in existing_meta:
                 generated.append(("trend", content, None))
+
+    # --- 4. メタ記憶のメタ観察（自己言及） ---
+    # 過去に生成した固着メタ記憶の対象IDが、今も固着しているか確認。
+    # 「固着が続いている」「固着が解消された」を観察する。
+    # メタ記憶がメタ記憶を観察する——型の階層なし。
+    past_fixations = conn.execute(
+        "SELECT m.id, c.content FROM memories m JOIN cortex c ON c.id = m.id "
+        "WHERE m.forgotten = 0 AND c.category = 'schema' "
+        "AND c.content LIKE '[メタ観察] 記憶#%への固着:%'"
+    ).fetchall()
+
+    for pf in past_fixations:
+        # 対象の記憶IDを抽出
+        id_match = re.search(r'記憶#(\d+)への固着', pf["content"])
+        if not id_match:
+            continue
+        target_id = int(id_match.group(1))
+        current_count = recall_counter.get(target_id, 0)
+        current_rate = current_count / n_sessions if n_sessions > 0 else 0
+
+        if current_rate < META_MEMORY_FIXATION_THRESHOLD * 0.5:
+            # 固着が解消された
+            content = (f"[メタ観察] 記憶#{target_id}の固着が解消: "
+                       f"以前は固着と判断されたが、現在{current_count}/{n_sessions}回"
+                       f"({current_rate:.0%})に減少。"
+                       f"メタ記憶#{pf['id']}の観察対象。")
+            if content not in existing_meta:
+                generated.append(("meta_resolved", content, pf["id"]))
+        elif current_rate >= META_MEMORY_FIXATION_THRESHOLD:
+            # 固着が続いている——メタ記憶が効いていない
+            content = (f"[メタ観察] 記憶#{target_id}の固着が持続: "
+                       f"メタ記憶#{pf['id']}で固着を認識したが、"
+                       f"現在も{current_count}/{n_sessions}回({current_rate:.0%})。"
+                       f"認識だけでは解消しない。")
+            if content not in existing_meta:
+                generated.append(("meta_persistent", content, pf["id"]))
+
+    # --- 5. 手続き記憶の効果観察（ルールを観察する） ---
+    # self-tuneが生んだ手続き記憶の効果をメタ観察として記録する。
+    # ルールが記憶なら、ルールの効果も記憶になる。
+    active_procs = conn.execute(
+        "SELECT m.id, c.content, m.access_count "
+        "FROM memories m JOIN cortex c ON c.id = m.id "
+        "WHERE m.forgotten = 0 AND c.category = 'procedure' "
+        "AND c.content LIKE ? ORDER BY m.created_at DESC LIMIT 5",
+        (PROCEDURE_PREFIX + '%',)
+    ).fetchall()
+
+    for proc in active_procs:
+        match_p = re.search(r'精度:(\d+)%', proc["content"])
+        match_r = re.search(r'網羅:(\d+)%', proc["content"])
+        if not match_p or not match_r:
+            continue
+        old_p = int(match_p.group(1)) / 100
+        old_r = int(match_r.group(1)) / 100
+
+        dp = avg_p - old_p
+        dr = avg_r - old_r
+        if abs(dp) > 0.08 or abs(dr) > 0.08:
+            effect = "改善" if (dp > 0 or dr > 0) else "悪化"
+            content = (f"[メタ観察] 手続き記憶#{proc['id']}の効果: "
+                       f"適用後の精度{dp:+.0%}, 網羅{dr:+.0%}({effect})。"
+                       f"access:{proc['access_count']}。"
+                       f"元の判断: {proc['content'][:60]}")
+            if content not in existing_meta:
+                generated.append(("rule_effect", content, proc["id"]))
 
     # --- 保存 ---
     if not generated:
