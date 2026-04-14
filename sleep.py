@@ -30,6 +30,8 @@ steps = [
     ("schema",        ["python", "memory.py", "schema"]),
     ("proceduralize", ["python", "memory.py", "proceduralize"]),
     ("think",         ["python", "think.py"]),
+    ("self_tune",     ["python", "memory.py", "self-tune"]),
+    ("meta_memory",   ["python", "memory.py", "meta-memory"]),
     ("stats",         ["python", "memory.py", "stats"]),
 ]
 
