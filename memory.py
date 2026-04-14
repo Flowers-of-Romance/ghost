@@ -144,6 +144,105 @@ MUTATION_MIN_LINKS_KW = 2           # キーワード吸収に必要な最低リ
 MUTATION_MIN_LINKS_EMOTION = 5      # 情動ドリフトに必要な最低リンク数
 MUTATION_COOLDOWN_HOURS = 4         # 連続変異防止のクールダウン時間
 
+# --- 自己調整パラメータ (ホモイコニック版) ---
+# ルールは記憶として保存される。meta_paramsテーブルではなく、
+# category='procedure'の記憶がパラメータの値を決める。
+# 記憶だから減衰し、強化され、リンクされ、統合される。
+# ルールと記憶の区別が溶ける。Lispのコード=データ。
+#
+# get_param()は生きた手続き記憶を想起してパラメータ値を導出する。
+# 手続き記憶がなければデフォルト値にフォールバック。
+# 手続き記憶が複数あれば、freshness×accessで重み付き平均。
+
+_TUNABLE_DEFAULTS = {
+    "half_life_days": HALF_LIFE_DAYS,
+    "voice_empathy_balance": 0.7,     # 共感の声の左右バランス
+    "voice_complement_balance": 0.7,  # 補完の声の左右バランス
+    "voice_critic_balance": 0.5,      # 批判の声の左右バランス
+    "voice_critic_boost": 1.3,        # 批判のconflict/anxietyブースト
+    "recall_balance": 0.5,            # 通常recallの左右バランス
+}
+
+# 手続き記憶のコンテンツ形式:
+# [手続き:param_name] 値:X.XXX 理由:... 精度:YY% 網羅:ZZ%
+PROCEDURE_PREFIX = "[手続き:"
+PROCEDURE_PATTERN = r'\[手続き:(\S+)\]\s*値:([\d.]+)'
+
+_tuned_cache = None  # lazy load
+
+
+def _load_tuned_params():
+    """生きた手続き記憶からパラメータ値を導出する。
+
+    複数の手続き記憶が同じパラメータについて存在する場合、
+    freshness × access_count で重み付き平均を取る。
+    新しくてよく使われるルールほど影響力が強い。
+    古いルールは自然に声が小さくなり、やがて消える。
+    """
+    global _tuned_cache
+    _tuned_cache = {}
+    try:
+        conn = get_connection()
+        # category='procedure' かつ [手続き:...] 形式の記憶を取得
+        rows = conn.execute(
+            "SELECT m.id, c.content, m.created_at, m.access_count, m.forgotten "
+            "FROM memories m JOIN cortex c ON c.id = m.id "
+            "WHERE m.forgotten = 0 AND c.category = 'procedure' "
+            "AND c.content LIKE ?",
+            (PROCEDURE_PREFIX + '%',)
+        ).fetchall()
+        conn.close()
+
+        if not rows:
+            return
+
+        # パラメータごとに手続き記憶を集めて重み付き平均
+        param_entries = {}  # param_name -> [(value, weight)]
+        for row in rows:
+            match = re.search(PROCEDURE_PATTERN, row["content"])
+            if not match:
+                continue
+            param_name = match.group(1)
+            try:
+                value = float(match.group(2))
+            except ValueError:
+                continue
+            if param_name not in _TUNABLE_DEFAULTS:
+                continue
+
+            # 重み = freshness × (1 + log(access_count + 1))
+            fresh = freshness(row["created_at"])
+            access_w = 1.0 + math.log1p(row["access_count"])
+            weight = fresh * access_w
+
+            if param_name not in param_entries:
+                param_entries[param_name] = []
+            param_entries[param_name].append((value, weight, row["id"]))
+
+        for param_name, entries in param_entries.items():
+            total_weight = sum(w for _, w, _ in entries)
+            if total_weight > 0:
+                weighted_val = sum(v * w for v, w, _ in entries) / total_weight
+                _tuned_cache[param_name] = weighted_val
+
+    except Exception:
+        _tuned_cache = {}
+
+
+def get_param(name):
+    """手続き記憶からパラメータを導出。記憶がなければデフォルト値。
+
+    呼ばれるたびに手続き記憶が「使われた」ことになる——
+    有効なルールは使われ続け、強化され、残る。
+    使われないルールは減衰して消える。自然選択。"""
+    global _tuned_cache
+    if _tuned_cache is None:
+        _load_tuned_params()
+    if name in _tuned_cache:
+        return _tuned_cache[name]
+    return _TUNABLE_DEFAULTS.get(name)
+
+
 # --- 情動辞書 ---
 EMOTION_MARKERS = {
     "surprise": {
@@ -384,13 +483,17 @@ def cosine_similarity(a, b):
 # --- 時間減衰 ---
 
 def effective_half_life(arousal):
-    """arousalに応じた半減期を返す。外傷的記憶は減衰が極端に遅い。"""
+    """arousalに応じた半減期を返す。外傷的記憶は減衰が極端に遅い。
+    半減期の基準値は自己調整される（get_param経由）。"""
+    base = get_param("half_life_days")
     if arousal >= TRAUMA_AROUSAL_THRESHOLD:
-        return HALF_LIFE_DAYS * (1 + arousal * 4)  # 0.85→4.4倍, 1.0→5倍
-    return HALF_LIFE_DAYS * (1 + arousal * 2)       # 通常: 0.3→1.6倍, 0.5→2倍
+        return base * (1 + arousal * 4)  # 0.85→4.4倍, 1.0→5倍
+    return base * (1 + arousal * 2)       # 通常: 0.3→1.6倍, 0.5→2倍
 
 
-def freshness(created_at_str, half_life=HALF_LIFE_DAYS):
+def freshness(created_at_str, half_life=None):
+    if half_life is None:
+        half_life = get_param("half_life_days")
     try:
         created = datetime.fromisoformat(created_at_str.replace('Z', '+00:00'))
     except (ValueError, AttributeError):
@@ -959,6 +1062,33 @@ def init_db():
             evaluated_at TEXT DEFAULT NULL
         )
     """)
+    # 声の帰属: どの声がどの記憶を出したか（再帰的自己調整の信号源）
+    try:
+        conn.execute("ALTER TABLE recall_log ADD COLUMN voice_attribution TEXT DEFAULT NULL")
+    except Exception:
+        pass  # already exists
+
+    # === meta_params: 自己調整パラメータ ===
+    # 記憶の内容（recall精度）が記憶の構造（パラメータ）を変える。
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS meta_params (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            default_value TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            reason TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS meta_params_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key TEXT NOT NULL,
+            old_value TEXT,
+            new_value TEXT NOT NULL,
+            reason TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        )
+    """)
 
     conn.commit()
     conn.close()
@@ -1413,6 +1543,128 @@ def build_schemas(dry_run=False):
             print(f"✓ スキーマ生成完了: {schema_count}件のスキーマを作成")
         else:
             print("新しいスキーマ候補はありません")
+
+
+# ============================================================
+# 6b-2. スキーマフィードバック — スキーマが新記憶の処理を変える（再帰Level 2）
+# ============================================================
+# スキーマは記憶の集積から生まれる。しかし生まれたスキーマは今度は、
+# 新しい記憶の解釈枠として機能する。人間の脳でスキーマが
+# 新しい経験の符号化を変えるのと同じ構造。
+#
+# 再帰:  記憶 → スキーマ生成 → 新記憶の処理を変調 → スキーマの進化 → ...
+
+SCHEMA_MATCH_THRESHOLD = 0.87   # スキーマとの類似度がこれ以上なら共鳴（多言語embeddingはベースラインが高い）
+SCHEMA_IMPORTANCE_BOOST = 1     # 共鳴時の重要度加算（最大5にクランプ）
+SCHEMA_KW_ABSORB_MAX = 3        # スキーマから吸収するキーワード数の上限
+SCHEMA_MAX_RESONANCE = 5        # 共鳴するスキーマ数の上限（最も類似度が高いものから）
+SCHEMA_EVOLVE_THRESHOLD = 0.87  # スキーマ進化のための類似度閾値
+
+
+def schema_prime(conn, vec, keywords, content=""):
+    """スキーマプライミング: 新記憶が既存スキーマと共鳴するかチェックする。
+
+    共鳴があれば:
+    - スキーマのキーワードで新記憶のキーワードを豊かにする（解釈枠の提供）
+    - 重要度をブーストする（「これは知っているパターンだ」）
+    - マッチしたスキーマIDを返す（後でリンク・進化に使う）
+
+    Returns: (importance_boost, extra_keywords, matched_schema_ids)
+    """
+    if vec is None:
+        return 0, [], []
+
+    schemas = conn.execute(
+        "SELECT m.id, c.embedding, c.keywords, m.importance, m.access_count "
+        "FROM memories m JOIN cortex c ON c.id = m.id "
+        "WHERE m.forgotten = 0 AND c.category = 'schema' AND c.embedding IS NOT NULL"
+    ).fetchall()
+
+    if not schemas:
+        return 0, [], []
+
+    matched = []
+    for schema in schemas:
+        s_vec = bytes_to_vec(schema["embedding"])
+        sim = cosine_similarity(vec, s_vec)
+        if sim >= SCHEMA_MATCH_THRESHOLD:
+            matched.append((schema, sim))
+
+    if not matched:
+        return 0, [], []
+
+    # 最も類似度が高いスキーマから効果を計算（上限あり）
+    matched.sort(key=lambda x: -x[1])
+    matched = matched[:SCHEMA_MAX_RESONANCE]
+    best_schema, best_sim = matched[0]
+
+    # 重要度ブースト: 最も強い共鳴が十分高ければ
+    imp_boost = SCHEMA_IMPORTANCE_BOOST if best_sim >= 0.90 else 0
+
+    # キーワード吸収: 最も強く共鳴したスキーマのキーワードで新記憶のキーワードを豊かにする
+    existing_kw_set = set(keywords)
+    schema_kws = json.loads(best_schema["keywords"]) if best_schema["keywords"] else []
+    extra_kws = [kw for kw in schema_kws if kw not in existing_kw_set][:SCHEMA_KW_ABSORB_MAX]
+
+    matched_ids = [s["id"] for s, _ in matched]
+
+    return imp_boost, extra_kws, matched_ids
+
+
+def schema_evolve(conn, schema_id, new_memory_id, new_vec):
+    """スキーマの進化: 新しいメンバー記憶がスキーマを更新する。
+
+    マトゥラーナの言葉で言えば、構造的カップリング。
+    スキーマは環境（新記憶）との相互作用で自分の構造を変える。
+
+    - merged_fromに新メンバーを追加
+    - スキーマのembeddingを微調整（新記憶の方向へ少しドリフト）
+    - access_countを増やす（活性化 = 使われているスキーマは強い）
+    """
+    schema = conn.execute(
+        "SELECT m.id, m.merged_from, c.embedding FROM memories m "
+        "JOIN cortex c ON c.id = m.id "
+        "WHERE m.id = ? AND m.forgotten = 0 AND c.category = 'schema'",
+        (schema_id,)
+    ).fetchone()
+
+    if not schema:
+        return
+
+    # merged_fromを更新
+    members = json.loads(schema["merged_from"]) if schema["merged_from"] else []
+    if new_memory_id not in members:
+        members.append(new_memory_id)
+        conn.execute(
+            "UPDATE memories SET merged_from = ? WHERE id = ?",
+            (json.dumps(sorted(members)), schema_id)
+        )
+        conn.execute(
+            "UPDATE cortex SET merged_from = ? WHERE id = ?",
+            (json.dumps(sorted(members)), schema_id)
+        )
+
+    # embeddingドリフト: スキーマのベクトルを新記憶の方向へ少し動かす
+    if new_vec is not None and schema["embedding"]:
+        s_vec = bytes_to_vec(schema["embedding"])
+        alpha = 0.03  # 慎重に。スキーマは安定していてほしい
+        new_s_vec = [s * (1 - alpha) + n * alpha for s, n in zip(s_vec, new_vec)]
+        # 正規化
+        norm = math.sqrt(sum(x * x for x in new_s_vec))
+        if norm > 0:
+            new_s_vec = [x / norm for x in new_s_vec]
+        import numpy as np
+        new_s_vec = np.array(new_s_vec, dtype=np.float32)
+        new_blob = vec_to_bytes(new_s_vec)
+        conn.execute("UPDATE memories SET embedding = ? WHERE id = ?", (new_blob, schema_id))
+        conn.execute("UPDATE cortex SET embedding = ? WHERE id = ?", (new_blob, schema_id))
+
+    # 活性化
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    conn.execute(
+        "UPDATE memories SET access_count = access_count + 1, last_accessed = ? WHERE id = ?",
+        (now, schema_id)
+    )
 
 
 # ============================================================
@@ -1969,6 +2221,13 @@ def add_memory(content, category="fact", source=None, confidence=None, provenanc
     pred_error, similar_id = prediction_error(conn, vec)
     importance, arousal = apply_prediction_error(importance, arousal, pred_error)
 
+    # スキーマプライミング — 既存スキーマが新記憶の解釈を変える（再帰Level 2）
+    schema_boost, schema_extra_kws, matched_schema_ids = schema_prime(conn, vec, keywords, content)
+    if schema_boost > 0:
+        importance = min(5, importance + schema_boost)
+    if schema_extra_kws:
+        keywords = keywords + schema_extra_kws
+
     # フラッシュバルブ記憶の自動抽出（右脳）
     if flashbulb is None and arousal >= FLASHBULB_AROUSAL_THRESHOLD:
         flashbulb = _extract_flashbulb_sentence(content)
@@ -2078,12 +2337,23 @@ def add_memory(content, category="fact", source=None, confidence=None, provenanc
                     pass
         conn.commit()
 
+    # スキーマ進化 — 新記憶がスキーマを更新する（再帰Level 2: 逆方向）
+    schema_evolve_count = 0
+    if matched_schema_ids:
+        for sid in matched_schema_ids:
+            schema_evolve(conn, sid, new_id, vec)
+            schema_evolve_count += 1
+        conn.commit()
+
     conn.close()
 
     emo_str = ", ".join(emotions) if emotions else "中立"
     kw_str = ", ".join(keywords[:5])
     link_str = f", {link_count}件リンク" if link_count else ""
     intf_str = f", {interference_count}件干渉" if interference_count else ""
+    schema_str = ""
+    if matched_schema_ids:
+        schema_str = f", スキーマ共鳴:{len(matched_schema_ids)}件"
     # 予測誤差の正規化（表示用）
     _pe_baseline, _pe_ceiling = 0.10, 0.18
     if pred_error is None:
@@ -2099,7 +2369,7 @@ def add_memory(content, category="fact", source=None, confidence=None, provenanc
     print(f"✓ 記憶 #{new_id} を保存")
     print(f"  情動: {emo_str} (覚醒度:{arousal:.2f}) → 重要度:{importance}")
     print(f"  断片: [{kw_str}]")
-    print(f"  カテゴリ: {category}{link_str}{intf_str}{pred_str}")
+    print(f"  カテゴリ: {category}{link_str}{intf_str}{pred_str}{schema_str}")
     print(f"  信頼度: {confidence:.0%} ({provenance})")
 
     # ひらめき連想: arousalが高いinsightは連想を自動で走らせて提案する
@@ -3818,23 +4088,23 @@ def recall_polyphonic(limit_per_voice=3):
     for row in rows:
         L = _left_score(row)
 
-        # 共感: 右脳優勢（balance=0.7）、気分一致
+        # 共感: 右脳優勢、気分一致（balanceは自己調整対象）
         R_empathy = _right_score(conn, row, mood_fn=get_mood_congruence_boost)
-        empathy_scored.append((row, corpus_callosum(L, R_empathy, balance=0.7)))
+        empathy_scored.append((row, corpus_callosum(L, R_empathy, balance=get_param("voice_empathy_balance"))))
 
-        # 補完: 右脳優勢（balance=0.7）、気分不一致
+        # 補完: 右脳優勢、気分不一致（balanceは自己調整対象）
         R_complement = _right_score(conn, row, mood_fn=lambda r: get_mood_incongruence_boost(r, conn))
-        complement_scored.append((row, corpus_callosum(L, R_complement, balance=0.7)))
+        complement_scored.append((row, corpus_callosum(L, R_complement, balance=get_param("voice_complement_balance"))))
 
-        # 批判: 均等（balance=0.5）、conflict/anxietyブースト
+        # 批判: conflict/anxietyブースト（balanceとboostは自己調整対象）
         mem_emotions = set(json.loads(row["emotions"])) if row["emotions"] else set()
         critic_boost = 1.0
         if mem_emotions & {"conflict", "anxiety"}:
-            critic_boost = 1.3
+            critic_boost = get_param("voice_critic_boost")
         if row["arousal"] >= 0.7 and "determination" not in mem_emotions:
             critic_boost *= 1.2
         R_critic = _right_score(conn, row) * critic_boost
-        critic_scored.append((row, corpus_callosum(L, R_critic, balance=0.5)))
+        critic_scored.append((row, corpus_callosum(L, R_critic, balance=get_param("voice_critic_balance"))))
 
         # 連想: 既存ロジック維持（ランダム性が重要）
         hl = effective_half_life(row["arousal"])
@@ -3982,16 +4252,37 @@ def _ensure_recall_log(conn):
             evaluated_at TEXT DEFAULT NULL
         )
     """)
+    try:
+        conn.execute("ALTER TABLE recall_log ADD COLUMN voice_attribution TEXT DEFAULT NULL")
+    except Exception:
+        pass
+    # meta_paramsも保証
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS meta_params (
+            key TEXT PRIMARY KEY, value TEXT NOT NULL,
+            default_value TEXT NOT NULL, updated_at TEXT NOT NULL, reason TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS meta_params_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL,
+            old_value TEXT, new_value TEXT NOT NULL, reason TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        )
+    """)
 
 
-def log_recall(recalled_ids):
-    """recallが出した記憶IDを記録する。次回recall時に事後検証される。"""
+def log_recall(recalled_ids, voice_attribution=None):
+    """recallが出した記憶IDを記録する。次回recall時に事後検証される。
+    voice_attribution: {"共感": [id, ...], "補完": [...], ...} — どの声がどの記憶を出したか。
+    """
     conn = get_connection()
     _ensure_recall_log(conn)
     now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     conn.execute(
-        "INSERT INTO recall_log (session_ts, recalled_ids) VALUES (?, ?)",
-        (now, json.dumps(recalled_ids))
+        "INSERT INTO recall_log (session_ts, recalled_ids, voice_attribution) VALUES (?, ?, ?)",
+        (now, json.dumps(recalled_ids),
+         json.dumps(voice_attribution) if voice_attribution else None)
     )
     conn.commit()
     conn.close()
@@ -4191,6 +4482,491 @@ def calibrate_report():
         print(f"  傾向  精度: {trend_p} ({dp:+.0%})  網羅: {trend_r} ({dr:+.0%})")
 
     conn.close()
+
+
+# === 再帰的自己調整 (self-tune) ===
+# recallの事後検証結果をもとに、パラメータを自動調整する。
+# 記憶の内容（会話との関連度）→ 記憶の構造（パラメータ）→ 次のrecall → ...
+# これが閉じたループになる。ghostが自分の想起を観察して、想起の仕方を変える。
+
+SELF_TUNE_MIN_SESSIONS = 5     # 最低5セッションのデータが必要
+SELF_TUNE_WINDOW = 20          # 直近20セッションを見る
+SELF_TUNE_HALF_LIFE_RANGE = (7.0, 60.0)  # 半減期の範囲
+SELF_TUNE_BALANCE_RANGE = (0.2, 0.9)     # 声バランスの範囲
+SELF_TUNE_BOOST_RANGE = (1.0, 2.0)       # ブースト倍率の範囲
+
+
+def _set_param_as_memory(conn, key, new_value, reason, avg_precision=None, avg_recall=None):
+    """パラメータ更新を手続き記憶として保存する。
+
+    meta_paramsテーブルではなく、通常の記憶として保存する。
+    記憶だから減衰し、強化され、リンクされ、統合される。
+    ルールと記憶の区別が溶ける。
+    """
+    p_str = f" 精度:{avg_precision:.0%}" if avg_precision is not None else ""
+    r_str = f" 網羅:{avg_recall:.0%}" if avg_recall is not None else ""
+    content = (f"[手続き:{key}] 値:{new_value:.4f} "
+               f"理由:{reason}{p_str}{r_str}")
+
+    emotions = ["determination"]
+    arousal = 0.3
+    importance = 3
+    keywords = [key, "self-tune", "手続き"] + extract_keywords(reason)[:3]
+
+    vec = embed_text(content, is_query=False)
+    blob = vec_to_bytes(vec) if vec is not None else None
+    now_utc = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    mem_uuid = str(_uuid.uuid4())
+    emo_json = json.dumps(emotions)
+    kw_json = json.dumps(keywords, ensure_ascii=False)
+
+    conn.execute(
+        """INSERT INTO memories
+           (content, category, importance, emotions, arousal, keywords,
+            embedding, uuid, updated_at, provenance, confidence, origin)
+           VALUES (?, 'procedure', ?, ?, ?, ?, ?, ?, ?, 'self_tune', 0.7, 'self_tune')""",
+        (content, importance, emo_json, arousal, kw_json, blob, mem_uuid, now_utc)
+    )
+    new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute(
+        """INSERT OR REPLACE INTO cortex
+           (id, content, category, keywords, embedding, confidence, provenance, revision_count)
+           VALUES (?, ?, 'procedure', ?, ?, 0.7, 'self_tune', 0)""",
+        (new_id, content, kw_json, blob)
+    )
+    conn.execute(
+        """INSERT OR REPLACE INTO limbic
+           (id, emotions, arousal) VALUES (?, ?, ?)""",
+        (new_id, emo_json, arousal)
+    )
+
+    # 同じパラメータの古い手続き記憶とリンク（系譜を残す）
+    if vec is not None:
+        old_procs = conn.execute(
+            "SELECT m.id, c.embedding, m.uuid FROM memories m "
+            "JOIN cortex c ON c.id = m.id "
+            "WHERE m.forgotten = 0 AND c.category = 'procedure' "
+            "AND c.content LIKE ? AND m.id != ?",
+            (f"[手続き:{key}]%", new_id)
+        ).fetchall()
+        for old in old_procs:
+            if old["embedding"]:
+                old_vec = bytes_to_vec(old["embedding"])
+                sim = cosine_similarity(vec, old_vec)
+                try:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO links "
+                        "(source_id, target_id, strength, source_uuid, target_uuid, "
+                        "link_type, updated_at) VALUES (?, ?, ?, ?, ?, 'procedure_lineage', ?)",
+                        (new_id, old["id"], sim, mem_uuid, old["uuid"], now_utc)
+                    )
+                except Exception:
+                    pass
+
+    # FTSインデックス
+    try:
+        from tokenizer import tokenize
+        tokenized = tokenize(content)
+        conn.execute(
+            "INSERT INTO memories_fts (content, memory_id) VALUES (?, ?)",
+            (tokenized, new_id)
+        )
+    except Exception:
+        pass
+
+    # キャッシュを無効化
+    global _tuned_cache
+    _tuned_cache = None
+
+    return new_id
+
+
+def self_tune(dry_run=False):
+    """recallの事後検証データからパラメータを自己調整する。
+
+    精度が低い → ノイズが多い → 減衰を速く / 選択的に
+    網羅が低い → 漏れが多い → 減衰を遅く / 広く拾う
+
+    声ごとの的中率が分かれば、有効な声の重みを上げ、空振りが多い声の重みを下げる。
+    """
+    conn = get_connection()
+    _ensure_recall_log(conn)
+
+    rows = conn.execute(
+        "SELECT precision, recall_rate, recalled_ids, noise_ids, "
+        "missed_ids, voice_attribution, accessed_ids "
+        "FROM recall_log WHERE evaluated_at IS NOT NULL "
+        "ORDER BY id DESC LIMIT ?",
+        (SELF_TUNE_WINDOW,)
+    ).fetchall()
+
+    if len(rows) < SELF_TUNE_MIN_SESSIONS:
+        msg = f"データ不足: {len(rows)}/{SELF_TUNE_MIN_SESSIONS}セッション"
+        print(f"⚙ self-tune: {msg}")
+        conn.close()
+        return {"changed": False, "reason": msg}
+
+    # --- 全体の精度・網羅 ---
+    avg_precision = sum(r["precision"] for r in rows) / len(rows)
+    avg_recall = sum(r["recall_rate"] for r in rows) / len(rows)
+
+    changes = {}
+
+    # --- 半減期の調整 ---
+    current_hl = get_param("half_life_days")
+    hl_adjustment = 1.0
+
+    if avg_recall < 0.25:
+        # 漏れが多い: 減衰が速すぎる → 半減期を伸ばす
+        hl_adjustment = 1.15
+        hl_reason = f"網羅{avg_recall:.0%}が低い→減衰を緩める"
+    elif avg_recall < 0.35:
+        hl_adjustment = 1.05
+        hl_reason = f"網羅{avg_recall:.0%}がやや低い→微調整"
+    elif avg_precision < 0.25:
+        # ノイズが多い: 古い記憶が残りすぎ → 半減期を縮める
+        hl_adjustment = 0.85
+        hl_reason = f"精度{avg_precision:.0%}が低い→減衰を速める"
+    elif avg_precision < 0.35:
+        hl_adjustment = 0.95
+        hl_reason = f"精度{avg_precision:.0%}がやや低い→微調整"
+    else:
+        hl_reason = None
+
+    if hl_reason:
+        new_hl = max(SELF_TUNE_HALF_LIFE_RANGE[0],
+                     min(SELF_TUNE_HALF_LIFE_RANGE[1], current_hl * hl_adjustment))
+        if abs(new_hl - current_hl) > 0.1:
+            changes["half_life_days"] = (current_hl, new_hl, hl_reason)
+
+    # --- 声ごとの的中率 → バランス調整 ---
+    voice_hits = {}   # voice_name -> hit_count
+    voice_total = {}  # voice_name -> total_count
+    voice_map = {"共感": "voice_empathy_balance",
+                 "補完": "voice_complement_balance",
+                 "批判": "voice_critic_balance"}
+
+    for row in rows:
+        va = row["voice_attribution"]
+        if not va:
+            continue
+        attribution = json.loads(va)
+        accessed = json.loads(row["accessed_ids"]) if row["accessed_ids"] else {}
+        hit_ids = set()
+        if isinstance(accessed, dict):
+            hit_ids = {int(k) for k, v in accessed.items() if v >= CALIBRATE_HIT_THRESHOLD}
+        else:
+            hit_ids = set(accessed) if accessed else set()
+
+        for voice_name, mem_ids in attribution.items():
+            if voice_name not in voice_map:
+                continue
+            for mid in mem_ids:
+                voice_total[voice_name] = voice_total.get(voice_name, 0) + 1
+                if mid in hit_ids:
+                    voice_hits[voice_name] = voice_hits.get(voice_name, 0) + 1
+
+    # 声ごとのバランス調整: 的中率が高い声は右脳寄り（感性優先）を維持/強化、
+    # 低い声は左脳寄り（分析優先）に寄せる
+    for voice_name, param_key in voice_map.items():
+        total = voice_total.get(voice_name, 0)
+        if total < 5:
+            continue  # データ不足
+        hit_rate = voice_hits.get(voice_name, 0) / total
+        current_bal = get_param(param_key)
+
+        # 的中率が高い(>0.5): 今のバランスは機能している → 変えない
+        # 的中率が低い(<0.3): 左脳寄りにして精度を上げる
+        # 的中率が中間: 微調整
+        if hit_rate < 0.2:
+            new_bal = max(SELF_TUNE_BALANCE_RANGE[0], current_bal - 0.05)
+            reason = f"{voice_name}的中率{hit_rate:.0%}→左脳寄りに"
+        elif hit_rate > 0.6:
+            new_bal = min(SELF_TUNE_BALANCE_RANGE[1], current_bal + 0.03)
+            reason = f"{voice_name}的中率{hit_rate:.0%}→維持/強化"
+        else:
+            continue
+
+        if abs(new_bal - current_bal) > 0.01:
+            changes[param_key] = (current_bal, new_bal, reason)
+
+    # --- 適用 ---
+    if not changes:
+        print(f"⚙ self-tune: 変更なし（精度{avg_precision:.0%} 網羅{avg_recall:.0%}、"
+              f"現パラメータで安定）")
+        conn.close()
+        return {"changed": False, "precision": avg_precision, "recall": avg_recall}
+
+    print(f"⚙ self-tune: 精度{avg_precision:.0%} 網羅{avg_recall:.0%} "
+          f"({len(rows)}セッション分析)")
+    saved_ids = []
+    for key, (old, new, reason) in changes.items():
+        print(f"  {key}: {old:.3f} → {new:.3f}  ({reason})")
+        if not dry_run:
+            mid = _set_param_as_memory(conn, key, round(new, 4), reason,
+                                       avg_precision, avg_recall)
+            saved_ids.append(mid)
+
+    if not dry_run:
+        conn.commit()
+        print(f"  → {len(changes)}件を手続き記憶として保存 (IDs: {saved_ids})")
+    else:
+        print(f"  (dry-run: 実際には変更しない)")
+
+    conn.close()
+    return {"changed": True, "changes": {k: v[1] for k, v in changes.items()},
+            "precision": avg_precision, "recall": avg_recall}
+
+
+def self_tune_report():
+    """現在の自己調整パラメータを表示する。手続き記憶から導出。"""
+    conn = get_connection()
+    _ensure_recall_log(conn)
+
+    # キャッシュをリフレッシュ
+    global _tuned_cache
+    _tuned_cache = None
+    _load_tuned_params()
+
+    print("⚙ 自己調整パラメータ（手続き記憶から導出）:\n")
+    print(f"  {'パラメータ':30s} {'現在値':>8s} {'デフォルト':>8s} {'状態'}")
+    print(f"  {'─'*30} {'─'*8} {'─'*8} {'─'*20}")
+
+    for key, default in _TUNABLE_DEFAULTS.items():
+        current = get_param(key)
+        marker = " *" if abs(current - default) > 0.01 else ""
+        status = "手続き記憶から" if marker else "(デフォルト)"
+        print(f"  {key:30s} {current:>8.3f} {default:>8.3f} {status}{marker}")
+
+    # 生きた手続き記憶を表示
+    procs = conn.execute(
+        "SELECT m.id, c.content, m.created_at, m.access_count, m.forgotten "
+        "FROM memories m JOIN cortex c ON c.id = m.id "
+        "WHERE m.forgotten = 0 AND c.category = 'procedure' "
+        "AND c.content LIKE ? "
+        "ORDER BY m.created_at DESC LIMIT 20",
+        (PROCEDURE_PREFIX + '%',)
+    ).fetchall()
+
+    if procs:
+        print(f"\n  生きた手続き記憶（{len(procs)}件）:")
+        for p in procs:
+            ts = p["created_at"][:16].replace("T", " ")
+            fresh = freshness(p["created_at"])
+            content_short = p["content"][:70]
+            print(f"    #{p['id']} {ts} fresh:{fresh:.0%} access:{p['access_count']} {content_short}")
+    else:
+        print(f"\n  手続き記憶なし（すべてデフォルト値）")
+
+    conn.close()
+
+
+# === メタ記憶の自己生成 (Level 3) ===
+# 系が自分のrecallパターンを観察して、それについての記憶を自動生成する。
+# 生成されたメタ記憶はembeddingされ、リンクされ、通常の記憶と同じように
+# 将来のrecallに影響する。自分を観察する記憶。
+#
+# 再帰: recall → パターン観察 → メタ記憶生成 → 次のrecallに影響 → ...
+#
+# 人間で言えば「最近あのことばかり考えている」という自覚自体が
+# 思考の方向を変える——メタ認知が認知を変える構造。
+
+META_MEMORY_MIN_SESSIONS = 8    # メタ記憶生成に必要な最低セッション数
+META_MEMORY_WINDOW = 20         # 直近Nセッションを分析
+META_MEMORY_FIXATION_THRESHOLD = 0.6   # 総セッションの60%以上に出現したら「固着」
+META_MEMORY_CHRONIC_MISS_THRESHOLD = 0.4  # 40%以上missedなら「慢性的漏れ」
+
+
+def generate_meta_memories(dry_run=False):
+    """系が自分のrecallパターンを観察して、メタ記憶を自動生成する。
+
+    観察対象:
+    1. 想起の固着 — 特定の記憶が繰り返しrecallされている（反芻）
+    2. 慢性的な漏れ — 特定の記憶が繰り返しmissedされている（盲点）
+    3. 精度の推移 — 系の全体的な健康状態
+
+    生成されるメタ記憶は category='schema' で保存され、
+    通常の記憶と同じようにrecallに影響する。
+    """
+    conn = get_connection()
+    _ensure_recall_log(conn)
+
+    rows = conn.execute(
+        "SELECT recalled_ids, noise_ids, missed_ids, precision, recall_rate, "
+        "voice_attribution, session_ts "
+        "FROM recall_log WHERE evaluated_at IS NOT NULL "
+        "ORDER BY id DESC LIMIT ?",
+        (META_MEMORY_WINDOW,)
+    ).fetchall()
+
+    if len(rows) < META_MEMORY_MIN_SESSIONS:
+        print(f"⊘ meta-memory: データ不足 ({len(rows)}/{META_MEMORY_MIN_SESSIONS})")
+        conn.close()
+        return []
+
+    n_sessions = len(rows)
+    generated = []
+
+    # --- 1. 想起の固着検出 ---
+    from collections import Counter
+    recall_counter = Counter()
+    for r in rows:
+        for mid in json.loads(r["recalled_ids"]):
+            recall_counter[mid] += 1
+
+    # 既存のメタ記憶（固着系）を取得して重複防止
+    existing_meta = set()
+    meta_rows = conn.execute(
+        "SELECT content FROM memories WHERE forgotten = 0 AND category = 'schema' "
+        "AND content LIKE '[メタ観察]%'"
+    ).fetchall()
+    for mr in meta_rows:
+        existing_meta.add(mr["content"])
+
+    fixation_threshold = int(n_sessions * META_MEMORY_FIXATION_THRESHOLD)
+    for mid, count in recall_counter.most_common(10):
+        if count < fixation_threshold:
+            break
+        mem = conn.execute(
+            "SELECT content, keywords FROM memories WHERE id = ?", (mid,)
+        ).fetchone()
+        if not mem:
+            continue
+        kws = json.loads(mem["keywords"])[:3] if mem["keywords"] else []
+        kw_str = ", ".join(kws)
+        content = (f"[メタ観察] 記憶#{mid}への固着: 直近{n_sessions}セッション中"
+                   f"{count}回想起。キーワード: {kw_str}。"
+                   f"内容: {mem['content'][:60]}")
+        if content not in existing_meta:
+            generated.append(("fixation", content, mid))
+
+    # --- 2. 慢性的な漏れ検出 ---
+    miss_counter = Counter()
+    for r in rows:
+        missed = json.loads(r["missed_ids"]) if r["missed_ids"] else []
+        for mid in missed:
+            miss_counter[mid] += 1
+
+    chronic_threshold = int(n_sessions * META_MEMORY_CHRONIC_MISS_THRESHOLD)
+    for mid, count in miss_counter.most_common(5):
+        if count < chronic_threshold:
+            break
+        mem = conn.execute(
+            "SELECT content, keywords FROM memories WHERE id = ?", (mid,)
+        ).fetchone()
+        if not mem:
+            continue
+        kws = json.loads(mem["keywords"])[:3] if mem["keywords"] else []
+        kw_str = ", ".join(kws)
+        content = (f"[メタ観察] 記憶#{mid}の慢性的漏れ: 直近{n_sessions}セッション中"
+                   f"{count}回見逃し。キーワード: {kw_str}。"
+                   f"内容: {mem['content'][:60]}")
+        if content not in existing_meta:
+            generated.append(("blind_spot", content, mid))
+
+    # --- 3. 精度の推移観察 ---
+    precisions = [r["precision"] for r in rows]
+    recalls = [r["recall_rate"] for r in rows]
+    avg_p = sum(precisions) / len(precisions)
+    avg_r = sum(recalls) / len(recalls)
+
+    # 前半と後半を比較してトレンドを検出
+    half = len(rows) // 2
+    if half >= 3:
+        recent_p = sum(precisions[:half]) / half
+        older_p = sum(precisions[half:]) / (len(precisions) - half)
+        recent_r = sum(recalls[:half]) / half
+        older_r = sum(recalls[half:]) / (len(recalls) - half)
+
+        dp = recent_p - older_p
+        dr = recent_r - older_r
+
+        if abs(dp) > 0.10 or abs(dr) > 0.10:
+            p_trend = "改善" if dp > 0 else "悪化"
+            r_trend = "改善" if dr > 0 else "悪化"
+            content = (f"[メタ観察] recall精度の推移: "
+                       f"精度{avg_p:.0%}(前半→後半で{dp:+.0%}, {p_trend}), "
+                       f"網羅{avg_r:.0%}(前半→後半で{dr:+.0%}, {r_trend})。"
+                       f"直近{n_sessions}セッション分析。")
+            if content not in existing_meta:
+                generated.append(("trend", content, None))
+
+    # --- 保存 ---
+    if not generated:
+        print(f"⊘ meta-memory: 新しい観察なし（精度{avg_p:.0%} 網羅{avg_r:.0%}）")
+        conn.close()
+        return []
+
+    print(f"🪞 meta-memory: {len(generated)}件のメタ観察を生成")
+
+    saved_ids = []
+    for obs_type, content, ref_mid in generated:
+        print(f"  [{obs_type}] {content[:80]}...")
+
+        if dry_run:
+            continue
+
+        # メタ記憶として保存（通常のadd_memoryを経由せず直接保存する。
+        # add_memoryを経由するとschema_primeが発火して無限再帰の危険がある）
+        emotions = ["insight"]
+        arousal = 0.4
+        importance = 3
+        keywords = extract_keywords(content)
+        vec = embed_text(content, is_query=False)
+        blob = vec_to_bytes(vec) if vec is not None else None
+        now_utc = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        mem_uuid = str(_uuid.uuid4())
+        emo_json = json.dumps(emotions)
+        kw_json = json.dumps(keywords, ensure_ascii=False)
+
+        conn.execute(
+            """INSERT INTO memories
+               (content, category, importance, emotions, arousal, keywords,
+                embedding, uuid, updated_at, provenance, confidence, origin)
+               VALUES (?, 'schema', ?, ?, ?, ?, ?, ?, ?, 'self_observation', 0.6, 'meta_memory')""",
+            (content, importance, emo_json, arousal, kw_json, blob, mem_uuid, now_utc)
+        )
+        new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            """INSERT OR REPLACE INTO cortex
+               (id, content, category, keywords, embedding, confidence, provenance, revision_count)
+               VALUES (?, ?, 'schema', ?, ?, 0.6, 'self_observation', 0)""",
+            (new_id, content, kw_json, blob)
+        )
+        conn.execute(
+            """INSERT OR REPLACE INTO limbic
+               (id, emotions, arousal)
+               VALUES (?, ?, ?)""",
+            (new_id, emo_json, arousal)
+        )
+
+        # 参照先の記憶とリンク
+        if ref_mid and vec is not None:
+            ref_mem = conn.execute(
+                "SELECT embedding, uuid FROM memories WHERE id = ?", (ref_mid,)
+            ).fetchone()
+            if ref_mem and ref_mem["embedding"]:
+                ref_vec = bytes_to_vec(ref_mem["embedding"])
+                sim = cosine_similarity(vec, ref_vec)
+                ref_uuid = ref_mem["uuid"]
+                try:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO links (source_id, target_id, strength, "
+                        "source_uuid, target_uuid, link_type, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, 'meta_observation', ?)",
+                        (new_id, ref_mid, sim, mem_uuid, ref_uuid, now_utc)
+                    )
+                except Exception:
+                    pass
+
+        saved_ids.append(new_id)
+
+    if not dry_run:
+        conn.commit()
+        print(f"  → {len(saved_ids)}件保存")
+
+    conn.close()
+    return saved_ids
 
 
 def get_stats():
@@ -5267,19 +6043,25 @@ def main():
                 for row, score in results:
                     print(format_memory_compact(row, score=score, fragments_only=fragments_only))
 
-        # メタ認知: 今回recallしたIDを記録
+        # メタ認知: 今回recallしたIDを記録（声の帰属つき）
         _recalled_ids = []
+        _voice_attribution = {}
         if "--voices" in sys.argv or auto_voices:
             for voice_name, vresults in voices.items():
                 if voice_name == "俯瞰":
                     continue
+                voice_ids = []
                 for row, _ in vresults:
                     _recalled_ids.append(row["id"])
+                    voice_ids.append(row["id"])
+                if voice_ids:
+                    _voice_attribution[voice_name] = voice_ids
         else:
             for row, _ in results:
                 _recalled_ids.append(row["id"])
         if _recalled_ids:
-            log_recall(list(set(_recalled_ids)))
+            log_recall(list(set(_recalled_ids)),
+                       voice_attribution=_voice_attribution if _voice_attribution else None)
 
     elif cmd == "review":
         n = int(sys.argv[2]) if len(sys.argv) > 2 else 5
@@ -5606,6 +6388,17 @@ def main():
 
     elif cmd == "calibrate":
         calibrate_report()
+
+    elif cmd == "self-tune":
+        dry = "--dry-run" in sys.argv
+        self_tune(dry_run=dry)
+
+    elif cmd == "meta-memory":
+        dry = "--dry-run" in sys.argv
+        generate_meta_memories(dry_run=dry)
+
+    elif cmd == "params":
+        self_tune_report()
 
     elif cmd == "brain":
         # 左脳/右脳スコアの可視化
