@@ -25,7 +25,7 @@ SQLite内でベクトル近傍探索が完結する。
 
 #### Design notes
 - vec0はJOIN/WHERE制約をサポートしないため、多めにk件取得してからPython側でforgotten等をフィルタする2段階方式
-- 6000件規模では速度差は小さいが、記憶が万単位に成長したときのスケーラビリティを確保
+- 数千件規模では速度差は小さいが、記憶が万単位に成長したときのスケーラビリティを確保
 - [pulp](https://github.com/Flowers-of-Romance/pulp)と同じスタック（sqlite-vec + multilingual-e5-small + FTS5）
 
 ## [v24.0] - 2026-04-15
