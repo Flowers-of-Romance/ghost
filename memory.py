@@ -610,6 +610,14 @@ def get_connection():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    # sqlite-vec を読み込み
+    try:
+        import sqlite_vec
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+    except ImportError:
+        pass  # sqlite-vec 未インストール時はフォールバック
     return conn
 
 
@@ -1090,9 +1098,109 @@ def init_db():
         )
     """)
 
+    # === sqlite-vec: ベクトルインデックス ===
+    try:
+        conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec USING vec0(
+                memory_id INTEGER PRIMARY KEY,
+                embedding FLOAT[384]
+            )
+        """)
+        # 既存embeddingをマイグレーション（まだ入っていないもの）
+        vec_count = conn.execute("SELECT COUNT(*) FROM memories_vec").fetchone()[0]
+        mem_count = conn.execute("SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL").fetchone()[0]
+        if vec_count < mem_count:
+            rows = conn.execute(
+                "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL AND id NOT IN (SELECT memory_id FROM memories_vec)"
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    "INSERT INTO memories_vec (memory_id, embedding) VALUES (?, ?)",
+                    (row[0], row[1])
+                )
+            if rows:
+                print(f"  ✓ {len(rows)}件のembeddingをmemories_vecに移行")
+    except Exception as e:
+        print(f"  (sqlite-vec初期化をスキップ: {e})")
+
     conn.commit()
     conn.close()
     print(f"✓ memory.db を初期化しました: {DB_PATH}")
+
+
+def _has_vec_table(conn):
+    """memories_vec仮想テーブルが存在するかチェック。"""
+    try:
+        conn.execute("SELECT COUNT(*) FROM memories_vec")
+        return True
+    except Exception:
+        return False
+
+
+def vec_search(conn, query_vec, k=50, forgotten=None):
+    """sqlite-vecを使ったベクトル近傍検索。
+
+    Args:
+        forgotten: None=全件, False=forgotten=0のみ, True=forgotten=1のみ
+    Returns: [(memory_id, distance, similarity), ...]
+    vec0はL2距離を返す。normalizedベクトルなので cosine_sim = 1 - dist²/2。
+    """
+    if query_vec is None:
+        return []
+    if not _has_vec_table(conn):
+        return []
+    query_blob = vec_to_bytes(query_vec)
+    # vec0はJOIN/WHERE制約をサポートしないので、多めに取ってPython側でフィルタ
+    # forgotten=0は全体の約60%なので、必要数の3倍を取る（最低200件）
+    fetch_k = max(k * 3, 200) if forgotten is not None else k
+    rows = conn.execute(
+        "SELECT memory_id, distance FROM memories_vec WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+        (query_blob, fetch_k)
+    ).fetchall()
+    # forgottenフィルタが必要な場合はmemoriesテーブルで確認
+    results = []
+    if forgotten is not None:
+        forgotten_val = 1 if forgotten else 0
+        for row in rows:
+            mid = row[0]
+            m = conn.execute("SELECT forgotten FROM memories WHERE id = ?", (mid,)).fetchone()
+            if m and m[0] == forgotten_val:
+                dist = row[1]
+                sim = 1.0 - (dist * dist) / 2.0
+                results.append((mid, dist, sim))
+                if len(results) >= k:
+                    break
+    else:
+        for row in rows:
+            dist = row[1]
+            sim = 1.0 - (dist * dist) / 2.0
+            results.append((row[0], dist, sim))
+    return results
+
+
+def _sync_vec_insert(conn, memory_id, embedding_blob):
+    """memories_vecにembeddingを同期挿入する。"""
+    if embedding_blob is None:
+        return
+    if not _has_vec_table(conn):
+        return
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO memories_vec (memory_id, embedding) VALUES (?, ?)",
+            (memory_id, embedding_blob)
+        )
+    except Exception:
+        pass
+
+
+def _sync_vec_delete(conn, memory_id):
+    """memories_vecからembeddingを削除する。"""
+    if not _has_vec_table(conn):
+        return
+    try:
+        conn.execute("DELETE FROM memories_vec WHERE memory_id = ?", (memory_id,))
+    except Exception:
+        pass
 
 
 def _rebuild_fts_index(conn):
@@ -1325,6 +1433,9 @@ def consolidate_memories(dry_run=False):
                  json.dumps({"who": _detect_who(), "relationship": "primary"}))
             )
 
+            # sqlite-vecに追加
+            _sync_vec_insert(conn, new_id, blob)
+
             # バージョン保存してから元の記憶を忘却
             _snapshot_version(conn, a["id"], "consolidation", superseded_by=new_id)
             _snapshot_version(conn, b["id"], "consolidation", superseded_by=new_id)
@@ -1527,6 +1638,8 @@ def build_schemas(dry_run=False):
                 (schema_id, emo_json, max_arousal,
                  json.dumps({"who": _detect_who(), "relationship": "primary"}))
             )
+            # sqlite-vecに追加
+            _sync_vec_insert(conn, schema_id, blob)
 
         used_ids |= clique
         schema_count += 1
@@ -1658,6 +1771,7 @@ def schema_evolve(conn, schema_id, new_memory_id, new_vec):
         new_blob = vec_to_bytes(new_s_vec)
         conn.execute("UPDATE memories SET embedding = ? WHERE id = ?", (new_blob, schema_id))
         conn.execute("UPDATE cortex SET embedding = ? WHERE id = ?", (new_blob, schema_id))
+        _sync_vec_insert(conn, schema_id, new_blob)
 
     # 活性化
     now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -1881,6 +1995,9 @@ def correct_memory(memory_id, new_content):
                      (tokenized, memory_id))
     except Exception:
         pass
+
+    # sqlite-vecインデックスを更新
+    _sync_vec_insert(conn, memory_id, blob)
 
     conn.commit()
     rev = conn.execute("SELECT revision_count FROM memories WHERE id = ?", (memory_id,)).fetchone()
@@ -2310,6 +2427,10 @@ def add_memory(content, category="fact", source=None, confidence=None, provenanc
     except Exception:
         pass  # FTS5なしでも動作
 
+    # sqlite-vecインデックスに追加
+    _sync_vec_insert(conn, new_id, blob)
+    conn.commit()
+
     # 連想リンク（閾値を0.82に引き上げ）
     link_count = 0
     if vec is not None:
@@ -2613,25 +2734,44 @@ def search_memories(query, limit=10, use_like=False, fuzzy=False):
             conn.close()
             return scored_results
 
-        all_rows = conn.execute(
-            "SELECT * FROM memories WHERE forgotten = 0 AND embedding IS NOT NULL"
-        ).fetchall()
+        # sqlite-vecで候補を取得し、左脳/右脳スコアリング
+        vec_candidates = vec_search(conn, query_vec, k=max(limit * 5, 100), forgotten=False)
 
         scored = []
-        for row in all_rows:
-            mem_vec = bytes_to_vec(row["embedding"])
-            sim = cosine_similarity(query_vec, mem_vec)
+        if vec_candidates:
+            candidate_ids = [mid for mid, _, _ in vec_candidates]
+            sim_map = {mid: sim for mid, _, sim in vec_candidates}
+            # 候補のrowを一括取得
+            placeholders = ",".join("?" * len(candidate_ids))
+            rows_by_id = {}
+            for row in conn.execute(
+                f"SELECT * FROM memories WHERE id IN ({placeholders})", candidate_ids
+            ).fetchall():
+                rows_by_id[row["id"]] = row
 
-            # 左脳: 意味的因子（simを含む）+ 時間帯ブースト
-            temporal = _temporal_boost(row)
-            L = _left_score(row, sim=sim) * temporal
-
-            # 右脳: 情動的因子
-            R = _right_score(conn, row)
-
-            # 脳梁で統合
-            score = corpus_callosum(L, R, balance=0.5)
-            scored.append((row, score, sim))
+            for mid in candidate_ids:
+                row = rows_by_id.get(mid)
+                if not row:
+                    continue
+                sim = sim_map[mid]
+                temporal = _temporal_boost(row)
+                L = _left_score(row, sim=sim) * temporal
+                R = _right_score(conn, row)
+                score = corpus_callosum(L, R, balance=0.5)
+                scored.append((row, score, sim))
+        else:
+            # sqlite-vecが使えない場合のフォールバック（旧方式）
+            all_rows = conn.execute(
+                "SELECT * FROM memories WHERE forgotten = 0 AND embedding IS NOT NULL"
+            ).fetchall()
+            for row in all_rows:
+                mem_vec = bytes_to_vec(row["embedding"])
+                sim = cosine_similarity(query_vec, mem_vec)
+                temporal = _temporal_boost(row)
+                L = _left_score(row, sim=sim) * temporal
+                R = _right_score(conn, row)
+                score = corpus_callosum(L, R, balance=0.5)
+                scored.append((row, score, sim))
 
         scored.sort(key=lambda x: x[1], reverse=True)
         scored_results = [(s[0], s[2]) for s in scored[:limit]]
@@ -2648,13 +2788,12 @@ def search_memories(query, limit=10, use_like=False, fuzzy=False):
 
         # 不随意記憶（フラッシュバック）+ 意図的復活
         if query_vec is not None:
-            forgotten_rows = conn.execute(
-                "SELECT * FROM memories WHERE forgotten = 1 AND embedding IS NOT NULL"
-            ).fetchall()
+            forgotten_candidates = vec_search(conn, query_vec, k=50, forgotten=True)
             top_sim = scored[0][2] if scored else 0.0
-            for frow in forgotten_rows:
-                fvec = bytes_to_vec(frow["embedding"])
-                fsim = cosine_similarity(query_vec, fvec)
+            for fmid, _, fsim in forgotten_candidates:
+                frow = conn.execute("SELECT * FROM memories WHERE id = ?", (fmid,)).fetchone()
+                if not frow:
+                    continue
 
                 # 意図的復活: 検索結果が乏しいとき、非常に高い類似度で復活
                 if top_sim < 0.7 and fsim > 0.92:
@@ -2666,7 +2805,6 @@ def search_memories(query, limit=10, use_like=False, fuzzy=False):
                     scored_results.append((frow, fsim))
 
                 # 不随意記憶: 確率的フラッシュバック
-                # 元の情動が強い記憶ほど、ふとした手がかりで蘇りやすい
                 elif fsim > FLASHBACK_SIM_THRESHOLD:
                     prob = FLASHBACK_BASE_PROB * frow["arousal"] * (fsim - FLASHBACK_SIM_THRESHOLD)
                     if random.random() < prob:
@@ -2776,7 +2914,7 @@ def delusion_search(query=None, limit=50, date=None, after=None, before=None,
         conn.close()
         return []
 
-    # --- ベクトル検索 (純粋cosine similarity) ---
+    # --- ベクトル検索 (sqlite-vec + FTS5ハイブリッド) ---
     results = []
 
     # FTS5検索を先に試す（テキスト完全一致に強い）
@@ -2799,28 +2937,41 @@ def delusion_search(query=None, limit=50, date=None, after=None, before=None,
     query_vec = embed_text(query, is_query=True)
 
     if query_vec is not None:
-        # forgotten=0 のフィルタを外す（忘却された記憶も検索対象）
-        all_rows = conn.execute(
-            f"SELECT * FROM memories WHERE embedding IS NOT NULL{date_clause}",
-            date_params
-        ).fetchall()
+        # sqlite-vecで候補取得（forgotten含む全件から）
+        vec_candidates = vec_search(conn, query_vec, k=max(limit * 5, 200), forgotten=None)
 
-        scored = []
-        for row in all_rows:
-            mem_vec = bytes_to_vec(row["embedding"])
-            sim = cosine_similarity(query_vec, mem_vec)
-            # FTS5でもヒットしていればボーナス
-            fts_bonus = 0.05 if row["id"] in fts_ids else 0.0
-            scored.append((row, sim + fts_bonus, sim))
+        if vec_candidates:
+            # 日付フィルタ + FTSボーナス
+            scored = []
+            for mid, _, sim in vec_candidates:
+                row = conn.execute(
+                    f"SELECT * FROM memories WHERE id = ?{date_clause}",
+                    (mid, *date_params)
+                ).fetchone()
+                if not row:
+                    continue
+                fts_bonus = 0.05 if row["id"] in fts_ids else 0.0
+                scored.append((row, sim + fts_bonus, sim))
+        else:
+            # フォールバック: 旧方式
+            all_rows = conn.execute(
+                f"SELECT * FROM memories WHERE embedding IS NOT NULL{date_clause}",
+                date_params
+            ).fetchall()
+            scored = []
+            for row in all_rows:
+                mem_vec = bytes_to_vec(row["embedding"])
+                sim = cosine_similarity(query_vec, mem_vec)
+                fts_bonus = 0.05 if row["id"] in fts_ids else 0.0
+                scored.append((row, sim + fts_bonus, sim))
 
         scored.sort(key=lambda x: x[1], reverse=True)
 
         # 馴化（habituation）: 類似内容の繰り返しを減衰させる
-        # 既に選ばれた記憶と類似度が高い後続記憶のスコアを下げる
         habituated = []
         selected_vecs = []
-        HABITUATION_THRESHOLD = 0.92  # この類似度以上で馴化発動
-        HABITUATION_DECAY = 0.7       # 減衰係数（スコアにかける）
+        HABITUATION_THRESHOLD = 0.92
+        HABITUATION_DECAY = 0.7
         for row, boosted_sim, raw_sim in scored:
             mem_vec = bytes_to_vec(row["embedding"])
             decay = 1.0
@@ -3396,8 +3547,10 @@ def mutate_metadata(conn):
                     if new_norm > 0:
                         new_vec = new_vec / new_norm
                         shift = float(1.0 - np.dot(current_vec, new_vec))
+                        new_blob = vec_to_bytes(new_vec)
                         conn.execute("UPDATE memories SET embedding = ? WHERE id = ?",
-                                     (vec_to_bytes(new_vec), mid))
+                                     (new_blob, mid))
+                        _sync_vec_insert(conn, mid, new_blob)
                         neighbor_ids = [str(nid) for nid, _ in my_neighbors[:5]]
                         conn.execute(
                             "INSERT INTO mutation_log (memory_id, field, old_value, new_value, reason) "
@@ -4209,21 +4362,37 @@ def resurrect_memories(query):
             print(f"  🔮 復活: #{row['id']} {row['content'][:60]}")
     else:
         query_vec = embed_text(query, is_query=True)
-        forgotten_rows = conn.execute(
-            "SELECT * FROM memories WHERE forgotten = 1 AND embedding IS NOT NULL"
-        ).fetchall()
+        # sqlite-vecで忘却記憶を検索
+        forgotten_candidates = vec_search(conn, query_vec, k=50, forgotten=True)
 
         resurrected = []
-        for row in forgotten_rows:
-            mem_vec = bytes_to_vec(row["embedding"])
-            sim = cosine_similarity(query_vec, mem_vec)
-            if sim > 0.85:
-                conn.execute(
-                    "UPDATE memories SET forgotten = 0, arousal = 0.3 WHERE id = ?",
-                    (row["id"],)
-                )
-                resurrected.append(row)
-                print(f"  🔮 復活: #{row['id']} {row['content'][:60]} (sim:{sim:.3f})")
+        if forgotten_candidates:
+            for fmid, _, sim in forgotten_candidates:
+                if sim > 0.85:
+                    row = conn.execute("SELECT * FROM memories WHERE id = ?", (fmid,)).fetchone()
+                    if not row:
+                        continue
+                    conn.execute(
+                        "UPDATE memories SET forgotten = 0, arousal = 0.3 WHERE id = ?",
+                        (row["id"],)
+                    )
+                    resurrected.append(row)
+                    print(f"  🔮 復活: #{row['id']} {row['content'][:60]} (sim:{sim:.3f})")
+        else:
+            # フォールバック
+            forgotten_rows = conn.execute(
+                "SELECT * FROM memories WHERE forgotten = 1 AND embedding IS NOT NULL"
+            ).fetchall()
+            for row in forgotten_rows:
+                mem_vec = bytes_to_vec(row["embedding"])
+                sim = cosine_similarity(query_vec, mem_vec)
+                if sim > 0.85:
+                    conn.execute(
+                        "UPDATE memories SET forgotten = 0, arousal = 0.3 WHERE id = ?",
+                        (row["id"],)
+                    )
+                    resurrected.append(row)
+                    print(f"  🔮 復活: #{row['id']} {row['content'][:60]} (sim:{sim:.3f})")
 
     conn.commit()
     conn.close()
@@ -4375,16 +4544,26 @@ def _evaluate_single_recall(conn, row):
     # 漏れ: recallが出さなかったが会話と高類似度の記憶
     missed = []
     recalled_set = set(recalled_ids)
-    candidates = conn.execute(
-        "SELECT id, embedding FROM memories WHERE forgotten = 0 AND embedding IS NOT NULL"
-    ).fetchall()
-    for c in candidates:
-        if c["id"] in recalled_set:
-            continue
-        c_vec = bytes_to_vec(c["embedding"])
-        sim = cosine_similarity(conv_vec, c_vec)
-        if sim >= CALIBRATE_MISS_THRESHOLD:
-            missed.append((c["id"], sim))
+    # sqlite-vecで会話ベクトルに近い記憶を取得
+    miss_candidates = vec_search(conn, conv_vec, k=100, forgotten=False)
+    if miss_candidates:
+        for mid, _, sim in miss_candidates:
+            if mid in recalled_set:
+                continue
+            if sim >= CALIBRATE_MISS_THRESHOLD:
+                missed.append((mid, sim))
+    else:
+        # フォールバック
+        candidates = conn.execute(
+            "SELECT id, embedding FROM memories WHERE forgotten = 0 AND embedding IS NOT NULL"
+        ).fetchall()
+        for c in candidates:
+            if c["id"] in recalled_set:
+                continue
+            c_vec = bytes_to_vec(c["embedding"])
+            sim = cosine_similarity(conv_vec, c_vec)
+            if sim >= CALIBRATE_MISS_THRESHOLD:
+                missed.append((c["id"], sim))
 
     # 類似度上位のみ漏れとして報告（最大10件）
     missed.sort(key=lambda x: -x[1])
@@ -4539,6 +4718,8 @@ def _set_param_as_memory(conn, key, new_value, reason, avg_precision=None, avg_r
            (id, emotions, arousal) VALUES (?, ?, ?)""",
         (new_id, emo_json, arousal)
     )
+    # sqlite-vecに追加
+    _sync_vec_insert(conn, new_id, blob)
 
     # 同じパラメータの古い手続き記憶とリンク（系譜を残す）
     if vec is not None:
@@ -5067,6 +5248,8 @@ def generate_meta_memories(dry_run=False):
                VALUES (?, ?, ?)""",
             (new_id, emo_json, arousal)
         )
+        # sqlite-vecに追加
+        _sync_vec_insert(conn, new_id, blob)
 
         # 参照先の記憶とリンク
         if ref_mid and vec is not None:
@@ -5611,6 +5794,8 @@ def sync_import(data):
                      mem["temporal_context"], mem["spatial_context"],
                      mem.get("relational_context"))
                 )
+                # sqlite-vecに追加
+                _sync_vec_insert(conn, new_id, blob)
                 stats["new"] += 1
             else:
                 # 既存: マージ

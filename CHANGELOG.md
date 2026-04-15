@@ -1,5 +1,33 @@
 # Changelog
 
+## [v25.0] - 2026-04-15
+
+### sqlite-vec — ベクトル検索のインデックス化
+
+全件スキャン+Pythonループだったベクトル検索を、sqlite-vecの仮想テーブルに置き換えた。
+SQLite内でベクトル近傍探索が完結する。
+
+#### 変更点
+- `pip install sqlite-vec` を依存に追加
+- `get_connection()`: sqlite-vecの拡張を自動ロード
+- `init_db()`: `memories_vec` 仮想テーブル (vec0) を作成。既存embeddingを自動マイグレーション
+- `vec_search()`: MATCH一発でk近傍探索。forgotten/日付のフィルタ対応
+- `_sync_vec_insert()` / `_sync_vec_delete()`: INSERT/UPDATE時にmemories_vecを自動同期
+- **search_memories** (recall本体): 全件スキャンをvec_searchに置換
+- **delusion_search**: 同上。FTS5ボーナス・馴化フィルタはそのまま
+- **resurrect_memories**: 忘却記憶の全件スキャンをvec_searchに置換
+- **calibrate**: 漏れ検出の全件スキャンをvec_searchに置換
+- 全記憶追加箇所（add_memory, consolidate, schema, self-tune, sync, mutate等）にvec同期を追加
+
+#### フォールバック
+- sqlite-vec未インストール時は旧方式（全件スキャン+cosine_similarity）で動作
+- vec0仮想テーブルが存在しない場合も旧方式にフォールバック
+
+#### Design notes
+- vec0はJOIN/WHERE制約をサポートしないため、多めにk件取得してからPython側でforgotten等をフィルタする2段階方式
+- 6000件規模では速度差は小さいが、記憶が万単位に成長したときのスケーラビリティを確保
+- [pulp](https://github.com/Flowers-of-Romance/pulp)と同じスタック（sqlite-vec + multilingual-e5-small + FTS5）
+
 ## [v24.0] - 2026-04-15
 
 ### 再帰的自己調整 — ルールと記憶の区別を溶かす
