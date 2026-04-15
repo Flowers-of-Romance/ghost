@@ -98,10 +98,10 @@ Lispのコード=データに倣い、ルールと記憶が同じ基盤の上に
 - **検索結果の馴化**: delusion検索で類似内容の繰り返しを自動減衰。類似度0.92以上の既出記憶があれば後続のスコアを0.7倍に減衰
 
 ### Source Monitoring（ソースモニタリング）
-- **`origin` カラム追加**: memoriesテーブルに情報の出自を記録。`"J"`, `"assistant:opus"`, `"assistant:gemini"`, `"system:sleep"` 等
+- **`origin` カラム追加**: memoriesテーブルに情報の出自を記録。`"user"`, `"assistant:opus"`, `"assistant:gemini"`, `"system:sleep"` 等
 - Extract.pyが抽出する記憶に `GHOST_WHO` 環境変数（デフォルト `"user"`）から自動付与
 - sleep処理で生成される記憶に `origin: "system:sleep"` を付与
-- delusionの出力に `[origin:J]` 等を表示
+- delusionの出力に `[origin:user]` 等を表示
 - CLIの `add` コマンドに `--origin` フラグ追加
 
 ### Design notes
