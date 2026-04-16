@@ -144,6 +144,16 @@ MUTATION_MIN_LINKS_KW = 2           # キーワード吸収に必要な最低リ
 MUTATION_MIN_LINKS_EMOTION = 5      # 情動ドリフトに必要な最低リンク数
 MUTATION_COOLDOWN_HOURS = 4         # 連続変異防止のクールダウン時間
 
+# --- 再固定化 (reconsolidation) ---
+# 想起はread-write操作。人間の脳では想起のたびに記憶が再固定化される。
+# embeddingが会話文脈方向に微小ドリフトし、文脈に適応していく。
+RECONSOLIDATION_EMBED_ALPHA = 0.02           # recall時のembeddingドリフト率
+RECONSOLIDATION_EMBED_ALPHA_FLASHBULB = 0.01 # flashbulb記憶のドリフト率（抵抗する）
+RECALL_HABITUATION_WINDOW_MINUTES = 30       # セッション内馴化の時間窓
+RECALL_HABITUATION_DECAY = 0.6               # 馴化によるスコア減衰係数
+CONTEXT_RELEVANCE_THRESHOLD = 0.3            # 文脈関連度の閾値
+CONTEXT_RELEVANCE_PENALTY = 0.5              # 文脈無関連時のペナルティ係数
+
 # --- 自己調整パラメータ (ホモイコニック版) ---
 # ルールは記憶として保存される。meta_paramsテーブルではなく、
 # category='procedure'の記憶がパラメータの値を決める。
@@ -3801,6 +3811,96 @@ def _get_session_gap(conn):
     return gap_hours
 
 
+def _get_recent_context_vec(conn):
+    """直近の会話文脈からembeddingベクトルを計算する。
+    evaluate_last_recallと同じパターン。文脈がなければNoneを返す。"""
+    now = datetime.now(timezone.utc)
+    window = now - timedelta(minutes=RECALL_HABITUATION_WINDOW_MINUTES)
+    window_str = window.strftime('%Y-%m-%dT%H:%M:%SZ')
+    try:
+        turns = conn.execute(
+            "SELECT content FROM raw_turns WHERE timestamp > ? ORDER BY timestamp DESC LIMIT 20",
+            (window_str,)
+        ).fetchall()
+    except Exception:
+        return None
+    if not turns:
+        return None
+    conversation_text = "\n".join(t["content"] for t in turns if t["content"])
+    if len(conversation_text.strip()) < 20:
+        return None
+    return embed_text(conversation_text[:2000], is_query=True)
+
+
+def _get_session_recalled_ids(conn):
+    """直近セッション（RECALL_HABITUATION_WINDOW_MINUTES以内）で既に想起されたIDのセットを返す。"""
+    now = datetime.now(timezone.utc)
+    window = now - timedelta(minutes=RECALL_HABITUATION_WINDOW_MINUTES)
+    window_str = window.strftime('%Y-%m-%dT%H:%M:%SZ')
+    try:
+        rows = conn.execute(
+            "SELECT recalled_ids FROM recall_log WHERE session_ts > ?",
+            (window_str,)
+        ).fetchall()
+    except Exception:
+        return set()
+    ids = set()
+    for r in rows:
+        for mid in json.loads(r["recalled_ids"]):
+            ids.add(mid)
+    return ids
+
+
+def _apply_habituation_and_context(scored_list, conn, context_vec, habituated_ids):
+    """馴化と文脈フィルタを適用する。scored_listは[(row, score), ...]。
+    - 馴化: 直近セッションで既に想起された記憶のスコアを減衰
+    - 文脈フィルタ: 会話文脈と無関係な記憶を抑制（flashbulb除外）
+    返り値: 同じ形式の新リスト（元リストは変更しない）。"""
+    import numpy as np
+    result = []
+    for row, score in scored_list:
+        s = score
+        # セッション内馴化: 同じ記憶が短期間に繰り返し出るのを抑制
+        if row["id"] in habituated_ids:
+            s *= RECALL_HABITUATION_DECAY
+        # 文脈関連度フィルタ: flashbulb記憶は除外
+        if context_vec is not None:
+            is_flashbulb = row["flashbulb"] if "flashbulb" in row.keys() else False
+            if not is_flashbulb and row["embedding"]:
+                mem_vec = bytes_to_vec(row["embedding"])
+                ctx_sim = cosine_similarity(context_vec, mem_vec)
+                if ctx_sim < CONTEXT_RELEVANCE_THRESHOLD:
+                    s *= CONTEXT_RELEVANCE_PENALTY
+        result.append((row, s))
+    return result
+
+
+def _reconsolidate_embeddings(conn, recalled_ids, context_vec):
+    """再固定化: 想起された記憶のembeddingを文脈方向に微小ドリフトさせる。
+    想起はread-write操作。発火そのものが記憶を変える。"""
+    if context_vec is None:
+        return
+    import numpy as np
+    for mid in recalled_ids:
+        row = conn.execute(
+            "SELECT embedding, flashbulb FROM memories WHERE id = ?", (mid,)
+        ).fetchone()
+        if not row or not row["embedding"]:
+            continue
+        mem_vec = bytes_to_vec(row["embedding"])
+        is_flashbulb = row["flashbulb"] if "flashbulb" in row.keys() else False
+        alpha = RECONSOLIDATION_EMBED_ALPHA_FLASHBULB if is_flashbulb else RECONSOLIDATION_EMBED_ALPHA
+        # ドリフト: 文脈方向に微小移動
+        new_vec = (1.0 - alpha) * mem_vec + alpha * context_vec
+        # 正規化（e5-smallは正規化済みベクトル）
+        norm = np.linalg.norm(new_vec)
+        if norm > 0:
+            new_vec = new_vec / norm
+        new_blob = vec_to_bytes(new_vec)
+        conn.execute("UPDATE memories SET embedding = ? WHERE id = ?", (new_blob, mid))
+        _sync_vec_insert(conn, mid, new_blob)
+
+
 def default_mode_network(conn, gap_hours):
     """
     デフォルトモードネットワーク (DMN):
@@ -3991,6 +4091,10 @@ def recall_important(limit=15, balance=0.5):
     # context期限切れチェック
     sweep_contexts(conn)
 
+    # --- 再固定化の準備 ---
+    context_vec = _get_recent_context_vec(conn)
+    habituated_ids = _get_session_recalled_ids(conn)
+
     rows = conn.execute(
         "SELECT * FROM memories WHERE forgotten = 0"
     ).fetchall()
@@ -4002,9 +4106,25 @@ def recall_important(limit=15, balance=0.5):
         score = corpus_callosum(L, R, balance)
         scored.append((row, score))
 
+    # 馴化 + 文脈フィルタ
+    scored = _apply_habituation_and_context(scored, conn, context_vec, habituated_ids)
     scored.sort(key=lambda x: x[1], reverse=True)
+    result = [(s[0], s[1]) for s in scored[:limit]]
+
+    # 再固定化ドリフト
+    recalled_ids = {s[0]["id"] for s in result}
+    if recalled_ids:
+        now = datetime.now().isoformat()
+        for mid in recalled_ids:
+            conn.execute(
+                "UPDATE memories SET last_accessed = ?, access_count = access_count + 1 WHERE id = ?",
+                (now, mid)
+            )
+        _reconsolidate_embeddings(conn, recalled_ids, context_vec)
+        conn.commit()
+
     conn.close()
-    return [(s[0], s[1]) for s in scored[:limit]]
+    return result
 
 
 def infer_implicit_mood(conn):
@@ -4232,6 +4352,10 @@ def recall_polyphonic(limit_per_voice=3):
         conn.close()
         return {}
 
+    # --- 再固定化の準備: 文脈ベクトルと馴化IDを取得 ---
+    context_vec = _get_recent_context_vec(conn)
+    habituated_ids = _get_session_recalled_ids(conn)
+
     # --- 各声のスコア計算 ---
     empathy_scored = []    # 共感
     complement_scored = [] # 補完
@@ -4270,6 +4394,14 @@ def recall_polyphonic(limit_per_voice=3):
         random_jitter = 0.8 + random.random() * 0.4
         associative_scored.append((row, (0.5 + fresh * 0.5) * novelty * richness * random_jitter))
 
+    # --- 馴化 + 文脈フィルタ適用 ---
+    # シナプス抑制: 同一セッションで既に発火した記憶のスコアを減衰
+    # 文脈弁別: 会話文脈と無関係な記憶を抑制（flashbulb除外）
+    empathy_scored = _apply_habituation_and_context(empathy_scored, conn, context_vec, habituated_ids)
+    complement_scored = _apply_habituation_and_context(complement_scored, conn, context_vec, habituated_ids)
+    critic_scored = _apply_habituation_and_context(critic_scored, conn, context_vec, habituated_ids)
+    associative_scored = _apply_habituation_and_context(associative_scored, conn, context_vec, habituated_ids)
+
     # --- 各声からtop Nを選ぶ（重複排除） ---
     empathy_scored.sort(key=lambda x: x[1], reverse=True)
     complement_scored.sort(key=lambda x: x[1], reverse=True)
@@ -4299,6 +4431,7 @@ def recall_polyphonic(limit_per_voice=3):
     voices["俯瞰"] = _birds_eye_view(conn, rows)
 
     # 想起した記憶の last_accessed / access_count を更新
+    # + 再固定化: embeddingを文脈方向に微小ドリフト
     if used_ids:
         now = datetime.now().isoformat()
         for mid in used_ids:
@@ -4306,6 +4439,8 @@ def recall_polyphonic(limit_per_voice=3):
                 "UPDATE memories SET last_accessed = ?, access_count = access_count + 1 WHERE id = ?",
                 (now, mid)
             )
+        # 再固定化ドリフト: 想起するたびにembeddingが文脈に向かって微小移動
+        _reconsolidate_embeddings(conn, used_ids, context_vec)
         conn.commit()
 
     conn.close()
