@@ -19,6 +19,27 @@ if sys.platform == "win32":
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 
+_MODEL_NAMES = {
+    "claude-opus-4-6": "Claude Opus 4.6",
+    "claude-sonnet-4-6": "Claude Sonnet 4.6",
+    "claude-haiku-4-5-20251001": "Claude Haiku 4.5",
+    "claude-sonnet-4-5-20250514": "Claude Sonnet 4.5",
+    "claude-opus-4-20250918": "Claude Opus 4",
+    "claude-sonnet-4-20250514": "Claude Sonnet 4",
+}
+
+def _friendly_model(model_id):
+    if not model_id:
+        return ""
+    if model_id in _MODEL_NAMES:
+        return _MODEL_NAMES[model_id]
+    # パターンマッチ: claude-{name}-{version}
+    for key, name in _MODEL_NAMES.items():
+        if model_id.startswith(key.rsplit("-", 1)[0]):
+            return name
+    return model_id  # 未知のモデルはIDそのまま
+
+
 def main():
     # 設定読み込み
     config_path = Path(__file__).parent / "turn_export.json"
@@ -35,9 +56,22 @@ def main():
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
 
-    rows = conn.execute(
-        "SELECT session_id, role, content, timestamp, cwd FROM raw_turns ORDER BY id"
-    ).fetchall()
+    # modelカラムの存在確認
+    has_model = False
+    try:
+        conn.execute("SELECT model FROM raw_turns LIMIT 0")
+        has_model = True
+    except Exception:
+        pass
+
+    if has_model:
+        rows = conn.execute(
+            "SELECT session_id, role, content, timestamp, cwd, model FROM raw_turns ORDER BY id"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT session_id, role, content, timestamp, cwd, NULL as model FROM raw_turns ORDER BY id"
+        ).fetchall()
     conn.close()
 
     if not rows:
@@ -66,6 +100,7 @@ def main():
             "content": row["content"],
             "time": time_str,
             "cwd": row["cwd"] or "",
+            "model": row["model"] or "",
         })
 
     # 書き出し
@@ -86,7 +121,11 @@ def main():
                 if turn["cwd"]:
                     lines.append(f"> cwd: {turn['cwd']}\n")
 
-            icon = "👤 User" if turn["role"] == "user" else "🤖 Assistant"
+            if turn["role"] == "user":
+                icon = "👤 User"
+            else:
+                model_name = _friendly_model(turn.get("model", ""))
+                icon = f"🤖 Assistant - {model_name}" if model_name else "🤖 Assistant"
             lines.append(f"\n### {icon}\n{turn['content']}\n")
 
         md_path.write_text("\n".join(lines), encoding="utf-8")
