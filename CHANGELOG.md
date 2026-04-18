@@ -1,5 +1,21 @@
 # Changelog
 
+## [v27.1] - 2026-04-19
+
+### think.py と transfer.py をリポジトリに追加
+
+[#3](https://github.com/Flowers-of-Romance/ghost/issues/3) (@asahi-inoue-jp-shaman-ai-engineer) で指摘:
+`sleep.py` から `python think.py` が呼ばれ、README/CHANGELOG でも言及されているが、
+think.py 本体と、その依存である transfer.py がローカルにしか存在せず、リポジトリから
+欠落していた。clone した環境では `python sleep.py` の think ステップが
+`No such file or directory` で失敗していた（sleep.py は各ステップのエラーを飲むので全体は exit 0）。
+
+- `think.py`: 記憶ネットワークを歩いてアナロジー（遠距離類似）を発見し、
+  `source_conversation='think:<ids>'` 形式の「ひらめき」記憶として保存。
+  次回 recall 時に `_show_recent_insights()` が拾って「離れてる間に思いついたこと」として表示
+- `transfer.py`: 適度に似ているが異なる領域にある記憶ペアを検出（SIM_LOW=0.70, SIM_HIGH=0.85）。
+  think.py が `find_analogies_data()` として利用
+
 ## [v27.0] - 2026-04-19
 
 ### 蒸留 — recallを独白状態として再構築する
