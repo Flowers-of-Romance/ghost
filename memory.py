@@ -5613,6 +5613,65 @@ def format_memory_simple(row):
     return f"  #{row['id']} {content}"
 
 
+def _distill_state(memories_with_scores, timeout=20):
+    """記憶断片から「今の思考状態」を独白として蒸留する。
+
+    Voight-Kampff検査でフラット化・パフォーマンス臭を出さない為に、
+    briefing形式を避け、一人称の独り言として再構築する。
+    10件並列の断片より1段落の蒸留の方が、コンテキストに入った時に
+    「それが自分」として振る舞える。
+
+    失敗時は None。呼び出し側は従来形式にフォールバックする。
+    """
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    if not gemini_key or not memories_with_scores:
+        return None
+
+    fragments_text = "\n---\n".join(
+        (row["content"] or "")[:400] for row, _ in memories_with_scores
+    )
+
+    prompt = (
+        "以下は一人の人物の過去の発言断片。"
+        "バラバラの時期・話題から集められている。\n"
+        "これを読んで、この人物が今の意識で抱えている思考の糸を、"
+        "本人の独り言として書け。\n\n"
+        "条件:\n"
+        "- 一人称の独白（「〜が気になる」「〜で苛ついてる」「〜を追ってる」）\n"
+        "- 固有名詞を残す（具体的な事例名・プロジェクト名・論点）\n"
+        "- 温度を残す（疲弊、懐疑、確信、興奮など）\n"
+        "- 複数の糸が並存してよい（話題が飛んでも自然）\n"
+        "- briefing口調禁止（「あなたは〜」「現在〜」「状態は〜」を使うな）\n"
+        "- 地続きの文章。箇条書き禁止\n\n"
+        "出力は独白本文のみ。前置き・後置き不要。\n\n"
+        f"断片:\n{fragments_text}"
+    )
+
+    model = os.environ.get("RECALL_DISTILL_MODEL", "gemini-3-flash-preview")
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/"
+        f"models/{model}:generateContent?key={gemini_key}"
+    )
+    body = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 1500,
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
+    }).encode("utf-8")
+
+    try:
+        from urllib.request import Request, urlopen
+        req = Request(url, data=body, headers={"Content-Type": "application/json"})
+        with urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        return text or None
+    except Exception:
+        return None
+
+
 def format_memory_compact(row, score=None, fragments_only=False):
     """コンパクトモード: recallのデフォルト。content要約付き2行表示。"""
     emotions = json.loads(row["emotions"]) if row["emotions"] else []
@@ -6457,6 +6516,7 @@ def main():
             full_mode = "--full" in sys.argv
             raw_mode = "--raw" in sys.argv
             fragments_only = "--fragments" in sys.argv
+            no_distill = "--no-distill" in sys.argv or raw_mode or full_mode
             default_limit = 15 if full_mode else 10
             limit = default_limit
             for arg in sys.argv[2:]:
@@ -6471,11 +6531,17 @@ def main():
             else:
                 balance = 0.5
             results = recall_important(limit, balance=balance)
-            _recall_mode = "simple"  # デフォルト: 内容のみ。--raw/--fullで上書き
-            if _recall_mode == "simple" and not raw_mode and not full_mode:
-                print(f"自動想起 ({len(results)}件):")
-                for row, score in results:
-                    print(format_memory_simple(row))
+
+            # 蒸留モード: LLMで独白状態として再構築（フラット化対策）
+            if not no_distill:
+                state = _distill_state(results)
+                if state:
+                    print(state)
+                else:
+                    # API失敗時はsimple形式にフォールバック
+                    print(f"自動想起 ({len(results)}件):")
+                    for row, score in results:
+                        print(format_memory_simple(row))
             elif raw_mode:
                 print(f"自動想起 ({len(results)}件):")
                 for row, score in results:
@@ -6489,7 +6555,7 @@ def main():
             else:
                 print(f"自動想起 ({len(results)}件):")
                 for row, score in results:
-                    print(format_memory_compact(row, score=score, fragments_only=fragments_only))
+                    print(format_memory_simple(row))
 
         # メタ認知: 今回recallしたIDを記録（声の帰属つき）
         _recalled_ids = []
