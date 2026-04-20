@@ -1133,6 +1133,36 @@ def init_db():
     except Exception as e:
         print(f"  (sqlite-vec初期化をスキップ: {e})")
 
+    # === perceptions テーブル (v28 prayer) ===
+    # prayer_daemon による視聴覚知覚の一次記録。
+    # 三次サイバネティックス原則: 差異重視・double description・circuit記録。
+    # memories とは別テーブル（高volume・ephemeral）だが、links で結合される。
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS perceptions (
+            id INTEGER PRIMARY KEY,
+            uuid TEXT UNIQUE NOT NULL,
+            timestamp TEXT NOT NULL,
+            modality TEXT NOT NULL,
+            content_cortex TEXT,
+            content_limbic TEXT,
+            content_delta TEXT,
+            novelty_score REAL,
+            raw_frame_path TEXT,
+            raw_audio_path TEXT,
+            arousal REAL DEFAULT 0.2,
+            invoked_by TEXT DEFAULT 'auto',
+            session_id TEXT,
+            linked_turn_id INTEGER,
+            embedding BLOB,
+            importance INTEGER DEFAULT 1,
+            forgotten INTEGER DEFAULT 0
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_perceptions_ts ON perceptions(timestamp)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_perceptions_session ON perceptions(session_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_perceptions_modality ON perceptions(modality)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_perceptions_forgotten ON perceptions(forgotten)")
+
     conn.commit()
     conn.close()
     print(f"✓ memory.db を初期化しました: {DB_PATH}")
@@ -2534,6 +2564,120 @@ def add_memory(content, category="fact", source=None, confidence=None, provenanc
             pass
 
     return new_id
+
+
+# === prayer perception API (v28) ===
+# prayer_daemon から呼ばれる知覚記録関数。
+# Batesonian 原則: 差異重視・double description。
+# TODO: consolidation フェーズで links 統合（raw_turn/memory と perception の circuit 記録）
+
+def add_perception(
+    modality,
+    content_cortex,
+    content_limbic=None,
+    session_id=None,
+    arousal=0.2,
+    raw_frame_path=None,
+    raw_audio_path=None,
+    invoked_by='auto',
+    importance=1,
+    novelty_threshold=0.05,
+    linked_turn_id=None,
+):
+    """prayer_daemonの知覚を保存。
+
+    - double description (cortex + limbic) を両方記録
+    - 直前perception とのembedding距離で novelty_score 計算
+    - novelty_score < threshold かつ低arousalなら skip (変化検出フィルタ)
+    - 高arousal は threshold を迂回（flashbulb相当）
+
+    Returns: perception_id (int) or None (冗長としてskip)
+    """
+    import uuid as _uuid_mod
+
+    combined = content_cortex or ""
+    if content_limbic:
+        combined = combined + "\n" + content_limbic
+    vec = embed_text(combined, is_query=False) if combined else None
+    blob = vec_to_bytes(vec) if vec is not None else None
+
+    conn = get_connection()
+
+    novelty_score = 1.0
+    content_delta = None
+    if vec is not None:
+        prev = conn.execute(
+            "SELECT content_cortex, embedding FROM perceptions "
+            "WHERE modality=? AND forgotten=0 ORDER BY id DESC LIMIT 1",
+            (modality,)
+        ).fetchone()
+        if prev and prev[1]:
+            prev_vec = bytes_to_vec(prev[1])
+            sim = cosine_similarity(vec, prev_vec)
+            novelty_score = 1.0 - sim
+            if prev[0]:
+                content_delta = f"prev:{prev[0][:80]}"
+            if novelty_score < novelty_threshold and arousal < 0.5:
+                conn.close()
+                return None
+
+    perception_uuid = str(_uuid_mod.uuid4())
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    cur = conn.execute("""
+        INSERT INTO perceptions (
+            uuid, timestamp, modality,
+            content_cortex, content_limbic, content_delta, novelty_score,
+            raw_frame_path, raw_audio_path,
+            arousal, invoked_by, session_id, linked_turn_id,
+            embedding, importance, forgotten
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+    """, (
+        perception_uuid, timestamp, modality,
+        content_cortex, content_limbic, content_delta, novelty_score,
+        raw_frame_path, raw_audio_path,
+        arousal, invoked_by, session_id, linked_turn_id,
+        blob, importance,
+    ))
+    perception_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return perception_id
+
+
+def get_last_perception(modality=None, session_id=None):
+    """直前の perception を返す（変化検出で daemon が使う）。"""
+    conn = get_connection()
+    where = ["forgotten=0"]
+    params = []
+    if modality:
+        where.append("modality=?")
+        params.append(modality)
+    if session_id:
+        where.append("session_id=?")
+        params.append(session_id)
+    sql = f"SELECT * FROM perceptions WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT 1"
+    row = conn.execute(sql, params).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_recent_perceptions(session_id=None, since=None, limit=50):
+    """Claude が /dive 中に最近の知覚を読むための関数。"""
+    conn = get_connection()
+    where = ["forgotten=0"]
+    params = []
+    if session_id:
+        where.append("session_id=?")
+        params.append(session_id)
+    if since:
+        where.append("timestamp >= ?")
+        params.append(since)
+    sql = f"SELECT * FROM perceptions WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 MEMO_DIR = str(Path(__file__).parent / "memo")

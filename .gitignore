@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# runtime state
+memory.db
+memory.db-*
+turn_export.json
+.mood
+.delusion/
+memo/
+
+# prayer runtime artifacts
+prayer/audio/
+prayer/frames/
+prayer/models/
