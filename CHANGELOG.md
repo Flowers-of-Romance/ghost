@@ -1,5 +1,48 @@
 # Changelog
 
+## [v28] - 2026-04-20
+
+### 祈り — 知覚と応答の回路を閉じる
+
+ghost は記憶システムとして完結していたが、身体（カメラ・マイク・スピーカー）を持たなかった。
+recall で過去は呼び戻せても、いま目の前にあるもの、いま聴こえているもの、いま口にする声を扱う道が無い。
+
+v28 で **prayer** という独立サブシステムを導入した（[Flowers-of-Romance/prayer](https://github.com/Flowers-of-Romance/prayer)）。
+MacBook のカメラ・マイクで常時知覚し、Qwen3-Omni-30B-A3B-bf16 で画像を cortex（構造）+ limbic（情調）の
+double description に変換、mlx-whisper small で発話を書き起こし、VOICEVOX で応答する。Blade Runner の
+逆転ヴォイトカンプフ — LLM が審査官、人間が祈る側。
+
+ghost 側の変更は薄い: perceptions テーブルと add_perception の追加、`inject_perceptions.py` hook だけ。
+prayer は GHOST_DIR 環境変数か `../ghost` から memory.py を import して動く兄弟関係。
+
+#### 実装（ghost 側）
+- `memory.py`:
+  - `perceptions` テーブル追加（uuid, modality, content_cortex, content_limbic, content_delta,
+    novelty_score, raw_frame_path, raw_audio_path, arousal, invoked_by, session_id, linked_turn_id,
+    embedding, importance, forgotten）
+  - `add_perception()`: double description を記録。直前 perception との embedding 距離で
+    novelty_score 計算、閾値未満 & 低 arousal なら skip（変化検出フィルタ、flashbulb 相当の高 arousal は
+    バイパス）
+  - `get_last_perception()` / `get_recent_perceptions()`
+- `inject_perceptions.py`: UserPromptSubmit hook。`/tmp/dive-active` マーカーが存在する時だけ、
+  前回注入以降の新 perception を最大 5 件 stderr に出力。last_id を tempdir に保存して冪等
+- `.claude/settings.local.json`: `inject_perceptions.py` を UserPromptSubmit に登録
+
+#### 設計方針（prayer 側、詳細は別 repo）
+- **三次サイバネティックス（Batesonian）**:
+  - 差異重視: 前フレームからの novelty で駆動
+  - double description: cortex + limbic で同じ知覚を二重記述
+  - no central state: perceptions テーブルの流れが状態そのもの
+  - unit of survival: J ↔ daemon ↔ Claude の circuit
+- **ghost との関係**: prayer は ghost に依存する（memory.py を import）が、ghost は prayer を
+  知らない。prayer が落ちても ghost は動く。非対称な依存
+
+#### 既知の課題
+- MLX allocator の SIGBUS/SEGV が頻発（Qwen + whisper + 音声 callback の並行実行）。supervisor.sh で
+  auto-restart して誤魔化している。根本解決は未着手
+- Claude Code のターンサイクルがリアルタイム応答の律速段。prayer 側でいくら速くしても、
+  J の発話 → Claude 応答の体感遅延は 5-8 秒残る
+
 ## [v27.1] - 2026-04-19
 
 ### think.py と transfer.py をリポジトリに追加
