@@ -37,12 +37,6 @@ prayer は GHOST_DIR 環境変数か `../ghost` から memory.py を import し�
 - **ghost との関係**: prayer は ghost に依存する（memory.py を import）が、ghost は prayer を
   知らない。prayer が落ちても ghost は動く。非対称な依存
 
-#### 既知の課題
-- MLX allocator の SIGBUS/SEGV が頻発（Qwen + whisper + 音声 callback の並行実行）。supervisor.sh で
-  auto-restart して誤魔化している。根本解決は未着手
-- Claude Code のターンサイクルがリアルタイム応答の律速段。prayer 側でいくら速くしても、
-  J の発話 → Claude 応答の体感遅延は 5-8 秒残る
-
 ## [v27.1] - 2026-04-19
 
 ### think.py と transfer.py をリポジトリに追加
