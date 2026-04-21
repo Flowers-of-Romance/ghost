@@ -1026,6 +1026,14 @@ def init_db():
         conn.execute("ALTER TABLE memories ADD COLUMN origin TEXT DEFAULT NULL")
     except sqlite3.OperationalError:
         pass
+    # domains カラム追加（凡例 / 地図の一軸 v29）: JSON 配列
+    # 例: ["impl/memory", "concept/memory"]
+    # 意味領域（memory / 記憶 / 実装 / claude / jun 等）の混濁を緩和するための
+    # soft hint。territory を消さず、_left_score に乗る multiplier としてのみ作用。
+    try:
+        conn.execute("ALTER TABLE cortex ADD COLUMN domains TEXT DEFAULT '[\"unknown\"]'")
+    except sqlite3.OperationalError:
+        pass
 
     # データ移行: memoriesからcortex/limbicにコピー（まだ移行されていない場合）
     migrated = conn.execute("SELECT COUNT(*) FROM cortex").fetchone()[0]
@@ -1060,7 +1068,8 @@ def init_db():
                l.flashbulb, m.context_expires_at, l.temporal_context,
                l.spatial_context, l.relational_context,
                m.uuid, m.updated_at, m.last_mutated,
-               c.provenance, c.confidence, c.revision_count
+               c.provenance, c.confidence, c.revision_count,
+               c.domains
         FROM memories m
         JOIN cortex c ON c.id = m.id
         JOIN limbic l ON l.id = m.id
@@ -2347,7 +2356,7 @@ def prospect_clear(prospect_id):
 # メイン操作
 # ============================================================
 
-def add_memory(content, category="fact", source=None, confidence=None, provenance=None, flashbulb=None, relational_context=None, origin=None):
+def add_memory(content, category="fact", source=None, confidence=None, provenance=None, flashbulb=None, relational_context=None, origin=None, domains=None):
     emotions, arousal, importance = detect_emotions(content)
 
     # 出自と信頼度の自動設定
@@ -2440,11 +2449,12 @@ def add_memory(content, category="fact", source=None, confidence=None, provenanc
     new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
     # 左脳（cortex）: 意味的データ
+    doms_json = json.dumps(domains, ensure_ascii=False) if domains else '["unknown"]'
     conn.execute(
         """INSERT OR REPLACE INTO cortex
-           (id, content, category, keywords, embedding, confidence, provenance, revision_count, merged_from)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL)""",
-        (new_id, content, category, kw_json, blob, confidence, provenance)
+           (id, content, category, keywords, embedding, confidence, provenance, revision_count, merged_from, domains)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)""",
+        (new_id, content, category, kw_json, blob, confidence, provenance, doms_json)
     )
     # 右脳（limbic）: 情動データ
     conn.execute(
@@ -2859,10 +2869,11 @@ def _temporal_boost(row):
     return 1.0
 
 
-def search_memories(query, limit=10, use_like=False, fuzzy=False):
+def search_memories(query, limit=10, use_like=False, fuzzy=False, requested_domains=None):
     conn = get_connection()
     fuzzy_results = []  # 舌先現象: 類似度0.45-0.65のもやもや記憶
     now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    domains_map = _load_domains_map(conn) if requested_domains else {}
 
     # 予期記憶チェック
     check_prospective(conn, query)
@@ -2909,7 +2920,8 @@ def search_memories(query, limit=10, use_like=False, fuzzy=False):
                     continue
                 sim = sim_map[mid]
                 temporal = _temporal_boost(row)
-                L = _left_score(row, sim=sim) * temporal
+                dw = _domain_weight(domains_map.get(mid), requested_domains) if requested_domains else 1.0
+                L = _left_score(row, sim=sim, domain_weight=dw) * temporal
                 R = _right_score(conn, row)
                 score = corpus_callosum(L, R, balance=0.5)
                 scored.append((row, score, sim))
@@ -2922,7 +2934,8 @@ def search_memories(query, limit=10, use_like=False, fuzzy=False):
                 mem_vec = bytes_to_vec(row["embedding"])
                 sim = cosine_similarity(query_vec, mem_vec)
                 temporal = _temporal_boost(row)
-                L = _left_score(row, sim=sim) * temporal
+                dw = _domain_weight(domains_map.get(row["id"]), requested_domains) if requested_domains else 1.0
+                L = _left_score(row, sim=sim, domain_weight=dw) * temporal
                 R = _right_score(conn, row)
                 score = corpus_callosum(L, R, balance=0.5)
                 scored.append((row, score, sim))
@@ -3558,6 +3571,9 @@ def mutate_metadata(conn):
     """
     メタデータ変容: 隣接記憶の影響でキーワード・埋め込み・情動が変化する。
     データ（content）は不変、メタデータが変容する。
+
+    不変条件 (v29): cortex.domains は変異対象に含めない。凡例は territory の
+    揺らぎで勝手に動かない。domain を変えるのは _domain_cli 経由の明示操作のみ。
     """
     import numpy as np
     now = datetime.now(timezone.utc)
@@ -4190,7 +4206,162 @@ def detect_rumination(conn):
     return []
 
 
-def _left_score(row, sim=None):
+def _prefix_match(row_domain, req):
+    """domain の path-like 双方向 prefix 一致。
+    "impl/memory" と "impl" は互いにマッチする（親子関係を許容）。"""
+    if row_domain == req:
+        return True
+    return row_domain.startswith(req + "/") or req.startswith(row_domain + "/")
+
+
+def _domain_weight(row_domains, requested):
+    """凡例 soft hint: requested domain との一致で L スコアを偏らせる。
+
+    territory を消さない設計:
+    - 未指定: 1.0
+    - unknown を含む: 1.0 (未分類記憶は penalty を受けない)
+    - 一致: 1.3 (boost)
+    - 不一致: 0.7 (soft penalty、0.0 にはしない)
+    """
+    if not requested:
+        return 1.0
+    if not row_domains:
+        return 1.0
+    if "unknown" in row_domains:
+        return 1.0
+    for rd in row_domains:
+        for req in requested:
+            if _prefix_match(rd, req):
+                return 1.3
+    return 0.7
+
+
+def _load_domains_map(conn, ids=None):
+    """cortex から {id: [domains]} を読む。ids=None なら全件。"""
+    if ids:
+        if not ids:
+            return {}
+        placeholders = ",".join("?" * len(ids))
+        rows = conn.execute(
+            f"SELECT id, domains FROM cortex WHERE id IN ({placeholders})",
+            list(ids)
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT id, domains FROM cortex").fetchall()
+    result = {}
+    for r in rows:
+        try:
+            doms = json.loads(r["domains"]) if r["domains"] else ["unknown"]
+        except (json.JSONDecodeError, TypeError):
+            doms = ["unknown"]
+        result[r["id"]] = doms
+    return result
+
+
+def _parse_domain_flag(argv):
+    """argv から --domain VAL をパースしてリスト化。未指定なら None。"""
+    if "--domain" not in argv:
+        return None
+    idx = argv.index("--domain")
+    if idx + 1 >= len(argv):
+        return None
+    raw = argv[idx + 1]
+    return [d.strip() for d in raw.split(",") if d.strip()] or None
+
+
+def _domain_cli(args):
+    """domain サブコマンド: set / add / remove / list / of
+    凡例を手で付ける最小 CLI。mutation_log に変更を残す。"""
+    usage = (
+        "使い方:\n"
+        "  python memory.py domain set <id> d1,d2,...\n"
+        "  python memory.py domain add <id> d1\n"
+        "  python memory.py domain remove <id> d1\n"
+        "  python memory.py domain list\n"
+        "  python memory.py domain of <id>"
+    )
+    if not args:
+        print(usage)
+        return
+    sub = args[0]
+    conn = get_connection()
+    try:
+        if sub == "list":
+            rows = conn.execute("SELECT domains FROM cortex").fetchall()
+            counts = {}
+            for r in rows:
+                try:
+                    doms = json.loads(r["domains"]) if r["domains"] else ["unknown"]
+                except (json.JSONDecodeError, TypeError):
+                    doms = ["unknown"]
+                for d in doms:
+                    counts[d] = counts.get(d, 0) + 1
+            total = sum(counts.values())
+            print(f"domain 別件数 (延べ {total}):")
+            for d, c in sorted(counts.items(), key=lambda x: -x[1]):
+                print(f"  {c:5d}  {d}")
+        elif sub == "of":
+            if len(args) < 2:
+                print(usage)
+                return
+            mid = int(args[1])
+            row = conn.execute("SELECT domains FROM cortex WHERE id = ?", (mid,)).fetchone()
+            if not row:
+                print(f"#{mid} が見つからない")
+                return
+            print(f"#{mid} domains: {row['domains']}")
+        elif sub in ("set", "add", "remove"):
+            if len(args) < 3:
+                print(usage)
+                return
+            mid = int(args[1])
+            row = conn.execute("SELECT domains FROM cortex WHERE id = ?", (mid,)).fetchone()
+            if not row:
+                print(f"#{mid} が cortex に見つからない")
+                return
+            try:
+                current = json.loads(row["domains"]) if row["domains"] else ["unknown"]
+            except (json.JSONDecodeError, TypeError):
+                current = ["unknown"]
+            old_value = json.dumps(current, ensure_ascii=False)
+            if sub == "set":
+                new = [d.strip() for d in args[2].split(",") if d.strip()]
+                if not new:
+                    new = ["unknown"]
+                reason = "domain_set"
+            elif sub == "add":
+                dom = args[2].strip()
+                new = [d for d in current if d != "unknown"]
+                if dom not in new:
+                    new.append(dom)
+                if not new:
+                    new = ["unknown"]
+                reason = f"domain_add:{dom}"
+            else:  # remove
+                dom = args[2].strip()
+                new = [d for d in current if d != dom]
+                if not new:
+                    new = ["unknown"]
+                reason = f"domain_remove:{dom}"
+            new_value = json.dumps(new, ensure_ascii=False)
+            if new_value == old_value:
+                print(f"#{mid} 変化なし: {old_value}")
+                return
+            conn.execute("UPDATE cortex SET domains = ? WHERE id = ?", (new_value, mid))
+            conn.execute(
+                "INSERT INTO mutation_log (memory_id, field, old_value, new_value, reason) "
+                "VALUES (?, 'domains', ?, ?, ?)",
+                (mid, old_value, new_value, reason)
+            )
+            conn.commit()
+            print(f"#{mid} domains: {old_value} → {new_value}")
+        else:
+            print(usage)
+    finally:
+        conn.close()
+
+
+def _left_score(row, sim=None, domain_weight=1.0):
     """左脳スコア: 意味的・分析的因子。"""
     hl = effective_half_life(row["arousal"])
     fresh = freshness(row["created_at"], half_life=hl)
@@ -4200,7 +4371,7 @@ def _left_score(row, sim=None):
     confidence_weight = 0.5 + conf * 0.5
     rev = row["revision_count"] if "revision_count" in row.keys() and row["revision_count"] is not None else 0
     stability = 1.0 / (1.0 + rev * 0.15)
-    L = fresh_factor * access_boost * confidence_weight * stability
+    L = fresh_factor * access_boost * confidence_weight * stability * domain_weight
     if sim is not None:
         L *= sim
     return L
@@ -4229,7 +4400,7 @@ def corpus_callosum(left, right, balance=0.5):
     return left ** (1.0 - balance) * right ** balance
 
 
-def recall_important(limit=15, balance=0.5):
+def recall_important(limit=15, balance=0.5, requested_domains=None):
     conn = get_connection()
 
     # context期限切れチェック
@@ -4243,9 +4414,12 @@ def recall_important(limit=15, balance=0.5):
         "SELECT * FROM memories WHERE forgotten = 0"
     ).fetchall()
 
+    domains_map = _load_domains_map(conn) if requested_domains else {}
+
     scored = []
     for row in rows:
-        L = _left_score(row)
+        dw = _domain_weight(domains_map.get(row["id"]), requested_domains) if requested_domains else 1.0
+        L = _left_score(row, domain_weight=dw)
         R = _right_score(conn, row)
         score = corpus_callosum(L, R, balance)
         scored.append((row, score))
@@ -4470,7 +4644,7 @@ def _birds_eye_view(conn, rows):
     return observations[:5]
 
 
-def recall_polyphonic(limit_per_voice=3):
+def recall_polyphonic(limit_per_voice=3, requested_domains=None):
     """
     内的対話 (polyphonic recall): 複数の声が同時に想起する。
 
@@ -4482,6 +4656,10 @@ def recall_polyphonic(limit_per_voice=3):
       補完: 気分と逆の記憶（見えていないもの）
       批判: 過去の失敗・葛藤・不安の記憶（警告）
       連想: ランダムウォークで到達した意外な記憶（創造性）
+
+    requested_domains を渡すと共感・補完・批判は domain に寄せ、
+    連想だけは逆に domain を跨いだ記憶をブーストする
+    （連想は凡例を横断する役）。
 
     Returns: dict of {voice_name: [(row, score), ...]}
     """
@@ -4500,6 +4678,8 @@ def recall_polyphonic(limit_per_voice=3):
     context_vec = _get_recent_context_vec(conn)
     habituated_ids = _get_session_recalled_ids(conn)
 
+    domains_map = _load_domains_map(conn) if requested_domains else {}
+
     # --- 各声のスコア計算 ---
     empathy_scored = []    # 共感
     complement_scored = [] # 補完
@@ -4507,7 +4687,18 @@ def recall_polyphonic(limit_per_voice=3):
     associative_scored = []  # 連想
 
     for row in rows:
-        L = _left_score(row)
+        row_doms = domains_map.get(row["id"]) if requested_domains else None
+        dw = _domain_weight(row_doms, requested_domains) if requested_domains else 1.0
+        # 連想の声だけ domain を反転: 別 domain を 1.2 ブースト
+        if requested_domains and row_doms and "unknown" not in row_doms:
+            matches = any(
+                _prefix_match(rd, req)
+                for rd in row_doms for req in requested_domains
+            )
+            associative_dw = 1.2 if not matches else 0.9
+        else:
+            associative_dw = 1.0
+        L = _left_score(row, domain_weight=dw)
 
         # 共感: 右脳優勢、気分一致（balanceは自己調整対象）
         R_empathy = _right_score(conn, row, mood_fn=get_mood_congruence_boost)
@@ -4536,7 +4727,7 @@ def recall_polyphonic(limit_per_voice=3):
         novelty = 1.0 / (1.0 + row["access_count"])
         richness = 1.0 + min(link_count, 20) * 0.05
         random_jitter = 0.8 + random.random() * 0.4
-        associative_scored.append((row, (0.5 + fresh * 0.5) * novelty * richness * random_jitter))
+        associative_scored.append((row, (0.5 + fresh * 0.5) * novelty * richness * random_jitter * associative_dw))
 
     # --- 馴化 + 文脈フィルタ適用 ---
     # シナプス抑制: 同一セッションで既に発火した記憶のスコアを減衰
@@ -6287,19 +6478,22 @@ def main():
 
     elif cmd == "add":
         if len(sys.argv) < 3:
-            print("使い方: python memory.py add \"内容\" [--category CAT] [--source SRC] [--flashbulb TEXT] [--origin ORIGIN]")
+            print("使い方: python memory.py add \"内容\" [--category CAT] [--source SRC] [--flashbulb TEXT] [--origin ORIGIN] [--domain D1,D2]")
             print("  位置引数: python memory.py add \"内容\" category [source]")
             return
         content = sys.argv[2]
         args = sys.argv[3:]
         category = "fact"
+        category_set = False
         source = None
         flashbulb = None
         origin = None
+        domains = None
         i = 0
         while i < len(args):
             if args[i] == "--category" and i + 1 < len(args):
                 category = args[i + 1]
+                category_set = True
                 i += 2
             elif args[i] == "--source" and i + 1 < len(args):
                 source = args[i + 1]
@@ -6310,26 +6504,31 @@ def main():
             elif args[i] == "--origin" and i + 1 < len(args):
                 origin = args[i + 1]
                 i += 2
+            elif args[i] == "--domain" and i + 1 < len(args):
+                domains = [d.strip() for d in args[i + 1].split(",") if d.strip()] or None
+                i += 2
             elif args[i].startswith("--"):
                 i += 2  # 未知のフラグはスキップ
-            elif category == "fact":
-                category = args[i]  # 後方互換: 位置引数
+            elif not category_set:
+                category = args[i]  # 後方互換: 位置引数（"fact" を明示的に渡しても誤爆しない）
+                category_set = True
                 i += 1
             elif source is None:
                 source = args[i]  # 後方互換: 位置引数
                 i += 1
             else:
                 i += 1
-        add_memory(content, category, source, flashbulb=flashbulb, origin=origin)
+        add_memory(content, category, source, flashbulb=flashbulb, origin=origin, domains=domains)
 
     elif cmd == "search":
         if len(sys.argv) < 3:
-            print("使い方: python memory.py search \"検索語\" [--like] [--raw] [--fuzzy]")
+            print("使い方: python memory.py search \"検索語\" [--like] [--raw] [--fuzzy] [--domain D1,D2]")
             return
         use_like = "--like" in sys.argv
         raw_mode = "--raw" in sys.argv
         fuzzy_mode = "--fuzzy" in sys.argv
-        search_result = search_memories(sys.argv[2], use_like=use_like, fuzzy=fuzzy_mode)
+        requested_domains = _parse_domain_flag(sys.argv)
+        search_result = search_memories(sys.argv[2], use_like=use_like, fuzzy=fuzzy_mode, requested_domains=requested_domains)
         if fuzzy_mode:
             results, fuzzy_results = search_result
         else:
@@ -6610,7 +6809,8 @@ def main():
                 for arg in sys.argv[2:]:
                     if arg.isdigit():
                         n = int(arg)
-            voices = recall_polyphonic(limit_per_voice=n)
+            requested_domains = _parse_domain_flag(sys.argv)
+            voices = recall_polyphonic(limit_per_voice=n, requested_domains=requested_domains)
             raw_mode = "--raw" in sys.argv
             fragments_only = "--fragments" in sys.argv
             conn = get_connection()
@@ -6674,7 +6874,8 @@ def main():
                 balance = 0.7
             else:
                 balance = 0.5
-            results = recall_important(limit, balance=balance)
+            requested_domains = _parse_domain_flag(sys.argv)
+            results = recall_important(limit, balance=balance, requested_domains=requested_domains)
 
             # 蒸留モード: LLMで独白状態として再構築（フラット化対策）
             if not no_distill:
@@ -6745,6 +6946,9 @@ def main():
     elif cmd == "proceduralize":
         dry = "--dry-run" in sys.argv
         proceduralize(dry_run=dry)
+
+    elif cmd == "domain":
+        _domain_cli(sys.argv[2:])
 
     elif cmd == "overview":
         overview()

@@ -6,15 +6,22 @@
 
 ```bash
 # 基本
-python memory.py add "内容" カテゴリ "出典"
-python memory.py search "検索語" [--raw] [--fuzzy]
-python memory.py recall [N] [--raw]
-python memory.py recall --voices [N]   # 内的対話（共感・補完・批判・連想）
+python memory.py add "内容" カテゴリ "出典" [--domain D1,D2]
+python memory.py search "検索語" [--raw] [--fuzzy] [--domain D1,D2]
+python memory.py recall [N] [--raw] [--domain D1,D2]
+python memory.py recall --voices [N] [--domain D1,D2]   # 内的対話（共感・補完・批判・連想）
 python memory.py chain ID [depth]
 python memory.py detail ID
 python memory.py recent [N]
 python memory.py all
 python memory.py forget ID
+
+# 凡例（v29〜）
+python memory.py domain set <id> d1,d2   # 上書き
+python memory.py domain add <id> d         # 追加
+python memory.py domain remove <id> d      # 削除
+python memory.py domain list               # domain 別件数
+python memory.py domain of <id>            # 付与確認
 
 # 脳機能
 python memory.py resurrect "語"        # 忘却記憶の復活検索
@@ -48,6 +55,34 @@ python autobiography.py               # 自伝的記憶の生成
 - **preference**: 好み。
 - **procedure**: 手続き。
 - **schema**: メタ記憶（自動生成）。記憶クラスタの要約。
+
+## domain（凡例、v29〜）
+
+カテゴリが「型」なのに対し domain は「領域」。memory / 記憶 / 実装 / claude / jun
+といった**意味領域の混濁**を緩和する soft hint。path-like、`/` は prefix match。
+
+初期 vocabulary（増やすときはこのリストに追記してから使う）:
+
+- `self/J` — J 本人に関する記憶
+- `self/claude` — Claude 側に関する記憶
+- `relation/J-claude` — J と Claude の関係・協働
+- `impl/memory` — memory.py 周りの実装・バグ・API
+- `impl/ghost` — ghost 全体の実装
+- `impl/other` — それ以外のコード
+- `concept/memory` — 記憶の概念（Korzybski, territory 等）
+- `concept/mind` — 認知・意識・サイバネティックス
+- `project/*` — プロジェクト単位（動的）
+- `external/*` — 外部情報の引用（動的、将来 confidence を下げる）
+- `meta` — 記憶システム自体への議論
+- `unknown` — 未分類（default）
+
+**設計制約（Korzybski 要件）**:
+- domain フィルタは candidate を消さない — スコアを偏らせるだけ
+- `unknown` を含む記憶は penalty を受けない（凡例未分類は常に通す）
+- 一致で 1.3 ブースト、不一致で 0.7 の soft penalty、0.0 にしない
+- recall の連想の声だけ domain を反転（違う domain を 1.2 ブースト）
+- delusion（完全記憶モード）は domain を一切適用しない
+- mutate_metadata は domains を変異させない（明示操作のみ）
 
 ## 脳っぽい動作（自動的に起きる）
 

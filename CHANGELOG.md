@@ -1,5 +1,49 @@
 # Changelog
 
+## [v29] - 2026-04-21
+
+### 凡例 — 地図の一軸を territory に乗せる
+
+memory.py は SQLite 上に category / provenance / confidence / cortex+limbic 分離 / links /
+自動生成 schema / FTS5 / sqlite-vec といった精緻な territory を持つのに、recall と search で
+「memory / 記憶 / 実装 / claude / jun」が平らに並んで混濁していた。自己診断は「地図がなかった」。
+territory にはあるが、各ノードがどの**領域**に属するかを示す凡例の一軸（domain / topic）が
+欠けていた。category は型であって領域ではない。
+
+Korzybski の警告（地図 ≠ 領土）を設計制約として織り込んだ最小スコープで、`cortex.domains`
+カラムを追加し、手動付与 CLI と `--domain` フィルタだけ入れた。自動推論・一括バックフィル・
+schema 伝播は次段階。
+
+#### 実装
+- `memory.py`:
+  - `cortex.domains` カラム追加（JSON 配列、default `["unknown"]`）
+  - `memories_v` VIEW に `c.domains` 追加
+  - `_prefix_match` / `_domain_weight` / `_load_domains_map` / `_parse_domain_flag` 追加
+  - `_left_score` に `domain_weight` 引数追加（default 1.0 で後方互換）
+  - `search_memories` / `recall_important` / `recall_polyphonic` に `requested_domains` 引数
+  - 連想の声だけ domain を反転（跨ぐ記憶を 1.2 ブースト） — 凡例を横断する役
+  - `delusion_search` には domain を適用しない（バイアス排除原則）
+  - `domain` サブコマンド（set / add / remove / list / of）。変更は `mutation_log` に記録
+  - `add` コマンドに `--domain D1,D2` フラグ（録る瞬間に凡例を付けられる、二段階を回避）
+  - `add_memory()` に `domains` 引数追加（default None → `["unknown"]` で保存）
+  - `add` CLI の位置引数バグ修正（`fact` を明示的に位置引数で渡すと category が誤上書きされる既存バグ、`category_set` フラグで解消）
+  - `mutate_metadata` の docstring に domain 不変条件を明記（変異対象に含めない）
+- `MEMORY_GUIDE.md`: 初期 vocabulary と設計制約を成文化
+
+#### 設計制約（Korzybski 要件）
+- domain フィルタは candidate を消さない — スコアを偏らせるだけ
+- `unknown` を含む記憶は penalty を受けない（凡例未分類は常に通す）
+- 一致で 1.3 ブースト、不一致で 0.7 の soft penalty、0.0 にしない
+- delusion（完全記憶モード）は domain を一切適用しない
+- mutate_metadata は domains を変異させない（明示操作のみ）
+
+#### 次段階（v30 以降）
+- 自動 domain 推論（埋め込み近傍 + schema 継承 + keyword rule の合議制）
+- 既存記憶のバックフィル（dry-run → 高 confidence のみ自動、低 confidence は手動）
+- `build_schemas` に domain 伝播
+- domain 別 confidence（JSON オブジェクト形式への拡張）
+- 2 バグ仮説（`_apply_habituation_and_context` 暴発・embedding ドリフトによる意味空間平滑化）の検証
+
 ## [v28] - 2026-04-20
 
 ### 祈り — 知覚と応答の回路を閉じる
