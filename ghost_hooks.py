@@ -43,7 +43,7 @@ def check_and_nap():
                 import subprocess
                 print("(うとうと...)", file=sys.stderr)
                 subprocess.run(
-                    ["python", "memory.py", "nap"],
+                    [sys.executable, "memory.py", "nap"],
                     cwd=str(Path(__file__).parent),
                     capture_output=True, timeout=30
                 )
