@@ -21,18 +21,22 @@ if sys.platform == "win32" and getattr(sys.stdout, 'encoding', '').lower() not i
 
 DREAM_LINES = sys.argv[1] if len(sys.argv) > 1 else "30"
 
+# v30: catalog は schema 直後に挿入（cluster_abstract の素材が出揃うため）。
+# catalog は navigability の整理（sleep の神経学的 fitness 整理とは目的が別）。
+# nap() には入れない — catalog は full sleep のみ。
 steps = [
-    ("memo_index",    ["python", "memory.py", "memo", "index"]),
-    ("promote",       ["python", "memory.py", "promote"]),
-    ("dream",         ["python", "dream.py", DREAM_LINES]),
-    ("replay",        ["python", "memory.py", "replay"]),
-    ("consolidate",   ["python", "memory.py", "consolidate"]),
-    ("schema",        ["python", "memory.py", "schema"]),
-    ("proceduralize", ["python", "memory.py", "proceduralize"]),
-    ("think",         ["python", "think.py"]),
-    ("self_tune",     ["python", "memory.py", "self-tune"]),
-    ("meta_memory",   ["python", "memory.py", "meta-memory"]),
-    ("stats",         ["python", "memory.py", "stats"]),
+    ("memo_index",    [sys.executable, "memory.py", "memo", "index"]),
+    ("promote",       [sys.executable, "memory.py", "promote"]),
+    ("dream",         [sys.executable, "dream.py", DREAM_LINES]),
+    ("replay",        [sys.executable, "memory.py", "replay"]),
+    ("consolidate",   [sys.executable, "memory.py", "consolidate"]),
+    ("schema",        [sys.executable, "memory.py", "schema"]),
+    ("catalog",       [sys.executable, "memory.py", "catalog", "build"]),
+    ("proceduralize", [sys.executable, "memory.py", "proceduralize"]),
+    ("think",         [sys.executable, "think.py"]),
+    ("self_tune",     [sys.executable, "memory.py", "self-tune"]),
+    ("meta_memory",   [sys.executable, "memory.py", "meta-memory"]),
+    ("stats",         [sys.executable, "memory.py", "stats"]),
 ]
 
 results = {}

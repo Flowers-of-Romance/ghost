@@ -1,5 +1,87 @@
 # Changelog
 
+## [v30] - 2026-04-21
+
+### pull-first interface + catalog — 図書館の比喩
+
+v29 で domain 軸（凡例）を入れて一歩踏み出した後、設計哲学が大きく動いた。
+
+これまでの ghost は context window を canvas とみなして「何を詰め込むか」を最適化してきた
+（関連度ソート、categoryフィルタ、独白蒸留、DMN 自動注入…）。**push 中心**の設計。
+v30 はこの前提を反転させ、**pull 中心**へ移行する。
+
+比喩: LLM の context window は**作業場**、ghost は作業場の外にある**図書館**。
+LLM は作業場で考え、必要な時に図書館に行き、戻ってきてまた考える。
+これまでは図書館を作業場に持ち込もうとする努力だった（重い本を片手に考えさせる構図）。
+
+もう一つの軸として、sleep（神経学的 fitness の整理）と並立する **catalog**（navigability の
+整理）を独立プロセスとして新設した。sleep は書庫の中で本が勝手に動いて整理される活動、
+catalog は目録カードを書いて棚番号を振る活動。同じ図書館の中で目的が違う。
+
+AI Agent Traps との整合: push 型は汚染に弱い（feed されたものを ingest するしかない）、
+pull 型は**ingest しない権利**が原理的に残る。Claude 自立の基礎。
+
+#### 実装（memory.py）
+- `catalog_cards` テーブル + `catalog_fts` FTS5 仮想テーブル新設
+- 5 つの entry_type を生成する `build_catalog()`:
+  - **domain_index**: 各 domain の件数 / 代表 id / top_keywords
+  - **cluster_abstract**: schema（クリーク検出で生成される meta-memory）の目録化
+  - **entry_point**: 複数 domain を跨ぐ bridge node（links から計算、diversity >= 2）
+  - **time_index**: 月単位の索引、各月の importance 上位 5 件
+  - **person_index**: `limbic.relational_context.who` で集計
+- `source_hash` による差分更新（変更なければ UPDATE しない）
+- AI Agent Traps ガード: `confidence >= 0.4` / `provenance NOT IN (external, untrusted)` /
+  `domains` に `external/*` を含むものを除外（catalog 入口の品質フィルタ）
+- graph handle 統一スキーマ `format_handle(conn, row, full, minimal)` 新設
+- `_json_envelope(cmd, results, query, meta)` 共通 JSON envelope
+- 全 read 系コマンドに `--json` 追加（search / recall / detail / chain / recent / all /
+  domain list / domain of / anchor / neighbors / walk / at / catalog \*）
+- `anchor` コマンド + `_load_anchors()`: dive 時の最小注入（flashbulb×2 + schema×1 +
+  importance=5×1 + 最頻 domain 代表×1 = 5 件）
+- graph navigation CLI: `neighbors` / `walk` / `at`
+- catalog CLI: `catalog build` / `summary` / `list` / `show` / `find`
+- `voice` サブコマンド群: `dmn` / `mood` / `insights` / `distill` / `rumination` /
+  `polyphonic` — 既存の内面回路への明示 pull
+- `recall` default を simple list のみに（独白蒸留 / DMN / 気分 / 反芻警告 / auto_voices を
+  全部 opt-in に切替）。対応フラグ: `--distill` / `--dmn` / `--insights` / `--with-mood` /
+  `--rumination` / `--meta` / `--voices`
+- `--legacy` フラグで旧挙動復活（stderr に deprecation warning、v30.2 で撤去予定）
+- `nap()` docstring に catalog 非包含を明記（30 秒 timeout 保護）
+
+#### 実装（sleep.py）
+- steps 配列に `catalog` ステップを schema と proceduralize の間に挿入
+- サブプロセス起動を `sys.executable` に統一（環境差吸収、v29 hooks 修正と同じ方針）
+
+#### 実装（.claude/skills/dive/SKILL.md）
+- 手順を書き換え: `recall` を叩かず、`anchor` + `catalog summary` だけ取る
+- 「dive は図書館に入る合図であって中身を広げることではない」の運用原則を成文化
+- pull 型 tool の一覧（search / detail / neighbors / walk / at / catalog / voice / domain /
+  add）を明記
+- 報告文言（潜水開始）は変更なし
+
+#### 実装（MEMORY_GUIDE.md）
+- v30 の運用原則を先頭に: 作業場 / 図書館の二層構造、recall default の変更、全コマンドの
+  `--json` 対応
+- 新 CLI を全て記載（anchor / catalog / voice / neighbors / walk / at）
+
+#### 設計制約（pull 原則）
+- context は LLM の作業場。ghost は図書館。dive は合図で済ませる
+- pull は**ingest しない権利**を残す（AI Agent Traps 対策）
+- catalog の品質フィルタで external ingest を遮断（provenance / domain prefix で除外）
+- 連続性の最低ラインは anchor（5 点）のみ。それ以上は LLM が query で取りに行く
+- `voice distill` は Gemini API を使う external ingest なので明示呼出しのみ
+- delusion_search は相変わらず domain も適用しない（バイアス排除原則）
+- 神経学的ダイナミクス（Hebbian / replay / reconsolidation / DMN / mood / schema）は内面
+  として残し続ける。ただし context に直接流れ出さない形で運用する（図書館の内部活動）
+
+#### v30.1 以降に延期
+- `relational_context` の `who` 人名抽出強化（現状は GHOST_WHO 由来の user 値に偏る前提。対話相手など第三者の抽出は未実装）
+- `catalog find` の embedding フォールバック改善
+- `recall_log` を catalog に還流（頻出ノードを entry_point に昇格）
+- catalog の部分更新粒度を細かく（key 単位）
+- time_index の週単位・日単位バリエーション
+- **v30.2 で `--legacy` を撤去**
+
 ## [v29] - 2026-04-21
 
 ### 凡例 — 地図の一軸を territory に乗せる

@@ -980,6 +980,37 @@ def init_db():
         )
     """)
 
+    # === catalog_cards: 目録カード (v30) ===
+    # sleep の神経学的整理に対し、catalog は navigability の整理。
+    # 夜間に build_catalog() が更新する。LLM が pull で引ける目録。
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS catalog_cards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_type TEXT NOT NULL,
+            key TEXT NOT NULL,
+            title TEXT,
+            content TEXT,
+            related_ids TEXT DEFAULT '[]',
+            stats TEXT DEFAULT '{}',
+            generation REAL DEFAULT 1.0,
+            source_hash TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            updated_at TEXT,
+            UNIQUE(entry_type, key)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_catalog_type ON catalog_cards(entry_type)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_catalog_key ON catalog_cards(key)")
+    # catalog 全文検索用 FTS5
+    try:
+        conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS catalog_fts USING fts5(
+                title, content, key, tokenize='unicode61'
+            )
+        """)
+    except sqlite3.OperationalError:
+        pass  # FTS5 未ビルドの場合は諦める
+
     # === 左脳/右脳テーブル分割 (v17.1) ===
     # cortex（左脳）: 意味的・分析的データ
     conn.execute("""
@@ -1828,6 +1859,700 @@ def schema_evolve(conn, schema_id, new_memory_id, new_vec):
         "UPDATE memories SET access_count = access_count + 1, last_accessed = ? WHERE id = ?",
         (now, schema_id)
     )
+
+
+# ============================================================
+# 6b. catalog — navigability のための目録 (v30)
+# sleep は神経学的 fitness の整理、catalog は navigability の整理。
+# 両者は目的も出力形式も使い手も違う。catalog は夜に更新される目録で、
+# LLM が pull で引く。
+# ============================================================
+
+# catalog 品質フィルタ（AI Agent Traps ガード）
+CATALOG_MIN_CONFIDENCE = 0.4
+CATALOG_EXCLUDED_DOMAIN_PREFIXES = ("external/",)
+CATALOG_EXCLUDED_PROVENANCE = {"external", "untrusted"}
+
+
+def _catalog_should_exclude(row_domains, provenance, confidence):
+    """catalog 入口の品質フィルタ。除外すべきなら True。"""
+    if confidence is not None and confidence < CATALOG_MIN_CONFIDENCE:
+        return True
+    if provenance in CATALOG_EXCLUDED_PROVENANCE:
+        return True
+    for d in (row_domains or []):
+        for prefix in CATALOG_EXCLUDED_DOMAIN_PREFIXES:
+            if d == prefix.rstrip("/") or d.startswith(prefix):
+                return True
+    return False
+
+
+def _catalog_upsert(conn, entry_type, key, title, content, related_ids, stats, source_hash):
+    """catalog_cards の一行を upsert。source_hash 比較で差分判定。"""
+    existing = conn.execute(
+        "SELECT id, source_hash FROM catalog_cards WHERE entry_type=? AND key=?",
+        (entry_type, key)
+    ).fetchone()
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    related_json = json.dumps(related_ids, ensure_ascii=False)
+    stats_json = json.dumps(stats, ensure_ascii=False)
+    if existing and existing["source_hash"] == source_hash:
+        return "unchanged"
+    if existing:
+        conn.execute(
+            """UPDATE catalog_cards
+               SET title=?, content=?, related_ids=?, stats=?, source_hash=?, updated_at=?
+               WHERE id=?""",
+            (title, content, related_json, stats_json, source_hash, now, existing["id"])
+        )
+        # FTS5 更新
+        conn.execute("DELETE FROM catalog_fts WHERE key = ?", (key,))
+        conn.execute(
+            "INSERT INTO catalog_fts (title, content, key) VALUES (?, ?, ?)",
+            (title or "", content or "", key)
+        )
+        return "updated"
+    else:
+        conn.execute(
+            """INSERT INTO catalog_cards
+               (entry_type, key, title, content, related_ids, stats, source_hash, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (entry_type, key, title, content, related_json, stats_json, source_hash, now)
+        )
+        conn.execute(
+            "INSERT INTO catalog_fts (title, content, key) VALUES (?, ?, ?)",
+            (title or "", content or "", key)
+        )
+        return "inserted"
+
+
+def _catalog_hash(payload):
+    """source_hash 計算。payload は安定的に並べ替え可能な構造。"""
+    import hashlib
+    s = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
+
+
+def _catalog_domain_index(conn, dry_run=False):
+    """各 domain の目録。件数・代表 id・top_keywords を集約。"""
+    rows = conn.execute(
+        """SELECT m.id, m.importance, m.last_accessed, c.domains, c.keywords,
+                  c.confidence, c.provenance
+           FROM memories m JOIN cortex c ON c.id = m.id
+           WHERE m.forgotten = 0"""
+    ).fetchall()
+    # domain → [rows]
+    by_domain = {}
+    for r in rows:
+        try:
+            doms = json.loads(r["domains"]) if r["domains"] else []
+        except (json.JSONDecodeError, TypeError):
+            doms = []
+        if _catalog_should_exclude(doms, r["provenance"], r["confidence"]):
+            continue
+        for d in doms:
+            by_domain.setdefault(d, []).append(r)
+
+    stats = {"inserted": 0, "updated": 0, "unchanged": 0}
+    for dom, drows in by_domain.items():
+        # 代表 id: importance 降順・last_accessed 降順で上位 10
+        sorted_rows = sorted(drows, key=lambda r: (-(r["importance"] or 0),
+                                                    r["last_accessed"] or ""),
+                             reverse=False)
+        sorted_rows.reverse()
+        related_ids = [r["id"] for r in sorted_rows[:10]]
+        # top keywords
+        from collections import Counter
+        kw_counter = Counter()
+        for r in drows:
+            try:
+                kws = json.loads(r["keywords"]) if r["keywords"] else []
+            except (json.JSONDecodeError, TypeError):
+                kws = []
+            for kw in kws:
+                kw_counter[kw] += 1
+        top_kw = [kw for kw, _ in kw_counter.most_common(5)]
+        count = len(drows)
+        # recent_id = last_accessed 最新
+        recent = max(drows, key=lambda r: r["last_accessed"] or "")
+        card_stats = {"count": count, "recent_id": recent["id"], "top_keywords": top_kw}
+        title = f"domain: {dom} ({count}件)"
+        content = f"{dom} — {count} memories. top keywords: {', '.join(top_kw)}"
+        source_hash = _catalog_hash({"ids": sorted(related_ids), "count": count, "top_kw": top_kw})
+        if not dry_run:
+            action = _catalog_upsert(conn, "domain_index", dom, title, content,
+                                     related_ids, card_stats, source_hash)
+            stats[action] += 1
+        else:
+            stats["unchanged"] += 1  # dry-run は unchanged 扱いでカウント
+    return stats
+
+
+def _catalog_cluster_abstract(conn, dry_run=False):
+    """schema 記憶を catalog で横流し索引化。"""
+    rows = conn.execute(
+        """SELECT m.id, m.content, m.importance, m.merged_from, m.access_count,
+                  c.keywords, c.domains, c.confidence, c.provenance
+           FROM memories m JOIN cortex c ON c.id = m.id
+           WHERE m.category = 'schema' AND m.forgotten = 0"""
+    ).fetchall()
+    stats = {"inserted": 0, "updated": 0, "unchanged": 0}
+    for r in rows:
+        try:
+            doms = json.loads(r["domains"]) if r["domains"] else []
+        except (json.JSONDecodeError, TypeError):
+            doms = []
+        if _catalog_should_exclude(doms, r["provenance"], r["confidence"]):
+            continue
+        try:
+            merged = json.loads(r["merged_from"]) if r["merged_from"] else []
+        except (json.JSONDecodeError, TypeError):
+            merged = []
+        try:
+            kws = json.loads(r["keywords"]) if r["keywords"] else []
+        except (json.JSONDecodeError, TypeError):
+            kws = []
+        key = f"schema_{r['id']}"
+        title = f"cluster #{r['id']}"
+        content = (r["content"] or "")[:400]
+        card_stats = {"member_count": len(merged), "access_count": r["access_count"],
+                      "top_keywords": kws[:5], "domains": doms}
+        source_hash = _catalog_hash({"id": r["id"], "merged": merged, "kws": kws[:10]})
+        if not dry_run:
+            action = _catalog_upsert(conn, "cluster_abstract", key, title, content,
+                                     merged, card_stats, source_hash)
+            stats[action] += 1
+        else:
+            stats["unchanged"] += 1
+    return stats
+
+
+def _catalog_entry_point(conn, dry_run=False):
+    """bridge node 検出: 複数 domain に繋がるノード。"""
+    # 各 memory のリンク先 domain の種類を Python 側で集計
+    rows = conn.execute(
+        """SELECT l.source_id, l.target_id, l.strength, c_target.domains target_domains,
+                  c_src.confidence src_conf, c_src.provenance src_prov,
+                  c_src.domains src_domains
+           FROM links l
+           JOIN cortex c_target ON c_target.id = l.target_id
+           JOIN cortex c_src ON c_src.id = l.source_id
+           JOIN memories m ON m.id = l.source_id
+           WHERE m.forgotten = 0"""
+    ).fetchall()
+    # source_id -> {domains seen, total strength}
+    agg = {}
+    for r in rows:
+        sid = r["source_id"]
+        try:
+            tdoms = set(json.loads(r["target_domains"])) if r["target_domains"] else set()
+        except (json.JSONDecodeError, TypeError):
+            tdoms = set()
+        if sid not in agg:
+            try:
+                sdoms = json.loads(r["src_domains"]) if r["src_domains"] else []
+            except (json.JSONDecodeError, TypeError):
+                sdoms = []
+            if _catalog_should_exclude(sdoms, r["src_prov"], r["src_conf"]):
+                agg[sid] = None
+                continue
+            agg[sid] = {"doms": set(), "weight": 0.0, "src_domains": sdoms}
+        if agg[sid] is None:
+            continue
+        agg[sid]["doms"] |= tdoms
+        agg[sid]["weight"] += r["strength"] or 0.0
+
+    # diversity >= 2 のノードを抽出
+    candidates = []
+    for sid, info in agg.items():
+        if info is None:
+            continue
+        diversity = len({d for d in info["doms"] if d != "unknown"})
+        if diversity >= 2:
+            candidates.append((sid, diversity, info["weight"], info["src_domains"]))
+
+    # 上位 30
+    candidates.sort(key=lambda x: (-x[1], -x[2]))
+    candidates = candidates[:30]
+    stats = {"inserted": 0, "updated": 0, "unchanged": 0}
+    for sid, diversity, weight, src_domains in candidates:
+        srow = conn.execute(
+            "SELECT content, importance, access_count FROM memories WHERE id = ?", (sid,)
+        ).fetchone()
+        if not srow:
+            continue
+        key = f"node_{sid}"
+        title = f"entry point #{sid} (diversity={diversity})"
+        content = (srow["content"] or "")[:300]
+        card_stats = {"diversity": diversity, "weight": round(weight, 3),
+                      "importance": srow["importance"], "access_count": srow["access_count"],
+                      "domains": src_domains}
+        source_hash = _catalog_hash({"sid": sid, "diversity": diversity,
+                                      "weight": round(weight, 2)})
+        if not dry_run:
+            action = _catalog_upsert(conn, "entry_point", key, title, content,
+                                     [sid], card_stats, source_hash)
+            stats[action] += 1
+        else:
+            stats["unchanged"] += 1
+    return stats
+
+
+def _catalog_time_index(conn, dry_run=False):
+    """月単位の索引。各月の importance 上位 5 件を related_ids に。"""
+    rows = conn.execute(
+        """SELECT m.id, m.importance, m.created_at, c.confidence, c.provenance, c.domains
+           FROM memories m JOIN cortex c ON c.id = m.id
+           WHERE m.forgotten = 0 AND m.created_at IS NOT NULL"""
+    ).fetchall()
+    by_month = {}
+    for r in rows:
+        try:
+            doms = json.loads(r["domains"]) if r["domains"] else []
+        except (json.JSONDecodeError, TypeError):
+            doms = []
+        if _catalog_should_exclude(doms, r["provenance"], r["confidence"]):
+            continue
+        ym = (r["created_at"] or "")[:7]  # YYYY-MM
+        if not ym:
+            continue
+        by_month.setdefault(ym, []).append(r)
+    stats = {"inserted": 0, "updated": 0, "unchanged": 0}
+    for ym, mrows in by_month.items():
+        sorted_rows = sorted(mrows, key=lambda r: -(r["importance"] or 0))
+        related_ids = [r["id"] for r in sorted_rows[:5]]
+        count = len(mrows)
+        title = f"time: {ym} ({count}件)"
+        content = f"{ym} — {count} memories"
+        card_stats = {"count": count, "top_ids": related_ids}
+        source_hash = _catalog_hash({"ym": ym, "top": related_ids, "count": count})
+        if not dry_run:
+            action = _catalog_upsert(conn, "time_index", ym, title, content,
+                                     related_ids, card_stats, source_hash)
+            stats[action] += 1
+        else:
+            stats["unchanged"] += 1
+    return stats
+
+
+def _catalog_person_index(conn, dry_run=False):
+    """limbic.relational_context の who 値で集計。who は GHOST_WHO 由来の
+    user 値（ghost を誰が使っているか）。対話相手など第三者の抽出は v30.1+。"""
+    rows = conn.execute(
+        """SELECT m.id, m.importance, l.relational_context,
+                  c.confidence, c.provenance, c.domains
+           FROM memories m
+           JOIN limbic l ON l.id = m.id
+           JOIN cortex c ON c.id = m.id
+           WHERE m.forgotten = 0 AND l.relational_context IS NOT NULL"""
+    ).fetchall()
+    by_person = {}
+    for r in rows:
+        try:
+            doms = json.loads(r["domains"]) if r["domains"] else []
+        except (json.JSONDecodeError, TypeError):
+            doms = []
+        if _catalog_should_exclude(doms, r["provenance"], r["confidence"]):
+            continue
+        try:
+            rc = json.loads(r["relational_context"]) if r["relational_context"] else {}
+        except (json.JSONDecodeError, TypeError):
+            rc = {}
+        who = rc.get("who") if isinstance(rc, dict) else None
+        if not who:
+            continue
+        by_person.setdefault(who, []).append(r)
+    stats = {"inserted": 0, "updated": 0, "unchanged": 0}
+    for who, prows in by_person.items():
+        sorted_rows = sorted(prows, key=lambda r: -(r["importance"] or 0))
+        related_ids = [r["id"] for r in sorted_rows[:10]]
+        count = len(prows)
+        title = f"person: {who} ({count}件)"
+        content = f"{who} — {count} memories linked via relational_context.who"
+        card_stats = {"count": count, "top_ids": related_ids}
+        source_hash = _catalog_hash({"who": who, "top": related_ids, "count": count})
+        if not dry_run:
+            action = _catalog_upsert(conn, "person_index", who, title, content,
+                                     related_ids, card_stats, source_hash)
+            stats[action] += 1
+        else:
+            stats["unchanged"] += 1
+    return stats
+
+
+def build_catalog(dry_run=False, full_rebuild=False):
+    """catalog_cards を更新する。各 entry_type を個別 try/except で囲み、
+    1 つが失敗しても他は進める。
+
+    full_rebuild=True の場合、既存の catalog_cards を一旦 TRUNCATE する。
+    通常は source_hash 比較で差分更新。
+    """
+    conn = get_connection()
+    if full_rebuild and not dry_run:
+        conn.execute("DELETE FROM catalog_cards")
+        conn.execute("DELETE FROM catalog_fts")
+    results = {}
+    for name, fn in [
+        ("domain_index", _catalog_domain_index),
+        ("cluster_abstract", _catalog_cluster_abstract),
+        ("entry_point", _catalog_entry_point),
+        ("time_index", _catalog_time_index),
+        ("person_index", _catalog_person_index),
+    ]:
+        try:
+            results[name] = fn(conn, dry_run=dry_run)
+        except Exception as e:
+            results[name] = {"error": str(e)}
+    if not dry_run:
+        conn.commit()
+    conn.close()
+    return results
+
+
+def _catalog_cli(args):
+    """catalog サブコマンド: build / summary / list / show / find"""
+    usage = (
+        "使い方:\n"
+        "  python memory.py catalog build [--full] [--dry-run]\n"
+        "  python memory.py catalog summary [--json]\n"
+        "  python memory.py catalog list <type> [--limit N] [--json]\n"
+        "  python memory.py catalog show <type> <key> [--json]\n"
+        "  python memory.py catalog find \"<query>\" [--type T] [--json]"
+    )
+    if not args:
+        print(usage)
+        return
+    sub = args[0]
+    json_mode = "--json" in args
+
+    if sub == "build":
+        full = "--full" in args
+        dry = "--dry-run" in args
+        results = build_catalog(dry_run=dry, full_rebuild=full)
+        if json_mode:
+            print(json.dumps(results, ensure_ascii=False, indent=2))
+        else:
+            mode = "dry-run" if dry else ("full" if full else "diff")
+            print(f"catalog build ({mode}):")
+            for k, v in results.items():
+                print(f"  {k}: {v}")
+        return
+
+    conn = get_connection()
+    try:
+        if sub == "summary":
+            rows = conn.execute(
+                """SELECT entry_type, COUNT(*) cnt, MAX(updated_at) last_update
+                   FROM catalog_cards GROUP BY entry_type"""
+            ).fetchall()
+            summary = [{"entry_type": r["entry_type"], "count": r["cnt"],
+                        "last_update": r["last_update"]} for r in rows]
+            if json_mode:
+                print(json.dumps(_json_envelope("catalog summary", summary),
+                                 ensure_ascii=False, indent=2))
+            else:
+                print("catalog summary:")
+                for r in summary:
+                    stale = ""
+                    if r["last_update"]:
+                        try:
+                            dt = datetime.strptime(r["last_update"], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+                            age_h = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+                            if age_h > 24:
+                                stale = f" (⚠️ {age_h:.0f}時間前)"
+                        except (ValueError, TypeError):
+                            pass
+                    print(f"  {r['entry_type']:20s} {r['count']:5d}件  updated={r['last_update']}{stale}")
+
+        elif sub == "list":
+            positional = [a for a in args[1:] if not a.startswith("--")]
+            if not positional:
+                print(usage); return
+            etype = positional[0]
+            limit = 20
+            for i, a in enumerate(args):
+                if a == "--limit" and i + 1 < len(args):
+                    try: limit = int(args[i + 1])
+                    except ValueError: pass
+            rows = conn.execute(
+                """SELECT entry_type, key, title, content, related_ids, stats, updated_at
+                   FROM catalog_cards WHERE entry_type = ?
+                   ORDER BY updated_at DESC LIMIT ?""",
+                (etype, limit)
+            ).fetchall()
+            cards = [{"entry_type": r["entry_type"], "key": r["key"], "title": r["title"],
+                      "content": r["content"],
+                      "related_ids": json.loads(r["related_ids"]) if r["related_ids"] else [],
+                      "stats": json.loads(r["stats"]) if r["stats"] else {},
+                      "updated_at": r["updated_at"]} for r in rows]
+            if json_mode:
+                print(json.dumps(_json_envelope("catalog list", cards, query=etype),
+                                 ensure_ascii=False, indent=2))
+            else:
+                print(f"catalog {etype} ({len(cards)}件):")
+                for c in cards:
+                    print(f"  [{c['key']}] {c['title']}")
+
+        elif sub == "show":
+            positional = [a for a in args[1:] if not a.startswith("--")]
+            if len(positional) < 2:
+                print(usage); return
+            etype, key = positional[0], positional[1]
+            row = conn.execute(
+                "SELECT * FROM catalog_cards WHERE entry_type=? AND key=?",
+                (etype, key)
+            ).fetchone()
+            if not row:
+                if json_mode:
+                    print(json.dumps(_json_envelope("catalog show", [], query=f"{etype}/{key}",
+                                                    meta={"error": "not found"}),
+                                     ensure_ascii=False))
+                else:
+                    print(f"{etype}/{key} not found")
+                return
+            card = {"entry_type": row["entry_type"], "key": row["key"], "title": row["title"],
+                    "content": row["content"],
+                    "related_ids": json.loads(row["related_ids"]) if row["related_ids"] else [],
+                    "stats": json.loads(row["stats"]) if row["stats"] else {},
+                    "created_at": row["created_at"], "updated_at": row["updated_at"]}
+            if json_mode:
+                print(json.dumps(_json_envelope("catalog show", [card], query=f"{etype}/{key}"),
+                                 ensure_ascii=False, indent=2))
+            else:
+                print(f"[{card['entry_type']}/{card['key']}] {card['title']}")
+                print(f"  updated: {card['updated_at']}")
+                print(f"  content: {card['content']}")
+                print(f"  related_ids: {card['related_ids']}")
+                print(f"  stats: {card['stats']}")
+
+        elif sub == "find":
+            positional = [a for a in args[1:] if not a.startswith("--")]
+            if not positional:
+                print(usage); return
+            query = positional[0]
+            filter_type = None
+            for i, a in enumerate(args):
+                if a == "--type" and i + 1 < len(args):
+                    filter_type = args[i + 1]
+            # FTS5 検索。MATCH クエリをエスケープ（簡易）
+            try:
+                fts_q = query.replace('"', '""')
+                if filter_type:
+                    rows = conn.execute(
+                        """SELECT c.* FROM catalog_cards c
+                           JOIN catalog_fts f ON f.key = c.key
+                           WHERE catalog_fts MATCH ? AND c.entry_type = ?
+                           LIMIT 20""",
+                        (f'"{fts_q}"', filter_type)
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        """SELECT c.* FROM catalog_cards c
+                           JOIN catalog_fts f ON f.key = c.key
+                           WHERE catalog_fts MATCH ?
+                           LIMIT 20""",
+                        (f'"{fts_q}"',)
+                    ).fetchall()
+            except sqlite3.OperationalError:
+                # FTS5 が使えない／クエリが壊れている場合は LIKE フォールバック
+                like = f"%{query}%"
+                if filter_type:
+                    rows = conn.execute(
+                        """SELECT * FROM catalog_cards
+                           WHERE (title LIKE ? OR content LIKE ?) AND entry_type = ?
+                           LIMIT 20""",
+                        (like, like, filter_type)
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        """SELECT * FROM catalog_cards
+                           WHERE title LIKE ? OR content LIKE ?
+                           LIMIT 20""",
+                        (like, like)
+                    ).fetchall()
+            cards = [{"entry_type": r["entry_type"], "key": r["key"], "title": r["title"],
+                      "content": (r["content"] or "")[:200]} for r in rows]
+            if json_mode:
+                print(json.dumps(_json_envelope("catalog find", cards, query=query),
+                                 ensure_ascii=False, indent=2))
+            else:
+                print(f"catalog find '{query}' ({len(cards)}件):")
+                for c in cards:
+                    print(f"  [{c['entry_type']}/{c['key']}] {c['title']}")
+        else:
+            print(usage)
+    finally:
+        conn.close()
+
+
+def _voice_cli(args):
+    """voice サブコマンド (v30): recall default から剥がした「内面」を
+    明示 pull にする。dmn / mood / insights / distill / rumination / polyphonic。"""
+    usage = (
+        "使い方:\n"
+        "  python memory.py voice dmn [--json]\n"
+        "  python memory.py voice mood [--json]\n"
+        "  python memory.py voice insights [--json]\n"
+        "  python memory.py voice distill <id1,id2,...> [--json]\n"
+        "  python memory.py voice rumination [--json]\n"
+        "  python memory.py voice polyphonic [N] [--json] [--domain D]"
+    )
+    if not args:
+        print(usage)
+        return
+    sub = args[0]
+    json_mode = "--json" in args
+
+    if sub == "dmn":
+        conn = get_connection()
+        # gap_hours はセッションベースで推定
+        try:
+            gap = _get_session_gap(conn)
+        except Exception:
+            gap = 1.0
+        if gap is None:
+            gap = 1.0
+        results_raw = default_mode_network(conn, gap)
+        if json_mode:
+            out = []
+            for a, b, path in results_raw:
+                out.append({
+                    "a": format_handle(conn, a, minimal=True),
+                    "b": format_handle(conn, b, minimal=True),
+                    "path": path,
+                })
+            conn.close()
+            print(json.dumps(_json_envelope("voice dmn", out,
+                                            meta={"gap_hours": round(gap, 2)}),
+                             ensure_ascii=False, indent=2))
+        else:
+            print(f"DMN (gap={gap:.1f}h):")
+            for a, b, path in results_raw:
+                print(f"  #{a['id']} ···{path}··· #{b['id']}")
+            conn.close()
+
+    elif sub == "mood":
+        conn = get_connection()
+        mood = _effective_mood(conn)
+        conn.close()
+        if json_mode:
+            print(json.dumps(_json_envelope("voice mood", [mood] if mood else [],
+                                            meta={"explicit": bool(load_mood())}),
+                             ensure_ascii=False, indent=2))
+        else:
+            if mood and mood.get("emotions"):
+                src = "明示" if load_mood() else "暗黙"
+                print(f"気分 [{src}]: {', '.join(mood['emotions'])} (覚醒:{mood['arousal']:.2f})")
+            else:
+                print("気分: なし")
+
+    elif sub == "insights":
+        # think.py / wander.py の未読洞察を列挙（_show_recent_insights の JSON 版）
+        conn = get_connection()
+        rows = conn.execute(
+            """SELECT * FROM memories
+               WHERE forgotten = 0 AND access_count = 0
+                 AND (source_conversation LIKE 'think:%' OR source_conversation LIKE 'wander:%')
+               ORDER BY created_at DESC LIMIT 5"""
+        ).fetchall()
+        if json_mode:
+            results = [{"handle": format_handle(conn, r)} for r in rows]
+            conn.close()
+            print(json.dumps(_json_envelope("voice insights", results),
+                             ensure_ascii=False, indent=2))
+        else:
+            if not rows:
+                print("insights: なし")
+            else:
+                print(f"💡 insights ({len(rows)}件):")
+                for r in rows:
+                    print(f"  #{r['id']} {(r['content'] or '')[:80]}")
+            conn.close()
+
+    elif sub == "distill":
+        positional = [a for a in args[1:] if not a.startswith("--")]
+        if not positional:
+            print(usage); return
+        id_str = positional[0]
+        ids = []
+        for part in id_str.split(","):
+            part = part.strip()
+            if part.isdigit():
+                ids.append(int(part))
+        if not ids:
+            print("有効な id が無い"); return
+        conn = get_connection()
+        placeholders = ",".join("?" * len(ids))
+        rows = conn.execute(
+            f"SELECT * FROM memories WHERE id IN ({placeholders}) AND forgotten = 0",
+            ids
+        ).fetchall()
+        mws = [(r, None) for r in rows]
+        state = _distill_state(mws)
+        conn.close()
+        if json_mode:
+            print(json.dumps(_json_envelope("voice distill",
+                                            [{"distilled": state, "source_ids": ids}],
+                                            query=id_str,
+                                            meta={"api": "gemini",
+                                                  "note": "external ingest (Gemini API)"}),
+                             ensure_ascii=False, indent=2))
+        else:
+            if state:
+                print(state)
+            else:
+                print("distill 失敗（GEMINI_API_KEY か API 応答を確認）")
+
+    elif sub == "rumination":
+        conn = get_connection()
+        ruminating = detect_rumination(conn)
+        if json_mode:
+            out = [{"id": r[0], "access_count": r[1], "keywords": r[2]} for r in ruminating]
+            conn.close()
+            print(json.dumps(_json_envelope("voice rumination", out),
+                             ensure_ascii=False, indent=2))
+        else:
+            if ruminating:
+                for r in ruminating:
+                    print(f"  🔄 #{r[0]} ({r[1]}回) [{', '.join(r[2])}]")
+            else:
+                print("rumination: なし")
+            conn.close()
+
+    elif sub == "polyphonic":
+        n = 3
+        for a in args[1:]:
+            if a.isdigit():
+                n = int(a)
+                break
+        requested_domains = _parse_domain_flag(args)
+        voices = recall_polyphonic(limit_per_voice=n, requested_domains=requested_domains)
+        if json_mode:
+            conn = get_connection()
+            out = {}
+            for vname, entries in voices.items():
+                if vname == "俯瞰":
+                    out[vname] = [{"text": t, "importance": imp} for t, imp in entries]
+                else:
+                    out[vname] = [{"handle": format_handle(conn, r, minimal=True),
+                                   "score": round(s, 3)} for r, s in entries]
+            conn.close()
+            print(json.dumps(_json_envelope("voice polyphonic", out),
+                             ensure_ascii=False, indent=2))
+        else:
+            for vname, entries in voices.items():
+                if not entries:
+                    continue
+                print(f"[{vname}]")
+                if vname == "俯瞰":
+                    for t, _ in entries:
+                        print(f"  {t}")
+                else:
+                    for r, _ in entries:
+                        print(f"  #{r['id']} {(r['content'] or '')[:60]}")
+
+    else:
+        print(usage)
 
 
 # ============================================================
@@ -3567,6 +4292,72 @@ def chain_memories(memory_id, depth=2):
     return result
 
 
+# v30 graph navigation — pull 型ハンドル返し
+def get_neighbors(memory_id, limit=10):
+    """指定ノードの隣接（1 歩先）を返す。strength 降順。"""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT m.*, l.strength FROM links l
+           JOIN memories m ON m.id = l.target_id
+           WHERE l.source_id = ? AND m.forgotten = 0
+           ORDER BY l.strength DESC LIMIT ?""",
+        (memory_id, limit)
+    ).fetchall()
+    results = [(row, row["strength"]) for row in rows]
+    conn.close()
+    return results
+
+
+def walk_from(memory_id, depth=2, per_hop=5):
+    """BFS: memory_id から depth 歩先まで展開。各ノードに最短距離を付ける。"""
+    conn = get_connection()
+    visited = {}  # id -> (row, dist)
+    frontier = [memory_id]
+    start_row = conn.execute(
+        "SELECT * FROM memories WHERE id = ? AND forgotten = 0", (memory_id,)
+    ).fetchone()
+    if not start_row:
+        conn.close()
+        return []
+    visited[memory_id] = (start_row, 0)
+
+    for d in range(1, depth + 1):
+        next_frontier = []
+        for mid in frontier:
+            links = conn.execute(
+                """SELECT l.target_id, l.strength, m.* FROM links l
+                   JOIN memories m ON m.id = l.target_id
+                   WHERE l.source_id = ? AND m.forgotten = 0
+                   ORDER BY l.strength DESC LIMIT ?""",
+                (mid, per_hop)
+            ).fetchall()
+            for lr in links:
+                tid = lr["target_id"]
+                if tid not in visited:
+                    visited[tid] = (lr, d)
+                    next_frontier.append(tid)
+        frontier = next_frontier
+        if not frontier:
+            break
+
+    conn.close()
+    return sorted(visited.values(), key=lambda x: (x[1], -(x[0]["importance"] or 0)))
+
+
+def nodes_at_domain(domain, limit=15):
+    """指定 domain の記憶を importance × last_accessed 順で返す。prefix 一致。"""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT m.* FROM memories m JOIN cortex c ON c.id = m.id
+           WHERE m.forgotten = 0
+             AND (c.domains LIKE ? OR c.domains LIKE ?)
+           ORDER BY m.importance DESC, m.last_accessed DESC LIMIT ?""",
+        (f'%"{domain}"%', f'%"{domain}/%',   limit)
+    ).fetchall()
+    conn.close()
+    return rows
+
+
 def mutate_metadata(conn):
     """
     メタデータ変容: 隣接記憶の影響でキーワード・埋め込み・情動が変化する。
@@ -3901,7 +4692,12 @@ def replay_memories():
 
 
 def nap():
-    """軽量sleep。replay + consolidateだけ。LLM不要。"""
+    """軽量sleep。replay + consolidateだけ。LLM不要。
+
+    v30: catalog は nap に含めない。catalog は full sleep（sleep.py）でのみ走る。
+    nap は ghost_hooks の 30 秒 timeout 内で完了する必要があるため、
+    重量級の catalog 全ビルドは除外する設計。
+    """
     conn = get_connection()
     conn.execute("""
         CREATE TABLE IF NOT EXISTS sleep_meta (
@@ -4283,6 +5079,7 @@ def _domain_cli(args):
     if not args:
         print(usage)
         return
+    json_mode = "--json" in args
     sub = args[0]
     conn = get_connection()
     try:
@@ -4297,15 +5094,41 @@ def _domain_cli(args):
                 for d in doms:
                     counts[d] = counts.get(d, 0) + 1
             total = sum(counts.values())
-            print(f"domain 別件数 (延べ {total}):")
-            for d, c in sorted(counts.items(), key=lambda x: -x[1]):
-                print(f"  {c:5d}  {d}")
+            if json_mode:
+                sorted_counts = sorted(counts.items(), key=lambda x: -x[1])
+                results = [{"domain": d, "count": c} for d, c in sorted_counts]
+                print(json.dumps(
+                    _json_envelope("domain list", results, meta={"total": total}),
+                    ensure_ascii=False, indent=2
+                ))
+            else:
+                print(f"domain 別件数 (延べ {total}):")
+                for d, c in sorted(counts.items(), key=lambda x: -x[1]):
+                    print(f"  {c:5d}  {d}")
         elif sub == "of":
-            if len(args) < 2:
+            # 位置引数を args から拾う（--json を除外）
+            positional = [a for a in args[1:] if not a.startswith("--")]
+            if not positional:
                 print(usage)
                 return
-            mid = int(args[1])
+            mid = int(positional[0])
             row = conn.execute("SELECT domains FROM cortex WHERE id = ?", (mid,)).fetchone()
+            if json_mode:
+                if not row:
+                    print(json.dumps(_json_envelope("domain of", [], query=str(mid),
+                                                    meta={"error": "not found"}),
+                                     ensure_ascii=False))
+                else:
+                    try:
+                        doms = json.loads(row["domains"]) if row["domains"] else ["unknown"]
+                    except (json.JSONDecodeError, TypeError):
+                        doms = ["unknown"]
+                    print(json.dumps(
+                        _json_envelope("domain of", [{"id": mid, "domains": doms}],
+                                       query=str(mid)),
+                        ensure_ascii=False, indent=2
+                    ))
+                return
             if not row:
                 print(f"#{mid} が見つからない")
                 return
@@ -4398,6 +5221,85 @@ def corpus_callosum(left, right, balance=0.5):
     if left <= 0 or right <= 0:
         return 0.0
     return left ** (1.0 - balance) * right ** balance
+
+
+def _load_anchors():
+    """dive 時の identity anchor (v30): 最小注入のための 5 件。
+
+    構成:
+      1-2. flashbulb IS NOT NULL から arousal 降順 2 件（自分史の杭）
+      3.   category='schema' かつ confidence>=0.7 から access_count 降順 1 件（抽象化済み自己像）
+      4.   importance=5 から last_accessed 降順 1 件（直近の最重要）
+      5.   最頻 domain（unknown 除く）から代表 1 件（今の関心地帯）
+
+    重複は dedupe、不足時はそのまま。5 件に達しなくても OK。
+    """
+    conn = get_connection()
+    picked_ids = []
+    picked_rows = []
+
+    def add(row):
+        if row and row["id"] not in picked_ids:
+            picked_ids.append(row["id"])
+            picked_rows.append(row)
+
+    # 1-2. flashbulb 2 件
+    flashbulbs = conn.execute(
+        """SELECT * FROM memories
+           WHERE flashbulb IS NOT NULL AND forgotten = 0
+           ORDER BY arousal DESC, importance DESC LIMIT 2"""
+    ).fetchall()
+    for r in flashbulbs:
+        add(r)
+
+    # 3. schema 1 件
+    schemas = conn.execute(
+        """SELECT * FROM memories
+           WHERE category = 'schema' AND forgotten = 0 AND confidence >= 0.7
+           ORDER BY access_count DESC LIMIT 1"""
+    ).fetchall()
+    for r in schemas:
+        add(r)
+
+    # 4. importance=5 直近
+    top_imp = conn.execute(
+        """SELECT * FROM memories
+           WHERE importance = 5 AND forgotten = 0
+           ORDER BY last_accessed DESC LIMIT 1"""
+    ).fetchall()
+    for r in top_imp:
+        add(r)
+
+    # 5. 最頻 domain の代表
+    doms_rows = conn.execute(
+        "SELECT domains FROM cortex WHERE domains IS NOT NULL"
+    ).fetchall()
+    from collections import Counter
+    counter = Counter()
+    for r in doms_rows:
+        try:
+            doms = json.loads(r["domains"]) if r["domains"] else []
+        except (json.JSONDecodeError, TypeError):
+            continue
+        for d in doms:
+            if d != "unknown":
+                counter[d] += 1
+    if counter:
+        top_dom = counter.most_common(1)[0][0]
+        # 該当 domain の代表を importance 降順で
+        dom_rows = conn.execute(
+            """SELECT m.* FROM memories m JOIN cortex c ON c.id = m.id
+               WHERE m.forgotten = 0 AND c.domains LIKE ?
+               ORDER BY m.importance DESC, m.last_accessed DESC LIMIT 3""",
+            (f'%"{top_dom}"%',)
+        ).fetchall()
+        for r in dom_rows:
+            if r["id"] not in picked_ids:
+                add(r)
+                break
+
+    conn.close()
+    return picked_rows
 
 
 def recall_important(limit=15, balance=0.5, requested_domains=None):
@@ -5948,6 +6850,103 @@ def format_memory_simple(row):
     return f"  #{row['id']} {content}"
 
 
+# v30 graph handle — pull 型 navigate 用の統一スキーマ
+def _get_top_links(conn, memory_id, limit=5):
+    """指定 id から最強の link を handle 用に取り出す。"""
+    rows = conn.execute(
+        """SELECT l.target_id, l.strength, m.content
+           FROM links l JOIN memories m ON l.target_id = m.id
+           WHERE l.source_id = ? AND m.forgotten = 0
+           ORDER BY l.strength DESC LIMIT ?""",
+        (memory_id, limit)
+    ).fetchall()
+    out = []
+    for r in rows:
+        snippet = (r["content"] or "")[:40]
+        out.append({
+            "id": r["target_id"],
+            "strength": round(r["strength"], 3),
+            "snippet": snippet
+        })
+    return out
+
+
+def _get_domains_for(conn, memory_id):
+    """cortex.domains を読み出して list で返す。"""
+    r = conn.execute("SELECT domains FROM cortex WHERE id = ?", (memory_id,)).fetchone()
+    if not r or not r["domains"]:
+        return ["unknown"]
+    try:
+        return json.loads(r["domains"])
+    except (json.JSONDecodeError, TypeError):
+        return ["unknown"]
+
+
+def format_handle(conn, row, full=False, minimal=False, include_links=True):
+    """graph handle: LLM が pull 型 navigate するための構造化データ。
+
+    - minimal: {id, snippet, domains} のみ（トークン節約）
+    - default: 主要フィールド + top_links (5件)
+    - full: content 全文 + merged_from + 全メタ
+    """
+    content = row["content"] or ""
+    domains = _get_domains_for(conn, row["id"])
+
+    if minimal:
+        snippet = content[:120]
+        return {
+            "id": row["id"],
+            "snippet": snippet,
+            "domains": domains,
+        }
+
+    handle = {
+        "id": row["id"],
+        "snippet": content[:120],
+        "category": row["category"] if "category" in row.keys() else None,
+        "domains": domains,
+        "keywords": json.loads(row["keywords"]) if row["keywords"] else [],
+        "importance": row["importance"] if "importance" in row.keys() else None,
+        "arousal": row["arousal"] if "arousal" in row.keys() else None,
+        "emotions": json.loads(row["emotions"]) if row["emotions"] else [],
+        "flashbulb": row["flashbulb"] if "flashbulb" in row.keys() else None,
+        "confidence": row["confidence"] if "confidence" in row.keys() else None,
+        "provenance": row["provenance"] if "provenance" in row.keys() else None,
+        "created_at": row["created_at"] if "created_at" in row.keys() else None,
+        "last_accessed": row["last_accessed"] if "last_accessed" in row.keys() else None,
+        "access_count": row["access_count"] if "access_count" in row.keys() else 0,
+    }
+
+    if include_links:
+        handle["top_links"] = _get_top_links(conn, row["id"])
+
+    if full:
+        handle["content"] = content
+        mf = row["merged_from"] if "merged_from" in row.keys() else None
+        if mf:
+            try:
+                handle["merged_from"] = json.loads(mf)
+            except (json.JSONDecodeError, TypeError):
+                handle["merged_from"] = None
+        handle["uuid"] = row["uuid"] if "uuid" in row.keys() else None
+
+    return handle
+
+
+def _json_envelope(cmd, results, query=None, meta=None):
+    """v30 共通 JSON エンベロープ。"""
+    envelope = {
+        "version": "v30",
+        "cmd": cmd,
+        "query": query,
+        "results": results,
+        "meta": meta or {},
+    }
+    if "count" not in envelope["meta"]:
+        envelope["meta"]["count"] = len(results) if isinstance(results, list) else None
+    return envelope
+
+
 def _distill_state(memories_with_scores, timeout=20):
     """記憶断片から「今の思考状態」を独白として蒸留する。
 
@@ -6522,11 +7521,12 @@ def main():
 
     elif cmd == "search":
         if len(sys.argv) < 3:
-            print("使い方: python memory.py search \"検索語\" [--like] [--raw] [--fuzzy] [--domain D1,D2]")
+            print("使い方: python memory.py search \"検索語\" [--like] [--raw] [--fuzzy] [--json] [--domain D1,D2]")
             return
         use_like = "--like" in sys.argv
         raw_mode = "--raw" in sys.argv
         fuzzy_mode = "--fuzzy" in sys.argv
+        json_mode = "--json" in sys.argv
         requested_domains = _parse_domain_flag(sys.argv)
         search_result = search_memories(sys.argv[2], use_like=use_like, fuzzy=fuzzy_mode, requested_domains=requested_domains)
         if fuzzy_mode:
@@ -6534,7 +7534,25 @@ def main():
         else:
             results = search_result
             fuzzy_results = []
-        if results:
+        if json_mode:
+            # v30 JSON 出力
+            conn = get_connection()
+            json_results = []
+            for row, sim in results:
+                h = format_handle(conn, row)
+                json_results.append({"handle": h, "similarity": sim})
+            fuzzy_out = []
+            for row, sim in fuzzy_results:
+                fuzzy_out.append({"handle": format_handle(conn, row, minimal=True), "similarity": sim})
+            conn.close()
+            meta = {"count": len(json_results), "mode": "LIKE" if use_like else "brain"}
+            if fuzzy_out:
+                meta["fuzzy"] = fuzzy_out
+            print(json.dumps(
+                _json_envelope("search", json_results, query=sys.argv[2], meta=meta),
+                ensure_ascii=False, indent=2
+            ))
+        elif results:
             mode = "LIKE" if use_like else "脳"
             if raw_mode:
                 print(f"想起 ({len(results)}件, {mode}検索):")
@@ -6548,31 +7566,46 @@ def main():
                 conn.close()
         else:
             print("想起できませんでした")
-        # 舌先現象: もやもや記憶を表示
-        if fuzzy_results:
-            print(f"  舌先現象 ({len(fuzzy_results)}件):")
-            for row, sim in fuzzy_results:
-                keywords = json.loads(row["keywords"]) if row["keywords"] else []
-                kw_str = ", ".join(keywords[:6])
-                print(f"  ?? #{row['id']} もやもや: [{kw_str}]")
+        if not json_mode:
+            # 舌先現象: もやもや記憶を表示
+            if fuzzy_results:
+                print(f"  舌先現象 ({len(fuzzy_results)}件):")
+                for row, sim in fuzzy_results:
+                    keywords = json.loads(row["keywords"]) if row["keywords"] else []
+                    kw_str = ", ".join(keywords[:6])
+                    print(f"  ?? #{row['id']} もやもや: [{kw_str}]")
 
-        # 反芻検出: 同じ記憶ばかり触ってたら警告
-        rum_conn = get_connection()
-        ruminating = detect_rumination(rum_conn)
-        if ruminating:
-            ids_str = ", ".join(f"#{r[0]}[{', '.join(r[2])}]" for r in ruminating)
-            print(f"  🔄 同じところを回ってる: {ids_str}")
-            print(f"     → recall --voices で別の視点を試してみて")
-        rum_conn.close()
+            # 反芻検出: 同じ記憶ばかり触ってたら警告（--rumination フラグ時のみ、または legacy）
+            if "--rumination" in sys.argv or "--legacy" in sys.argv:
+                rum_conn = get_connection()
+                ruminating = detect_rumination(rum_conn)
+                if ruminating:
+                    ids_str = ", ".join(f"#{r[0]}[{', '.join(r[2])}]" for r in ruminating)
+                    print(f"  🔄 同じところを回ってる: {ids_str}")
+                    print(f"     → recall --voices で別の視点を試してみて")
+                rum_conn.close()
 
     elif cmd == "chain":
         if len(sys.argv) < 3:
-            print("使い方: python memory.py chain ID [depth]")
+            print("使い方: python memory.py chain ID [depth] [--json]")
             return
         mid = int(sys.argv[2])
-        depth = int(sys.argv[3]) if len(sys.argv) > 3 else 2
+        # depth 位置引数（--json とぶつからないように isdigit で抽出）
+        depth = 2
+        for a in sys.argv[3:]:
+            if a.isdigit():
+                depth = int(a)
+                break
         chain = chain_memories(mid, depth)
-        if chain:
+        if "--json" in sys.argv:
+            conn = get_connection()
+            results = [{"handle": format_handle(conn, r), "depth": d} for r, d in chain]
+            conn.close()
+            print(json.dumps(
+                _json_envelope("chain", results, query=str(mid), meta={"depth": depth}),
+                ensure_ascii=False, indent=2
+            ))
+        elif chain:
             print(f"連想の連鎖 (#{mid} から深さ{depth}):")
             for row, d in chain:
                 indent = "  " + "→ " * d
@@ -6582,11 +7615,22 @@ def main():
 
     elif cmd == "detail":
         if len(sys.argv) < 3:
-            print("使い方: python memory.py detail ID")
+            print("使い方: python memory.py detail ID [--json]")
             return
         conn = get_connection()
         row = conn.execute("SELECT * FROM memories WHERE id = ?", (int(sys.argv[2]),)).fetchone()
-        if row:
+        if "--json" in sys.argv:
+            if row:
+                h = format_handle(conn, row, full=True)
+                print(json.dumps(
+                    _json_envelope("detail", [{"handle": h}], query=sys.argv[2]),
+                    ensure_ascii=False, indent=2
+                ))
+            else:
+                print(json.dumps(_json_envelope("detail", [], query=sys.argv[2],
+                                                meta={"error": "not found"}),
+                                 ensure_ascii=False))
+        elif row:
             print(format_memory_detail(row))
             links = conn.execute(
                 """SELECT l.target_id, l.strength, m.content
@@ -6604,17 +7648,34 @@ def main():
         conn.close()
 
     elif cmd == "recent":
-        n = int(sys.argv[2]) if len(sys.argv) > 2 else 10
+        # 数値位置引数のみ拾い（--json 等が混ざっても OK）
+        n = 10
+        for a in sys.argv[2:]:
+            if a.isdigit():
+                n = int(a)
+                break
         rows = get_recent(n)
-        print(f"最近の記憶 ({len(rows)}件):")
-        for row in rows:
-            print(format_memory(row))
+        if "--json" in sys.argv:
+            conn = get_connection()
+            results = [{"handle": format_handle(conn, r)} for r in rows]
+            conn.close()
+            print(json.dumps(_json_envelope("recent", results), ensure_ascii=False, indent=2))
+        else:
+            print(f"最近の記憶 ({len(rows)}件):")
+            for row in rows:
+                print(format_memory(row))
 
     elif cmd == "all":
         rows = get_all()
-        print(f"全記憶 ({len(rows)}件):")
-        for row in rows:
-            print(format_memory(row))
+        if "--json" in sys.argv:
+            conn = get_connection()
+            results = [{"handle": format_handle(conn, r, minimal=True)} for r in rows]
+            conn.close()
+            print(json.dumps(_json_envelope("all", results), ensure_ascii=False, indent=2))
+        else:
+            print(f"全記憶 ({len(rows)}件):")
+            for row in rows:
+                print(format_memory(row))
 
     elif cmd == "forget":
         if len(sys.argv) < 3:
@@ -6767,40 +7828,163 @@ def main():
                 print(f"🧠 右脳 ({right['name']}, {updated}):")
                 print(right["interpretation"])
 
+    elif cmd == "neighbors":
+        if len(sys.argv) < 3:
+            print("使い方: python memory.py neighbors ID [--limit N] [--json]")
+            return
+        mid = int(sys.argv[2])
+        limit = 10
+        for i, a in enumerate(sys.argv):
+            if a == "--limit" and i + 1 < len(sys.argv):
+                try:
+                    limit = int(sys.argv[i + 1])
+                except ValueError:
+                    pass
+        results_raw = get_neighbors(mid, limit=limit)
+        if "--json" in sys.argv:
+            conn = get_connection()
+            results = [{"handle": format_handle(conn, r), "strength": round(s, 3)}
+                       for r, s in results_raw]
+            conn.close()
+            print(json.dumps(
+                _json_envelope("neighbors", results, query=str(mid)),
+                ensure_ascii=False, indent=2
+            ))
+        else:
+            print(f"#{mid} の隣接 ({len(results_raw)}件):")
+            for r, s in results_raw:
+                print(f"  → #{r['id']} ({s:.3f}) {(r['content'] or '')[:60]}")
+
+    elif cmd == "walk":
+        if len(sys.argv) < 3:
+            print("使い方: python memory.py walk ID [--depth N] [--json]")
+            return
+        mid = int(sys.argv[2])
+        depth = 2
+        for i, a in enumerate(sys.argv):
+            if a == "--depth" and i + 1 < len(sys.argv):
+                try:
+                    depth = int(sys.argv[i + 1])
+                except ValueError:
+                    pass
+        nodes = walk_from(mid, depth=depth)
+        if "--json" in sys.argv:
+            conn = get_connection()
+            results = [{"handle": format_handle(conn, r), "distance": d} for r, d in nodes]
+            conn.close()
+            print(json.dumps(
+                _json_envelope("walk", results, query=str(mid), meta={"depth": depth}),
+                ensure_ascii=False, indent=2
+            ))
+        else:
+            print(f"#{mid} から {depth} 歩先まで ({len(nodes)}件):")
+            for r, d in nodes:
+                indent = "  " + "  " * d
+                print(f"{indent}[{d}] #{r['id']} {(r['content'] or '')[:60]}")
+
+    elif cmd == "at":
+        if len(sys.argv) < 3:
+            print("使い方: python memory.py at DOMAIN [--limit N] [--json]")
+            return
+        domain = sys.argv[2]
+        limit = 15
+        for i, a in enumerate(sys.argv):
+            if a == "--limit" and i + 1 < len(sys.argv):
+                try:
+                    limit = int(sys.argv[i + 1])
+                except ValueError:
+                    pass
+        rows = nodes_at_domain(domain, limit=limit)
+        if "--json" in sys.argv:
+            conn = get_connection()
+            results = [{"handle": format_handle(conn, r)} for r in rows]
+            conn.close()
+            print(json.dumps(
+                _json_envelope("at", results, query=domain),
+                ensure_ascii=False, indent=2
+            ))
+        else:
+            print(f"domain={domain} のノード ({len(rows)}件):")
+            for r in rows:
+                stars = "★" * (r["importance"] or 0)
+                print(f"  #{r['id']} {stars} {(r['content'] or '')[:60]}")
+
+    elif cmd == "anchor":
+        # v30 identity anchor: dive 時の最小注入用
+        as_json = "--json" in sys.argv
+        anchors = _load_anchors()
+        if as_json:
+            conn = get_connection()
+            results = [{"handle": format_handle(conn, r, full=False, include_links=False)}
+                       for r in anchors]
+            conn.close()
+            print(json.dumps(_json_envelope("anchor", results), ensure_ascii=False, indent=2))
+        else:
+            print(f"identity anchor ({len(anchors)}件):")
+            for r in anchors:
+                tag = []
+                if r["flashbulb"]:
+                    tag.append("💎")
+                if r["category"] == "schema":
+                    tag.append("[スキーマ]")
+                if r["importance"] == 5:
+                    tag.append("★★★★★")
+                tag_str = " ".join(tag)
+                content = (r["content"] or "")[:100]
+                print(f"  #{r['id']} {tag_str} {content}")
+
     elif cmd == "recall":
-        # メタ認知: 前回recallの事後検証
-        prev_eval = evaluate_last_recall()
-        if prev_eval:
-            p = prev_eval["precision"]
-            r = prev_eval["recall_rate"]
-            print(f"(前回recall検証: 精度{p:.0%} 網羅{r:.0%} "
-                  f"空振{len(prev_eval['noise'])} 漏れ{len(prev_eval['missed'])})")
+        # v30: default は pull 指向の simple list のみ。内面系は全部 opt-in。
+        # --legacy で旧挙動（独白蒸留・DMN・気分・反芻警告・auto_voices）を復活。
+        legacy = "--legacy" in sys.argv
+        if legacy:
+            print("[deprecation] --legacy は v30.2 で撤去予定。voice/catalog 系 CLI へ移行を。",
+                  file=sys.stderr)
 
-        # DMN（デフォルトモードネットワーク）: 間隔に応じて起動
-        dmn_conn = get_connection()
-        gap = _get_session_gap(dmn_conn)
-        if gap is not None and gap >= 1.0:
-            dmn_results = default_mode_network(dmn_conn, gap)
-            if dmn_results:
-                if gap >= 24:
-                    gap_str = f"{gap/24:.0f}日"
-                else:
-                    gap_str = f"{gap:.0f}時間"
-                print(f"💭 DMN（{gap_str}ぶり — ぼーっとしてたら浮かんできた）:")
-                for a, b, path in dmn_results:
-                    kw_a = json.loads(a["keywords"])[:3] if a["keywords"] else []
-                    kw_b = json.loads(b["keywords"])[:3] if b["keywords"] else []
-                    print(f"  #{a['id']} [{', '.join(kw_a)}] ···{path}··· #{b['id']} [{', '.join(kw_b)}]")
-                print()
-        dmn_conn.close()
+        # --meta または --legacy の時のみ事後検証プリント
+        if "--meta" in sys.argv or legacy:
+            prev_eval = evaluate_last_recall()
+            if prev_eval:
+                p = prev_eval["precision"]
+                r = prev_eval["recall_rate"]
+                print(f"(前回recall検証: 精度{p:.0%} 網羅{r:.0%} "
+                      f"空振{len(prev_eval['noise'])} 漏れ{len(prev_eval['missed'])})")
 
-        # ひらめき枠: think.pyが前回以降に保存した洞察を表示
-        _show_recent_insights()
+        # --dmn または --legacy の時のみ DMN 発火
+        gap = None
+        if "--dmn" in sys.argv or legacy:
+            dmn_conn = get_connection()
+            gap = _get_session_gap(dmn_conn)
+            if gap is not None and gap >= 1.0:
+                dmn_results = default_mode_network(dmn_conn, gap)
+                if dmn_results:
+                    if gap >= 24:
+                        gap_str = f"{gap/24:.0f}日"
+                    else:
+                        gap_str = f"{gap:.0f}時間"
+                    print(f"💭 DMN（{gap_str}ぶり — ぼーっとしてたら浮かんできた）:")
+                    for a, b, path in dmn_results:
+                        kw_a = json.loads(a["keywords"])[:3] if a["keywords"] else []
+                        kw_b = json.loads(b["keywords"])[:3] if b["keywords"] else []
+                        print(f"  #{a['id']} [{', '.join(kw_a)}] ···{path}··· #{b['id']} [{', '.join(kw_b)}]")
+                    print()
+            dmn_conn.close()
 
-        # 間隔が長い（6時間以上）なら自動でvoicesモードに切り替え
-        auto_voices = gap is not None and gap >= 6.0 and "--voices" not in sys.argv
-        if auto_voices:
-            print(f"(久しぶりなので内的対話モードで想起します)\n")
+        # --insights または --legacy の時のみ
+        if "--insights" in sys.argv or legacy:
+            _show_recent_insights()
+
+        # auto_voices: --legacy の時のみ（default では撤去）
+        auto_voices = False
+        if legacy:
+            # legacy モードの時だけ 6h 以上で自動発火（旧挙動）
+            if gap is None:
+                _g_conn = get_connection()
+                gap = _get_session_gap(_g_conn)
+                _g_conn.close()
+            auto_voices = gap is not None and gap >= 6.0 and "--voices" not in sys.argv
+            if auto_voices:
+                print(f"(久しぶりなので内的対話モードで想起します)\n")
 
         if "--voices" in sys.argv or auto_voices:
             # 内的対話モード
@@ -6815,19 +7999,20 @@ def main():
             fragments_only = "--fragments" in sys.argv
             conn = get_connection()
 
-            # 今効いてる気分を表示
-            mood = _effective_mood(conn)
-            if mood and mood.get("emotions"):
-                explicit = load_mood()
-                if explicit and explicit.get("emotions"):
-                    mood_src = "明示"
+            # --with-mood または --legacy の時のみ気分を表示
+            if "--with-mood" in sys.argv or legacy:
+                mood = _effective_mood(conn)
+                if mood and mood.get("emotions"):
+                    explicit = load_mood()
+                    if explicit and explicit.get("emotions"):
+                        mood_src = "明示"
+                    else:
+                        mood_src = "暗黙（最近触った記憶から推定）"
+                    emo_str = ", ".join(mood["emotions"])
+                    print(f"気分: {emo_str} (覚醒度:{mood['arousal']:.2f}) [{mood_src}]")
+                    print(f"  → 共感は{emo_str}系を出す / 補完はそれ以外を出す")
                 else:
-                    mood_src = "暗黙（最近触った記憶から推定）"
-                emo_str = ", ".join(mood["emotions"])
-                print(f"気分: {emo_str} (覚醒度:{mood['arousal']:.2f}) [{mood_src}]")
-                print(f"  → 共感は{emo_str}系を出す / 補完はそれ以外を出す")
-            else:
-                print("気分: なし（共感と補完の差は出にくい）")
+                    print("気分: なし（共感と補完の差は出にくい）")
 
             voice_labels = {
                 "共感": "🤝",
@@ -6860,7 +8045,9 @@ def main():
             full_mode = "--full" in sys.argv
             raw_mode = "--raw" in sys.argv
             fragments_only = "--fragments" in sys.argv
-            no_distill = "--no-distill" in sys.argv or raw_mode or full_mode
+            json_mode = "--json" in sys.argv
+            # v30: --distill か --legacy の時のみ蒸留。default は simple list
+            want_distill = ("--distill" in sys.argv or legacy) and not (raw_mode or full_mode or json_mode)
             default_limit = 15 if full_mode else 10
             limit = default_limit
             for arg in sys.argv[2:]:
@@ -6877,13 +8064,20 @@ def main():
             requested_domains = _parse_domain_flag(sys.argv)
             results = recall_important(limit, balance=balance, requested_domains=requested_domains)
 
-            # 蒸留モード: LLMで独白状態として再構築（フラット化対策）
-            if not no_distill:
+            if json_mode:
+                conn = get_connection()
+                json_results = [{"handle": format_handle(conn, r), "score": s}
+                                for r, s in results]
+                conn.close()
+                print(json.dumps(
+                    _json_envelope("recall", json_results, meta={"limit": limit, "balance": balance}),
+                    ensure_ascii=False, indent=2
+                ))
+            elif want_distill:
                 state = _distill_state(results)
                 if state:
                     print(state)
                 else:
-                    # API失敗時はsimple形式にフォールバック
                     print(f"自動想起 ({len(results)}件):")
                     for row, score in results:
                         print(format_memory_simple(row))
@@ -6949,6 +8143,12 @@ def main():
 
     elif cmd == "domain":
         _domain_cli(sys.argv[2:])
+
+    elif cmd == "catalog":
+        _catalog_cli(sys.argv[2:])
+
+    elif cmd == "voice":
+        _voice_cli(sys.argv[2:])
 
     elif cmd == "overview":
         overview()
