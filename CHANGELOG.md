@@ -1,5 +1,59 @@
 # Changelog
 
+## [v30.2] - 2026-04-23
+
+### raw_turn 層の目録化 — session_index / topic_thread + Gemini CLI 統一 + スコープ検索
+
+v30.1 までの catalog は memory 層（忘却を経た層）だけを索引していた。だが意味は
+raw_turn（原文、忘却なし）にしか残らない場面が多い。raw_turn 層にも並立で目録を
+立てて、navigation の覆いを広げた。
+
+比喩: memory catalog = 海馬の索引、raw_turn catalog = 日誌のインデックス。
+人間も記憶と日記は別に管理する。ghost が日誌（raw_turn）を持ってるのに目録が
+記憶側だけなのは片側ブラインド、を埋める。
+
+#### 実装（memory.py）
+- **新 entry_type `session_index`**: `session_id` 単位で raw_turn を集約、Gemini で
+  title / summary / keywords / topic_slug / status / status_note を生成。
+  `related_ids` に session 内の raw_turn id 群、`stats` に turn_count / user_turns /
+  assistant_turns / start_ts / end_ts / cwd / git_branch。差分更新は
+  `source_hash = (sid, turn_count, last_ts, v)` で判定（ongoing session が進んだら
+  自動再要約）。`max_sessions_per_build=40` で初回大量リクエストを抑制。
+- **新 entry_type `topic_thread`**: session_index の `topic_slug` を embedding cosine
+  （title + summary + keywords を embed 対象、threshold=0.88）で Union-Find
+  クラスタリングし、session_count >= 2 のクラスタを topic カードに。Gemini で
+  cross-session 要約を生成。key = `topic_<representative_slug>`、stats に session_ids /
+  member_slugs / turn_count_total / first_ts / last_ts。
+- **status フィールド**: session_index の stats に `status`
+  （solved / unsolved / ongoing / abandoned）と `status_note`（判定根拠）を追加。
+  「結論が明示されてなければ未決と書け」をプロンプトで強制して捏造を抑制。
+- **Gemini CLI 経由に統一**: `_extract_mentions_batch` / `_distill_state` /
+  `_summarize_session_batch` / `_summarize_topic_thread` の HTTP 直叩きを撤去し、
+  `_gemini_cli_call(prompt, model, timeout, retries=3)` + `_parse_gemini_json`
+  （```json fence 剥がし対応）に一本化。skill 層と実行経路を合わせ、
+  `GEMINI_API_KEY` 依存を撤去（CLI の OAuth に統一）。モデルは
+  `GEMINI_DEFAULT_MODEL` 環境変数（デフォルト gemini-3.1-pro-preview）、
+  個別関数は `MENTIONS_MODEL` / `SESSION_INDEX_MODEL` / `TOPIC_THREAD_MODEL` /
+  `RECALL_DISTILL_MODEL` で上書き可。
+- **`search --session <sid>` / `--topic <slug>` / `--status <S>`**: session_index /
+  topic_thread を namespace として使う raw_turn 検索。複数指定時は AND。FTS5 で
+  session_id フィルタをかけ、hit した raw_turn に session_title と status を添えて返す。
+  LIKE fallback も同じ filter で動く。`--status solved` で過去の成功例を引き、
+  `--status unsolved` で未決の山をバックログとして見える化できる。
+
+#### 実装（build_catalog / sleep.py）
+- `build_catalog()` の all_fns に `session_index` → `topic_thread` の順で追加。
+  topic_thread は session_index の成果物を束ねるので必ず後。sleep.py は既存の
+  `catalog build` を呼ぶだけなので、夜間バッチに自動組込み（sleep.py 自体は無変更）。
+
+#### 運用メモ
+- pro-preview は flash 比で 10 倍遅い（1 call 50-150 秒）。品質は一段上で
+  status 判定や結論/未決の区別が安定する。夜間バッチ前提なら許容。速度優先なら
+  `SESSION_INDEX_MODEL=gemini-2.5-flash` で上書き可。
+- embedding threshold=0.88 は短文字列（snake_case の slug）問題を回避するため、
+  embed 対象を title + summary + keywords に拡張した結果の値。データが増えたら
+  再チューニング。
+
 ## [v30.1] - 2026-04-22
 
 ### v30 延期リストの回収 — catalog 深堀り + mentions 抽出 + --legacy 撤去

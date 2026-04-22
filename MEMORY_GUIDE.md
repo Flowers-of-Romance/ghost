@@ -15,6 +15,9 @@ context window は LLM の**作業場**。ghost は作業場の外にある**図
 # 基本
 python memory.py add "内容" カテゴリ "出典" [--domain D1,D2]
 python memory.py search "検索語" [--raw] [--fuzzy] [--json] [--domain D1,D2]
+python memory.py search "検索語" --session SID     # session 内の raw_turn だけ検索
+python memory.py search "検索語" --topic SLUG      # topic_thread の session 群を横断検索
+python memory.py search "検索語" --status solved   # solved|unsolved|ongoing|abandoned で絞り込み
 python memory.py recall [N] [--json] [--distill] [--dmn] [--insights] [--with-mood] [--meta] [--legacy]
 python memory.py recall --voices [N] [--domain D1,D2]   # 内的対話（共感・補完・批判・連想）
 python memory.py detail ID [--json]
@@ -35,7 +38,11 @@ python memory.py catalog summary [--json]                # 目録の全体サマ
 python memory.py catalog list <type> [--limit N] [--json]
 python memory.py catalog show <type> <key> [--json]
 python memory.py catalog find "<query>" [--type T] [--json]
-# entry_type: domain_index / cluster_abstract / entry_point / time_index / person_index
+# entry_type (v30):  domain_index / cluster_abstract / entry_point / time_index /
+#                    time_week / time_day / person_index / hot_node
+# entry_type (v30.2 raw_turn 層): session_index / topic_thread
+#   - session_index: session_id 単位の要約。stats に status (solved/unsolved/ongoing/abandoned) + status_note。
+#   - topic_thread:  session_index を topic_slug で束ねた上位索引（session_count >= 2 のみ）。
 
 # voice (v30): recall default から剥がした「内面」を明示 pull
 python memory.py voice dmn [--json]             # デフォルトモードネットワーク
