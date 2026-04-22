@@ -54,25 +54,18 @@ raw_turn（原文、忘却なし）にしか残らない場面が多い。raw_tu
   embed 対象を title + summary + keywords に拡張している。
 
 #### 追加修正（topic_thread 巨塊回避）
-全 294 session で回した初回で `topic_claude_code_rc` が 39 session を抱え込んだ
-（ローカル AI / ハードウェア / ComfyUI / ollama 等が「環境構築」という粗さで
-束ねられた）。以下を入れて解消した:
+単純 Union-Find だけだと e5-small の cosine 空間で隣接話題が繋がって巨塊化しやすい
+（「環境構築」「開発全般」など粗いドメインで全部吸着する）。以下を入れた:
 
 - **`similarity_threshold` デフォルトを 0.88 → 0.92** に引き上げ
 - **`_cluster_with_size_limit`**: 初期 threshold で分けたあと session_count が
   `max_size`（=10）を超えたクラスタは内部で threshold を 0.02 ずつ段階的に上げて
   再分割、`max_threshold`（=0.98）まで到達しても解けない塊は破棄する
 - **代表 slug 選定を「最頻 session 数」に変更**: 従来は最短文字列だったが、
-  偶然短い slug が代表になり title が誘導される問題があった（`claude_code_rc` が
-  代表になって巨塊全体を「Claude Code リモート接続」と命名してしまう現象）。
-  `_pick_representative_slug` で中心的な slug を選ぶ
+  偶然短い slug が代表になると title が誘導される（slug 1 個の主題が cluster 全体の
+  名前になってしまう）。`_pick_representative_slug` で中心的な slug を選ぶ
 - **`_summarize_topic_thread` の prompt から slug 依存を除去**: 与える slug で
   title が誘導されるのを防ぎ、session 群の内容だけを見て主題を再命名させる
-
-再 rebuild 後: 最大クラスタ 7 session / 全 15 cluster。`topic_claude_code_remote_check`
-は純粋にリモートアクセス検証の 3 session のみ、ComfyUI / 翻訳 / ハードウェア /
-ghost 内部設計（cortex-limbic / memory arch / FTS）などがそれぞれ独立した意味単位の
-topic カードになった。
 
 ## [v30.1] - 2026-04-22
 
