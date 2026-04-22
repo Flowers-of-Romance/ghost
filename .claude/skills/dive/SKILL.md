@@ -10,8 +10,7 @@ user-invocable: true
 
 **v30 以降、dive は「図書館に入る合図」であって「図書館の中身を全部テーブルに広げる」ではない。**
 LLM は作業場（context window）で考え、必要な時に図書館（ghost）へ取りに行く pull 型運用。
-dive が自動注入するのは identity anchor（5 点程度）と catalog summary だけで、
-content は query が来るまで context に入れない。
+dive 自体は content を何も注入しない。状態マーカーを立てて、以降 query 駆動で pull する。
 
 ## 手順
 
@@ -21,24 +20,14 @@ content は query が来るまで context に入れない。
    ```
    CLAUDE.mdや過去の文脈から明らかな場合（例: Jの環境で起動された）は聞かずにセットしてよい。
 
-2. ghost.toml の `[brain]` セクションに `left_cmd` または `right_cmd` が設定されているか確認する。
-
-3. **identity anchor** を取る（誰の図書館か思い出すための 5 点）:
-   ```bash
-   python memory.py anchor
-   ```
-
-4. **catalog summary** を取る（図書館の目録が最新か確認、24h 以上古ければ警告表示）:
-   ```bash
-   python memory.py catalog summary
-   ```
-
-5. ステータスライン用のマーカーファイルを作成:
+2. ステータスライン用のマーカーファイルを作成:
    ```bash
    python -c "from pathlib import Path; import tempfile, os; Path(tempfile.gettempdir(), 'dive-active').write_text(str(os.getppid()))"
    ```
 
-6. 以降の会話で必要になった時に pull する。使える tool（全て `--json` 対応）:
+3. 以降の会話で必要になった時に pull する。使える tool（全て `--json` 対応）:
+   - `python memory.py anchor` — 誰の図書館か思い出す 5 点（必要になった時だけ）
+   - `python memory.py catalog summary` — 目録が最新か確認
    - `python memory.py search "語" [--domain X]` — 記憶を検索
    - `python memory.py detail <id>` — 記憶の詳細
    - `python memory.py neighbors <id>` — 指定ノードの隣接
@@ -52,11 +41,11 @@ content は query が来るまで context に入れない。
    - `python memory.py domain set <id> D1,D2` — 凡例を手で付ける
    - 旧挙動が欲しければ `python memory.py recall --legacy`（独白蒸留・DMN 等、v30.2 で撤去予定）
 
-7. 記憶から得た情報は自然に知っているように振る舞う。pull した query と結果の対応は
+4. 記憶から得た情報は自然に知っているように振る舞う。pull した query と結果の対応は
    コンテキストに残る（provenance が分かる）ので、混濁を感じたら domain タグを足す。
 
 ## 報告
 
 > 潜水開始
 
-とだけ言い、anchor と catalog summary の内容に基づいて会話を続ける。
+とだけ言う。query が来るまで何も pull しない。

@@ -31,6 +31,7 @@ steps = [
     ("replay",        [sys.executable, "memory.py", "replay"]),
     ("consolidate",   [sys.executable, "memory.py", "consolidate"]),
     ("schema",        [sys.executable, "memory.py", "schema"]),
+    ("mentions",      [sys.executable, "memory.py", "extract-mentions", "--limit", "100"]),
     ("catalog",       [sys.executable, "memory.py", "catalog", "build"]),
     ("proceduralize", [sys.executable, "memory.py", "proceduralize"]),
     ("think",         [sys.executable, "think.py"]),
