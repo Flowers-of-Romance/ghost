@@ -1,5 +1,48 @@
 # Changelog
 
+## [v30.1] - 2026-04-22
+
+### v30 延期リストの回収 — catalog 深堀り + mentions 抽出 + --legacy 撤去
+
+v30 で catalog を立てて運用してみて気になった 6 項目をまとめて埋めた。
+dive は v30 の思想どおり「接続の合図」だけに縮めた（anchor/catalog の自動 pull を撤去）。
+
+#### 実装（memory.py）
+- **catalog find の embedding fallback**: FTS5 が 0 件の時に query を embed →
+  `memories_vec` で近傍検索 → hit した memory_id を `related_ids` に含む catalog_cards を返す。
+  LIKE は FTS5 例外時の最終フォールバックとして残す。検索経路は `_source` / 表示で明示。
+- **recall_log 還流 (`hot_node`)**: 過去 30 日の `recall_log.recalled_ids` を集計し、
+  頻出上位 30 件を新 entry_type `hot_node` として catalog 化。`entry_point`（bridge 検出）
+  とは別軸 — 実際によく引かれたノードが目録に昇る。
+- **catalog 部分更新**: `build_catalog(only_types=[...], only_key=...)` 追加。各
+  `_catalog_*` 関数に `only_key` 引数。CLI: `catalog build --type T [--key K]`。
+- **time_index の週/日バリエーション**: 新 entry_type `time_week`（ISO 週 YYYY-Www、全期間）と
+  `time_day`（YYYY-MM-DD、過去 60 日のみ、カットオフ外の古いカードは毎回削除）。既存の
+  `time_index`（月）は保全。
+- **`extract-mentions` + `person_index` 拡張**: Gemini で本文から人名（第三者への言及）を
+  抽出し `limbic.relational_context.mentions` に保存する夜間バッチ。`mentions` キーが既に
+  ある記憶はスキップ（空配列も「抽出済み」扱い＝冪等）。batch 失敗時は次回再挑戦。
+  `_catalog_person_index` は従来の `who`（書き手＝GHOST_WHO）に加えて `mentions` も
+  併合し、各人物を 1 card、`card_stats.via` に経路（who / mentions / 両方）を残す。
+  `who` と同一人物の自己言及は除外。`MENTIONS_MODEL` 環境変数で model 上書き可。
+- **`--legacy` フラグ撤去**: v30 で独白蒸留・DMN・気分・反芻警告・auto_voices を opt-in に
+  切り出した時に残していた後方互換口を削除。各機能は `--distill` / `--dmn` / `--with-mood`
+  / `--rumination` / `--voices` および `voice distill | dmn | mood | insights | rumination
+  | polyphonic` として個別に残っているので機能上の穴はない。
+
+#### 実装（sleep.py）
+- `steps` に `mentions` ステップを `schema` と `catalog` の間に挿入。catalog が抽出済みの
+  mentions を拾って `person_index` に反映する順序。夜間バッチなので API 失敗しても翌日拾える。
+
+#### 実装（.claude/skills/dive/SKILL.md）
+- 手順から「anchor 自動 pull」「catalog summary 自動 pull」を撤去。
+  dive は GHOST_WHO セット → マーカー作成 → 報告の 3 ステップに。
+- anchor/catalog summary は「必要になった時に pull する tool」の一つに格下げ。v30 の
+  pull-first 思想に完全に揃えた。
+
+#### v30 延期リストの状態
+- v30 立ち上げ時の 6 項目はすべて解消。次の設計課題は運用しながら見つける。
+
 ## [v30] - 2026-04-21
 
 ### pull-first interface + catalog — 図書館の比喩
@@ -76,10 +119,10 @@ pull 型は**ingest しない権利**が原理的に残る。Claude 自立の基
 
 #### v30.1 以降に延期
 - `relational_context` の `who` 人名抽出強化（現状は GHOST_WHO 由来の user 値に偏る前提。対話相手など第三者の抽出は未実装）
-- `catalog find` の embedding フォールバック改善
-- `recall_log` を catalog に還流（頻出ノードを entry_point に昇格）
-- catalog の部分更新粒度を細かく（key 単位）
-- time_index の週単位・日単位バリエーション
+- `catalog find` の embedding フォールバック改善 → **v30.1 で実装**
+- `recall_log` を catalog に還流（頻出ノードを entry_point に昇格） → **v30.1 で `hot_node` として実装**
+- catalog の部分更新粒度を細かく（key 単位） → **v30.1 で実装**
+- time_index の週単位・日単位バリエーション → **v30.1 で `time_week` / `time_day` として実装**
 - **v30.2 で `--legacy` を撤去**
 
 ## [v29] - 2026-04-21

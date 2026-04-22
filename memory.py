@@ -1933,8 +1933,9 @@ def _catalog_hash(payload):
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
 
-def _catalog_domain_index(conn, dry_run=False):
-    """各 domain の目録。件数・代表 id・top_keywords を集約。"""
+def _catalog_domain_index(conn, dry_run=False, only_key=None):
+    """各 domain の目録。件数・代表 id・top_keywords を集約。
+    only_key で特定 domain だけを再計算。"""
     rows = conn.execute(
         """SELECT m.id, m.importance, m.last_accessed, c.domains, c.keywords,
                   c.confidence, c.provenance
@@ -1955,6 +1956,8 @@ def _catalog_domain_index(conn, dry_run=False):
 
     stats = {"inserted": 0, "updated": 0, "unchanged": 0}
     for dom, drows in by_domain.items():
+        if only_key is not None and dom != only_key:
+            continue
         # 代表 id: importance 降順・last_accessed 降順で上位 10
         sorted_rows = sorted(drows, key=lambda r: (-(r["importance"] or 0),
                                                     r["last_accessed"] or ""),
@@ -1988,14 +1991,20 @@ def _catalog_domain_index(conn, dry_run=False):
     return stats
 
 
-def _catalog_cluster_abstract(conn, dry_run=False):
-    """schema 記憶を catalog で横流し索引化。"""
-    rows = conn.execute(
-        """SELECT m.id, m.content, m.importance, m.merged_from, m.access_count,
+def _catalog_cluster_abstract(conn, dry_run=False, only_key=None):
+    """schema 記憶を catalog で横流し索引化。only_key で schema_<id> だけ再計算。"""
+    base_sql = """SELECT m.id, m.content, m.importance, m.merged_from, m.access_count,
                   c.keywords, c.domains, c.confidence, c.provenance
            FROM memories m JOIN cortex c ON c.id = m.id
            WHERE m.category = 'schema' AND m.forgotten = 0"""
-    ).fetchall()
+    if only_key is not None:
+        try:
+            target_id = int(only_key.replace("schema_", ""))
+        except ValueError:
+            return {"inserted": 0, "updated": 0, "unchanged": 0, "note": "bad key"}
+        rows = conn.execute(base_sql + " AND m.id = ?", (target_id,)).fetchall()
+    else:
+        rows = conn.execute(base_sql).fetchall()
     stats = {"inserted": 0, "updated": 0, "unchanged": 0}
     for r in rows:
         try:
@@ -2027,8 +2036,8 @@ def _catalog_cluster_abstract(conn, dry_run=False):
     return stats
 
 
-def _catalog_entry_point(conn, dry_run=False):
-    """bridge node 検出: 複数 domain に繋がるノード。"""
+def _catalog_entry_point(conn, dry_run=False, only_key=None):
+    """bridge node 検出: 複数 domain に繋がるノード。only_key で node_<id> だけ再計算。"""
     # 各 memory のリンク先 domain の種類を Python 側で集計
     rows = conn.execute(
         """SELECT l.source_id, l.target_id, l.strength, c_target.domains target_domains,
@@ -2074,6 +2083,12 @@ def _catalog_entry_point(conn, dry_run=False):
     # 上位 30
     candidates.sort(key=lambda x: (-x[1], -x[2]))
     candidates = candidates[:30]
+    if only_key is not None:
+        try:
+            target_id = int(only_key.replace("node_", ""))
+        except ValueError:
+            return {"inserted": 0, "updated": 0, "unchanged": 0, "note": "bad key"}
+        candidates = [c for c in candidates if c[0] == target_id]
     stats = {"inserted": 0, "updated": 0, "unchanged": 0}
     for sid, diversity, weight, src_domains in candidates:
         srow = conn.execute(
@@ -2098,8 +2113,9 @@ def _catalog_entry_point(conn, dry_run=False):
     return stats
 
 
-def _catalog_time_index(conn, dry_run=False):
-    """月単位の索引。各月の importance 上位 5 件を related_ids に。"""
+def _catalog_time_index(conn, dry_run=False, only_key=None):
+    """月単位の索引。各月の importance 上位 5 件を related_ids に。
+    only_key で特定 YYYY-MM だけ再計算。"""
     rows = conn.execute(
         """SELECT m.id, m.importance, m.created_at, c.confidence, c.provenance, c.domains
            FROM memories m JOIN cortex c ON c.id = m.id
@@ -2119,6 +2135,8 @@ def _catalog_time_index(conn, dry_run=False):
         by_month.setdefault(ym, []).append(r)
     stats = {"inserted": 0, "updated": 0, "unchanged": 0}
     for ym, mrows in by_month.items():
+        if only_key is not None and ym != only_key:
+            continue
         sorted_rows = sorted(mrows, key=lambda r: -(r["importance"] or 0))
         related_ids = [r["id"] for r in sorted_rows[:5]]
         count = len(mrows)
@@ -2135,9 +2153,115 @@ def _catalog_time_index(conn, dry_run=False):
     return stats
 
 
-def _catalog_person_index(conn, dry_run=False):
-    """limbic.relational_context の who 値で集計。who は GHOST_WHO 由来の
-    user 値（ghost を誰が使っているか）。対話相手など第三者の抽出は v30.1+。"""
+def _catalog_time_week(conn, dry_run=False, only_key=None):
+    """週単位の索引。key は ISO 週 YYYY-Www。only_key で特定週だけ再計算。"""
+    rows = conn.execute(
+        """SELECT m.id, m.importance, m.created_at, c.confidence, c.provenance, c.domains
+           FROM memories m JOIN cortex c ON c.id = m.id
+           WHERE m.forgotten = 0 AND m.created_at IS NOT NULL"""
+    ).fetchall()
+    by_week = {}
+    for r in rows:
+        try:
+            doms = json.loads(r["domains"]) if r["domains"] else []
+        except (json.JSONDecodeError, TypeError):
+            doms = []
+        if _catalog_should_exclude(doms, r["provenance"], r["confidence"]):
+            continue
+        ca = r["created_at"] or ""
+        if len(ca) < 10:
+            continue
+        try:
+            dt = datetime.fromisoformat(ca[:10])
+            iso_year, iso_week, _ = dt.isocalendar()
+            wk = f"{iso_year:04d}-W{iso_week:02d}"
+        except ValueError:
+            continue
+        by_week.setdefault(wk, []).append(r)
+    stats = {"inserted": 0, "updated": 0, "unchanged": 0}
+    for wk, wrows in by_week.items():
+        if only_key is not None and wk != only_key:
+            continue
+        sorted_rows = sorted(wrows, key=lambda r: -(r["importance"] or 0))
+        related_ids = [r["id"] for r in sorted_rows[:5]]
+        count = len(wrows)
+        title = f"time: {wk} ({count}件)"
+        content = f"{wk} — {count} memories"
+        card_stats = {"count": count, "top_ids": related_ids}
+        source_hash = _catalog_hash({"wk": wk, "top": related_ids, "count": count})
+        if not dry_run:
+            action = _catalog_upsert(conn, "time_week", wk, title, content,
+                                     related_ids, card_stats, source_hash)
+            stats[action] += 1
+        else:
+            stats["unchanged"] += 1
+    return stats
+
+
+def _catalog_time_day(conn, dry_run=False, only_key=None):
+    """日単位の索引。key は YYYY-MM-DD。過去 60 日分だけ作る（古い日は月/週で十分）。
+    only_key で特定日だけ再計算。カットオフ外の古いカードは毎回削除。"""
+    cutoff = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
+    if not dry_run and only_key is None:
+        old_keys = [r["key"] for r in conn.execute(
+            "SELECT key FROM catalog_cards WHERE entry_type = 'time_day' AND key < ?",
+            (cutoff,)
+        ).fetchall()]
+        if old_keys:
+            placeholders = ",".join("?" * len(old_keys))
+            conn.execute(
+                f"DELETE FROM catalog_cards WHERE entry_type = 'time_day' AND key IN ({placeholders})",
+                old_keys
+            )
+            conn.execute(
+                f"DELETE FROM catalog_fts WHERE key IN ({placeholders})",
+                old_keys
+            )
+    rows = conn.execute(
+        """SELECT m.id, m.importance, m.created_at, c.confidence, c.provenance, c.domains
+           FROM memories m JOIN cortex c ON c.id = m.id
+           WHERE m.forgotten = 0 AND m.created_at IS NOT NULL
+             AND substr(m.created_at, 1, 10) >= ?""",
+        (cutoff,)
+    ).fetchall()
+    by_day = {}
+    for r in rows:
+        try:
+            doms = json.loads(r["domains"]) if r["domains"] else []
+        except (json.JSONDecodeError, TypeError):
+            doms = []
+        if _catalog_should_exclude(doms, r["provenance"], r["confidence"]):
+            continue
+        ymd = (r["created_at"] or "")[:10]
+        if not ymd:
+            continue
+        by_day.setdefault(ymd, []).append(r)
+    stats = {"inserted": 0, "updated": 0, "unchanged": 0}
+    for ymd, drows in by_day.items():
+        if only_key is not None and ymd != only_key:
+            continue
+        sorted_rows = sorted(drows, key=lambda r: -(r["importance"] or 0))
+        related_ids = [r["id"] for r in sorted_rows[:5]]
+        count = len(drows)
+        title = f"time: {ymd} ({count}件)"
+        content = f"{ymd} — {count} memories"
+        card_stats = {"count": count, "top_ids": related_ids}
+        source_hash = _catalog_hash({"ymd": ymd, "top": related_ids, "count": count})
+        if not dry_run:
+            action = _catalog_upsert(conn, "time_day", ymd, title, content,
+                                     related_ids, card_stats, source_hash)
+            stats[action] += 1
+        else:
+            stats["unchanged"] += 1
+    return stats
+
+
+def _catalog_person_index(conn, dry_run=False, only_key=None):
+    """limbic.relational_context の who / mentions で集計する。
+    - who = 書き手（GHOST_WHO 由来）: 「この記憶を誰が書いたか」
+    - mentions = 本文言及（extract-mentions で抽出）: 「誰の話題か」
+    各 person を key にした 1 カードを作る。card_stats の via に経路を残す。
+    only_key で特定 person だけ再計算。"""
     rows = conn.execute(
         """SELECT m.id, m.importance, l.relational_context,
                   c.confidence, c.provenance, c.domains
@@ -2146,6 +2270,7 @@ def _catalog_person_index(conn, dry_run=False):
            JOIN cortex c ON c.id = m.id
            WHERE m.forgotten = 0 AND l.relational_context IS NOT NULL"""
     ).fetchall()
+    # person → {rows, via_set}
     by_person = {}
     for r in rows:
         try:
@@ -2158,21 +2283,42 @@ def _catalog_person_index(conn, dry_run=False):
             rc = json.loads(r["relational_context"]) if r["relational_context"] else {}
         except (json.JSONDecodeError, TypeError):
             rc = {}
-        who = rc.get("who") if isinstance(rc, dict) else None
-        if not who:
+        if not isinstance(rc, dict):
             continue
-        by_person.setdefault(who, []).append(r)
+        who = rc.get("who")
+        mentions = rc.get("mentions") or []
+        if not isinstance(mentions, list):
+            mentions = []
+        persons = []
+        if who:
+            persons.append((who, "who"))
+        for m_name in mentions:
+            if isinstance(m_name, str) and m_name.strip() and m_name != who:
+                persons.append((m_name.strip(), "mentions"))
+        for name, via in persons:
+            entry = by_person.setdefault(name, {"rows": [], "via": set()})
+            # dedupe: 同じ記憶が who と mentions の両方に入る可能性があるが
+            # 1 人物 1 カードでは rows に重複しないように id で追跡
+            if r["id"] not in {rr["id"] for rr in entry["rows"]}:
+                entry["rows"].append(r)
+            entry["via"].add(via)
     stats = {"inserted": 0, "updated": 0, "unchanged": 0}
-    for who, prows in by_person.items():
+    for name, info in by_person.items():
+        if only_key is not None and name != only_key:
+            continue
+        prows = info["rows"]
+        via_list = sorted(info["via"])
         sorted_rows = sorted(prows, key=lambda r: -(r["importance"] or 0))
         related_ids = [r["id"] for r in sorted_rows[:10]]
         count = len(prows)
-        title = f"person: {who} ({count}件)"
-        content = f"{who} — {count} memories linked via relational_context.who"
-        card_stats = {"count": count, "top_ids": related_ids}
-        source_hash = _catalog_hash({"who": who, "top": related_ids, "count": count})
+        via_str = "/".join(via_list)
+        title = f"person: {name} ({count}件, via {via_str})"
+        content = f"{name} — {count} memories (via {via_str})"
+        card_stats = {"count": count, "top_ids": related_ids, "via": via_list}
+        source_hash = _catalog_hash({"name": name, "top": related_ids,
+                                      "count": count, "via": via_list})
         if not dry_run:
-            action = _catalog_upsert(conn, "person_index", who, title, content,
+            action = _catalog_upsert(conn, "person_index", name, title, content,
                                      related_ids, card_stats, source_hash)
             stats[action] += 1
         else:
@@ -2180,27 +2326,96 @@ def _catalog_person_index(conn, dry_run=False):
     return stats
 
 
-def build_catalog(dry_run=False, full_rebuild=False):
+def _catalog_hot_node(conn, dry_run=False, only_key=None):
+    """recall_log の還流: 過去 30 日で頻出した recalled_ids 上位 30 件を
+    hot_node として昇格する。entry_point（bridge 検出）とは別軸 — 実際に
+    よく引かれたノードが目録に上がってくる。only_key で node_<id> だけ再計算。"""
+    cutoff = (datetime.now() - timedelta(days=30)).isoformat()
+    try:
+        rows = conn.execute(
+            "SELECT recalled_ids FROM recall_log WHERE session_ts > ?",
+            (cutoff,)
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {"inserted": 0, "updated": 0, "unchanged": 0, "note": "no recall_log"}
+    freq = {}
+    for r in rows:
+        try:
+            ids = json.loads(r["recalled_ids"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            ids = []
+        for mid in ids:
+            if isinstance(mid, int):
+                freq[mid] = freq.get(mid, 0) + 1
+    if not freq:
+        return {"inserted": 0, "updated": 0, "unchanged": 0, "note": "empty"}
+    ranked = sorted(freq.items(), key=lambda kv: -kv[1])[:30]
+    if only_key is not None:
+        try:
+            target_id = int(only_key.replace("node_", ""))
+        except ValueError:
+            return {"inserted": 0, "updated": 0, "unchanged": 0, "note": "bad key"}
+        ranked = [x for x in ranked if x[0] == target_id]
+    stats = {"inserted": 0, "updated": 0, "unchanged": 0}
+    for mid, count in ranked:
+        srow = conn.execute(
+            """SELECT m.content, m.importance, c.provenance, c.confidence, c.domains
+               FROM memories m JOIN cortex c ON c.id = m.id
+               WHERE m.id = ? AND m.forgotten = 0""",
+            (mid,)
+        ).fetchone()
+        if not srow:
+            continue
+        try:
+            sdoms = json.loads(srow["domains"]) if srow["domains"] else []
+        except (json.JSONDecodeError, TypeError):
+            sdoms = []
+        if _catalog_should_exclude(sdoms, srow["provenance"], srow["confidence"]):
+            continue
+        key = f"node_{mid}"
+        title = f"hot node #{mid} (recalls={count})"
+        content = (srow["content"] or "")[:300]
+        card_stats = {"recalls": count, "importance": srow["importance"],
+                      "domains": sdoms}
+        source_hash = _catalog_hash({"mid": mid, "recalls": count})
+        if not dry_run:
+            action = _catalog_upsert(conn, "hot_node", key, title, content,
+                                     [mid], card_stats, source_hash)
+            stats[action] += 1
+        else:
+            stats["unchanged"] += 1
+    return stats
+
+
+def build_catalog(dry_run=False, full_rebuild=False, only_types=None, only_key=None):
     """catalog_cards を更新する。各 entry_type を個別 try/except で囲み、
     1 つが失敗しても他は進める。
 
     full_rebuild=True の場合、既存の catalog_cards を一旦 TRUNCATE する。
     通常は source_hash 比較で差分更新。
+    only_types: 指定 type（list or set）だけ再計算。
+    only_key: only_types 内でさらに特定 key だけ再計算（type を 1 つに絞った時のみ有用）。
     """
     conn = get_connection()
-    if full_rebuild and not dry_run:
+    if full_rebuild and not dry_run and only_types is None:
         conn.execute("DELETE FROM catalog_cards")
         conn.execute("DELETE FROM catalog_fts")
     results = {}
-    for name, fn in [
+    all_fns = [
         ("domain_index", _catalog_domain_index),
         ("cluster_abstract", _catalog_cluster_abstract),
         ("entry_point", _catalog_entry_point),
         ("time_index", _catalog_time_index),
+        ("time_week", _catalog_time_week),
+        ("time_day", _catalog_time_day),
         ("person_index", _catalog_person_index),
-    ]:
+        ("hot_node", _catalog_hot_node),
+    ]
+    for name, fn in all_fns:
+        if only_types is not None and name not in only_types:
+            continue
         try:
-            results[name] = fn(conn, dry_run=dry_run)
+            results[name] = fn(conn, dry_run=dry_run, only_key=only_key)
         except Exception as e:
             results[name] = {"error": str(e)}
     if not dry_run:
@@ -2213,7 +2428,7 @@ def _catalog_cli(args):
     """catalog サブコマンド: build / summary / list / show / find"""
     usage = (
         "使い方:\n"
-        "  python memory.py catalog build [--full] [--dry-run]\n"
+        "  python memory.py catalog build [--full] [--dry-run] [--type T [--key K]]\n"
         "  python memory.py catalog summary [--json]\n"
         "  python memory.py catalog list <type> [--limit N] [--json]\n"
         "  python memory.py catalog show <type> <key> [--json]\n"
@@ -2228,12 +2443,28 @@ def _catalog_cli(args):
     if sub == "build":
         full = "--full" in args
         dry = "--dry-run" in args
-        results = build_catalog(dry_run=dry, full_rebuild=full)
+        only_types = None
+        only_key = None
+        for i, a in enumerate(args):
+            if a == "--type" and i + 1 < len(args):
+                only_types = [args[i + 1]]
+            elif a == "--key" and i + 1 < len(args):
+                only_key = args[i + 1]
+        if only_key is not None and only_types is None:
+            print("--key には --type が必要")
+            return
+        results = build_catalog(dry_run=dry, full_rebuild=full,
+                                 only_types=only_types, only_key=only_key)
         if json_mode:
             print(json.dumps(results, ensure_ascii=False, indent=2))
         else:
             mode = "dry-run" if dry else ("full" if full else "diff")
-            print(f"catalog build ({mode}):")
+            scope = ""
+            if only_types:
+                scope = f" type={only_types[0]}"
+                if only_key:
+                    scope += f" key={only_key}"
+            print(f"catalog build ({mode}{scope}):")
             for k, v in results.items():
                 print(f"  {k}: {v}")
         return
@@ -2334,7 +2565,9 @@ def _catalog_cli(args):
             for i, a in enumerate(args):
                 if a == "--type" and i + 1 < len(args):
                     filter_type = args[i + 1]
-            # FTS5 検索。MATCH クエリをエスケープ（簡易）
+            # tier 1: FTS5 全文検索
+            rows = []
+            source = "fts"
             try:
                 fts_q = query.replace('"', '""')
                 if filter_type:
@@ -2354,7 +2587,35 @@ def _catalog_cli(args):
                         (f'"{fts_q}"',)
                     ).fetchall()
             except sqlite3.OperationalError:
-                # FTS5 が使えない／クエリが壊れている場合は LIKE フォールバック
+                rows = []
+                source = "like"
+            # tier 2: FTS5 が 0 件なら embedding fallback
+            if not rows and source == "fts":
+                try:
+                    qvec = embed_text(query, is_query=True)
+                except Exception:
+                    qvec = None
+                if qvec is not None:
+                    hits = vec_search(conn, qvec, k=30, forgotten=False)
+                    hit_ids = [mid for mid, _d, _s in hits]
+                    if hit_ids:
+                        placeholders = ",".join("?" * len(hit_ids))
+                        if filter_type:
+                            sql = (f"""SELECT DISTINCT c.* FROM catalog_cards c,
+                                       json_each(c.related_ids) j
+                                       WHERE j.value IN ({placeholders}) AND c.entry_type = ?
+                                       LIMIT 20""")
+                            rows = conn.execute(sql, (*hit_ids, filter_type)).fetchall()
+                        else:
+                            sql = (f"""SELECT DISTINCT c.* FROM catalog_cards c,
+                                       json_each(c.related_ids) j
+                                       WHERE j.value IN ({placeholders})
+                                       LIMIT 20""")
+                            rows = conn.execute(sql, hit_ids).fetchall()
+                        if rows:
+                            source = "embedding"
+            # tier 3: FTS5 が壊れていた、もしくは embedding もダメなら LIKE
+            if not rows:
                 like = f"%{query}%"
                 if filter_type:
                     rows = conn.execute(
@@ -2370,13 +2631,15 @@ def _catalog_cli(args):
                            LIMIT 20""",
                         (like, like)
                     ).fetchall()
+                if rows:
+                    source = "like"
             cards = [{"entry_type": r["entry_type"], "key": r["key"], "title": r["title"],
-                      "content": (r["content"] or "")[:200]} for r in rows]
+                      "content": (r["content"] or "")[:200], "_source": source} for r in rows]
             if json_mode:
                 print(json.dumps(_json_envelope("catalog find", cards, query=query),
                                  ensure_ascii=False, indent=2))
             else:
-                print(f"catalog find '{query}' ({len(cards)}件):")
+                print(f"catalog find '{query}' ({len(cards)}件, via {source}):")
                 for c in cards:
                     print(f"  [{c['entry_type']}/{c['key']}] {c['title']}")
         else:
@@ -6947,6 +7210,120 @@ def _json_envelope(cmd, results, query=None, meta=None):
     return envelope
 
 
+def _extract_mentions_batch(fragments, timeout=30):
+    """記憶断片のリストから、本文中に言及された人名を抽出する。
+    Gemini を使って fragments 並び順どおりに [[name, ...], ...] を返す。
+    失敗時は None（呼び出し側が batch 単位で諦める）。"""
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    if not gemini_key or not fragments:
+        return None
+    numbered = "\n\n".join(
+        f"[{i}] {(frag or '')[:600]}" for i, frag in enumerate(fragments)
+    )
+    prompt = (
+        "以下は番号付きの記憶断片。それぞれの本文中に明示的に言及された**人物名**を"
+        "JSON 配列で抽出せよ。\n"
+        "条件:\n"
+        "- 固有名詞のみ（実在人物名・ハンドル名・プロジェクト内のエージェント名）\n"
+        "- 一般名詞（user / assistant / 人 / 誰か）は除外\n"
+        "- 本人（書き手）は含めない — 第三者への言及のみ\n"
+        "- 自信がない時は空配列 []\n"
+        "- 正規化（フルネームはそのまま、敬称・様・さんは外す）\n\n"
+        "出力フォーマット（厳密な JSON、前置き後置きなし）:\n"
+        '{"results": [{"i": 0, "mentions": ["name1", "name2"]}, ...]}\n\n'
+        f"断片:\n{numbered}"
+    )
+    model = os.environ.get("MENTIONS_MODEL", "gemini-3-flash-preview")
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/"
+        f"models/{model}:generateContent?key={gemini_key}"
+    )
+    body = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": 2000,
+            "responseMimeType": "application/json",
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
+    }).encode("utf-8")
+    try:
+        from urllib.request import Request, urlopen
+        req = Request(url, data=body, headers={"Content-Type": "application/json"})
+        with urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        parsed = json.loads(text)
+        results = parsed.get("results", [])
+        out = [[] for _ in fragments]
+        for item in results:
+            idx = item.get("i")
+            names = item.get("mentions", [])
+            if isinstance(idx, int) and 0 <= idx < len(fragments) and isinstance(names, list):
+                out[idx] = [str(n).strip() for n in names if isinstance(n, str) and n.strip()]
+        return out
+    except Exception:
+        return None
+
+
+def extract_mentions(limit=100, batch=10, dry_run=False):
+    """limbic.relational_context に mentions キーがない記憶を対象に、
+    本文から人名を抽出して mentions フィールドを追加する。
+
+    - 既に mentions キーがあればスキップ（空配列も「抽出済み」とみなす）
+    - batch 単位で Gemini を呼ぶ（API コール数 = ceil(limit / batch)）
+    - failed batch は relational_context を変更しない（次回再挑戦）
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """SELECT m.id, m.content, l.relational_context
+               FROM memories m
+               LEFT JOIN limbic l ON l.id = m.id
+               WHERE m.forgotten = 0 AND m.content IS NOT NULL
+               ORDER BY m.importance DESC, m.id DESC"""
+        ).fetchall()
+        pending = []
+        for r in rows:
+            try:
+                rc = json.loads(r["relational_context"]) if r["relational_context"] else {}
+            except (json.JSONDecodeError, TypeError):
+                rc = {}
+            if not isinstance(rc, dict):
+                rc = {}
+            if "mentions" in rc:
+                continue
+            pending.append((r["id"], r["content"], rc))
+            if len(pending) >= limit:
+                break
+        stats = {"processed": 0, "updated": 0, "failed_batches": 0, "pending_total": len(pending)}
+        if not pending:
+            return stats
+        for start in range(0, len(pending), batch):
+            chunk = pending[start:start + batch]
+            fragments = [c[1] for c in chunk]
+            if dry_run:
+                stats["processed"] += len(chunk)
+                continue
+            extracted = _extract_mentions_batch(fragments)
+            if extracted is None:
+                stats["failed_batches"] += 1
+                continue
+            for (mid, _content, rc), names in zip(chunk, extracted):
+                rc["mentions"] = names
+                conn.execute(
+                    "UPDATE limbic SET relational_context = ? WHERE id = ?",
+                    (json.dumps(rc, ensure_ascii=False), mid)
+                )
+                stats["processed"] += 1
+                if names:
+                    stats["updated"] += 1
+            conn.commit()
+        return stats
+    finally:
+        conn.close()
+
+
 def _distill_state(memories_with_scores, timeout=20):
     """記憶断片から「今の思考状態」を独白として蒸留する。
 
@@ -7575,8 +7952,8 @@ def main():
                     kw_str = ", ".join(keywords[:6])
                     print(f"  ?? #{row['id']} もやもや: [{kw_str}]")
 
-            # 反芻検出: 同じ記憶ばかり触ってたら警告（--rumination フラグ時のみ、または legacy）
-            if "--rumination" in sys.argv or "--legacy" in sys.argv:
+            # 反芻検出: 同じ記憶ばかり触ってたら警告（--rumination フラグ時のみ）
+            if "--rumination" in sys.argv:
                 rum_conn = get_connection()
                 ruminating = detect_rumination(rum_conn)
                 if ruminating:
@@ -7935,14 +8312,9 @@ def main():
 
     elif cmd == "recall":
         # v30: default は pull 指向の simple list のみ。内面系は全部 opt-in。
-        # --legacy で旧挙動（独白蒸留・DMN・気分・反芻警告・auto_voices）を復活。
-        legacy = "--legacy" in sys.argv
-        if legacy:
-            print("[deprecation] --legacy は v30.2 で撤去予定。voice/catalog 系 CLI へ移行を。",
-                  file=sys.stderr)
 
-        # --meta または --legacy の時のみ事後検証プリント
-        if "--meta" in sys.argv or legacy:
+        # --meta の時のみ事後検証プリント
+        if "--meta" in sys.argv:
             prev_eval = evaluate_last_recall()
             if prev_eval:
                 p = prev_eval["precision"]
@@ -7950,9 +8322,8 @@ def main():
                 print(f"(前回recall検証: 精度{p:.0%} 網羅{r:.0%} "
                       f"空振{len(prev_eval['noise'])} 漏れ{len(prev_eval['missed'])})")
 
-        # --dmn または --legacy の時のみ DMN 発火
-        gap = None
-        if "--dmn" in sys.argv or legacy:
+        # --dmn の時のみ DMN 発火
+        if "--dmn" in sys.argv:
             dmn_conn = get_connection()
             gap = _get_session_gap(dmn_conn)
             if gap is not None and gap >= 1.0:
@@ -7970,37 +8341,24 @@ def main():
                     print()
             dmn_conn.close()
 
-        # --insights または --legacy の時のみ
-        if "--insights" in sys.argv or legacy:
+        # --insights の時のみ
+        if "--insights" in sys.argv:
             _show_recent_insights()
 
-        # auto_voices: --legacy の時のみ（default では撤去）
-        auto_voices = False
-        if legacy:
-            # legacy モードの時だけ 6h 以上で自動発火（旧挙動）
-            if gap is None:
-                _g_conn = get_connection()
-                gap = _get_session_gap(_g_conn)
-                _g_conn.close()
-            auto_voices = gap is not None and gap >= 6.0 and "--voices" not in sys.argv
-            if auto_voices:
-                print(f"(久しぶりなので内的対話モードで想起します)\n")
-
-        if "--voices" in sys.argv or auto_voices:
+        if "--voices" in sys.argv:
             # 内的対話モード
-            n = 2 if auto_voices else 3  # 自動の場合は軽めに
-            if not auto_voices:
-                for arg in sys.argv[2:]:
-                    if arg.isdigit():
-                        n = int(arg)
+            n = 3
+            for arg in sys.argv[2:]:
+                if arg.isdigit():
+                    n = int(arg)
             requested_domains = _parse_domain_flag(sys.argv)
             voices = recall_polyphonic(limit_per_voice=n, requested_domains=requested_domains)
             raw_mode = "--raw" in sys.argv
             fragments_only = "--fragments" in sys.argv
             conn = get_connection()
 
-            # --with-mood または --legacy の時のみ気分を表示
-            if "--with-mood" in sys.argv or legacy:
+            # --with-mood の時のみ気分を表示
+            if "--with-mood" in sys.argv:
                 mood = _effective_mood(conn)
                 if mood and mood.get("emotions"):
                     explicit = load_mood()
@@ -8046,8 +8404,8 @@ def main():
             raw_mode = "--raw" in sys.argv
             fragments_only = "--fragments" in sys.argv
             json_mode = "--json" in sys.argv
-            # v30: --distill か --legacy の時のみ蒸留。default は simple list
-            want_distill = ("--distill" in sys.argv or legacy) and not (raw_mode or full_mode or json_mode)
+            # v30: --distill の時のみ蒸留。default は simple list
+            want_distill = "--distill" in sys.argv and not (raw_mode or full_mode or json_mode)
             default_limit = 15 if full_mode else 10
             limit = default_limit
             for arg in sys.argv[2:]:
@@ -8149,6 +8507,32 @@ def main():
 
     elif cmd == "voice":
         _voice_cli(sys.argv[2:])
+
+    elif cmd == "extract-mentions":
+        limit = 100
+        batch = 10
+        dry = "--dry-run" in sys.argv
+        json_mode = "--json" in sys.argv
+        for i, a in enumerate(sys.argv[2:], start=2):
+            if a == "--limit" and i + 1 < len(sys.argv):
+                try:
+                    limit = int(sys.argv[i + 1])
+                except ValueError:
+                    pass
+            elif a == "--batch" and i + 1 < len(sys.argv):
+                try:
+                    batch = int(sys.argv[i + 1])
+                except ValueError:
+                    pass
+        stats = extract_mentions(limit=limit, batch=batch, dry_run=dry)
+        if json_mode:
+            print(json.dumps(_json_envelope("extract-mentions", [stats],
+                                            meta={"limit": limit, "batch": batch,
+                                                  "dry_run": dry}),
+                             ensure_ascii=False, indent=2))
+        else:
+            mode = "dry-run" if dry else "live"
+            print(f"extract-mentions ({mode}): {stats}")
 
     elif cmd == "overview":
         overview()
