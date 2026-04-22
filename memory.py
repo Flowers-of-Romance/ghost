@@ -2387,6 +2387,507 @@ def _catalog_hot_node(conn, dry_run=False, only_key=None):
     return stats
 
 
+_GEMINI_CLI_PATH = os.environ.get("GEMINI_CLI_PATH", "/opt/homebrew/bin/gemini")
+_GEMINI_DEFAULT_MODEL = os.environ.get("GEMINI_DEFAULT_MODEL", "gemini-3.1-pro-preview")
+
+
+def _gemini_cli_call(prompt, model=None, timeout=120, retries=3):
+    """gemini CLI 経由で prompt を投げ、response text を返す。
+    HTTP 直叩きから CLI 経由に切替（skill 層と実行経路を一本化、API key 不要）。
+
+    戻り値: モデル応答の生テキスト（markdown fence は剥がさない、呼び出し側で処理）。
+    失敗時は None。
+    """
+    import subprocess
+    if not prompt:
+        return None
+    model = model or _GEMINI_DEFAULT_MODEL
+    import time as _time
+    for attempt in range(retries):
+        try:
+            r = subprocess.run(
+                [_GEMINI_CLI_PATH, "-p", prompt, "-m", model, "-o", "json"],
+                capture_output=True, text=True, timeout=timeout,
+                stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace",
+            )
+            if r.returncode != 0:
+                if attempt < retries - 1:
+                    _time.sleep(2 ** attempt)
+                    continue
+                return None
+            data = json.loads(r.stdout)
+            if data.get("error"):
+                if attempt < retries - 1:
+                    _time.sleep(2 ** attempt)
+                    continue
+                return None
+            response = data.get("response")
+            if response is None:
+                if attempt < retries - 1:
+                    _time.sleep(2 ** attempt)
+                    continue
+                return None
+            return response
+        except subprocess.TimeoutExpired:
+            if attempt < retries - 1:
+                _time.sleep(2 ** attempt)
+                continue
+            return None
+        except Exception:
+            if attempt < retries - 1:
+                _time.sleep(2 ** attempt)
+                continue
+            return None
+    return None
+
+
+def _parse_gemini_json(text):
+    """Gemini CLI の response text から JSON を取り出す。
+    gemini-2.5-pro 等は ```json ... ``` で包む場合があるので fence を剥がす。
+    """
+    if text is None:
+        return None
+    t = text.strip()
+    if t.startswith("```"):
+        # 最初の改行までのヘッダ（```json など）と末尾の ``` を剥がす
+        first_nl = t.find("\n")
+        if first_nl >= 0:
+            t = t[first_nl + 1:]
+        if t.rstrip().endswith("```"):
+            t = t.rstrip()[:-3].rstrip()
+    try:
+        return json.loads(t)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _summarize_session_batch(sessions, timeout=120):
+    """複数セッションを 1 リクエストで要約する。
+    sessions: [(session_id, turns_text), ...] の並び。
+    Gemini の出力: [{"i": 0, "title": "...", "summary": "...", "keywords": [...], "topic_slug": "..."}, ...]
+    失敗時は None（呼び出し側が batch 単位で諦める）。"""
+    if not sessions:
+        return None
+    parts = []
+    for i, (_sid, body) in enumerate(sessions):
+        parts.append(f"===== SESSION [{i}] =====\n{body}")
+    numbered = "\n\n".join(parts)
+    prompt = (
+        "以下は番号付きの会話セッションの原文（user と assistant のターン）。\n"
+        "各セッションについて以下の JSON を返せ。捏造せず、書かれていることだけを要約する。\n\n"
+        "条件:\n"
+        "- title: このセッションで何をしたかを 1 行（50文字以内、主題 or 結論を明示）\n"
+        "- summary: 主題・現状・結論 or 未決を 2-4 行（300文字以内）。結論が明示されてなければ「未決」と書け。\n"
+        "- keywords: 3-8 個の主要キーワード\n"
+        "- topic_slug: このセッションの話題を snake_case の英数字で 1 語（例: stacks_xlsx_bug, ghost_v30_catalog）\n"
+        "- status: \"solved\" | \"unsolved\" | \"ongoing\" | \"abandoned\" のいずれか\n"
+        "    * solved: 最後のターンで結論に達した（実装完了・合意形成・問題解決）\n"
+        "    * unsolved: 結論が出ずに中断（blocker 残り・明示的な「未決」）\n"
+        "    * ongoing: 末尾ターンが継続を示唆（次の作業が予告されている）\n"
+        "    * abandoned: 途中で別話題へ切替 or 明示的に保留\n"
+        "- status_note: status の根拠を 1 行（どのターンで何を基に判定したか）。判断材料が無ければ「不明瞭」と書け。\n\n"
+        "出力フォーマット（厳密な JSON、前置き後置きなし）:\n"
+        '{"results": [{"i": 0, "title": "...", "summary": "...", "keywords": ["..."], "topic_slug": "...", "status": "...", "status_note": "..."}, ...]}\n\n'
+        f"セッション:\n{numbered}"
+    )
+    model = os.environ.get("SESSION_INDEX_MODEL", _GEMINI_DEFAULT_MODEL)
+    response_text = _gemini_cli_call(prompt, model=model, timeout=timeout)
+    parsed = _parse_gemini_json(response_text)
+    if parsed is None:
+        return None
+    try:
+        results = parsed.get("results", [])
+        out = [None] * len(sessions)
+        for item in results:
+            idx = item.get("i")
+            if isinstance(idx, int) and 0 <= idx < len(sessions):
+                status = str(item.get("status") or "").strip().lower()
+                if status not in ("solved", "unsolved", "ongoing", "abandoned"):
+                    status = "ongoing"  # 不正値は ongoing に倒す（最も無難）
+                out[idx] = {
+                    "title": str(item.get("title") or "").strip()[:100],
+                    "summary": str(item.get("summary") or "").strip()[:600],
+                    "keywords": [str(k).strip() for k in (item.get("keywords") or [])
+                                 if isinstance(k, str) and k.strip()][:10],
+                    "topic_slug": str(item.get("topic_slug") or "").strip()[:60],
+                    "status": status,
+                    "status_note": str(item.get("status_note") or "").strip()[:200],
+                }
+        return out
+    except Exception:
+        return None
+
+
+def _build_session_body(turns, head=25, tail=15, turn_chars=400):
+    """raw_turns リスト（timestamp 昇順）を Gemini に投げる文字列に整形。
+    長い session は先頭 head + 末尾 tail に切り詰め。"""
+    if len(turns) <= head + tail:
+        picked = turns
+        elided = 0
+    else:
+        picked = list(turns[:head]) + list(turns[-tail:])
+        elided = len(turns) - head - tail
+    lines = []
+    for i, t in enumerate(picked):
+        if elided and i == head:
+            lines.append(f"... ({elided} turns 省略) ...")
+        role = t["role"]
+        content = (t["content"] or "")[:turn_chars]
+        lines.append(f"[{role}] {content}")
+    return "\n".join(lines)
+
+
+def _catalog_session_index(conn, dry_run=False, only_key=None,
+                           min_turns=4, batch_size=5, max_sessions_per_build=40):
+    """raw_turns を session_id で集約し、Gemini で title / summary / keywords / topic_slug を生成。
+    catalog_cards に session_index として upsert。
+
+    差分更新: source_hash = (session_id, turn_count, last_ts) で判定。
+    session に新しい turn が追加されたら再要約される。
+
+    max_sessions_per_build: 1 回の build で Gemini に投げる最大 session 数（API コスト保護）。
+    超過分は次回 build に回る（差分更新で優先順位が自然に決まる）。
+    """
+    rows = conn.execute(
+        """SELECT session_id, COUNT(*) as turn_count,
+                  MIN(timestamp) as start_ts, MAX(timestamp) as end_ts
+           FROM raw_turns
+           WHERE session_id IS NOT NULL AND session_id != ''
+           GROUP BY session_id
+           HAVING turn_count >= ?
+           ORDER BY end_ts DESC""",
+        (min_turns,)
+    ).fetchall()
+
+    stats = {"inserted": 0, "updated": 0, "unchanged": 0,
+             "failed_batches": 0, "skipped_no_key": 0,
+             "pending": 0, "total_sessions": len(rows)}
+
+    pending = []
+    for r in rows:
+        sid = r["session_id"]
+        if only_key is not None and sid != only_key:
+            continue
+        source_hash = _catalog_hash({
+            "sid": sid, "tc": r["turn_count"], "last": r["end_ts"],
+            "v": 2,  # v30.2: status フィールド追加
+        })
+        existing = conn.execute(
+            "SELECT source_hash FROM catalog_cards WHERE entry_type='session_index' AND key=?",
+            (sid,)
+        ).fetchone()
+        if existing and existing["source_hash"] == source_hash:
+            stats["unchanged"] += 1
+            continue
+        pending.append((sid, source_hash, r))
+
+    if only_key is not None and not pending:
+        stats["skipped_no_key"] = 1
+        return stats
+
+    pending = pending[:max_sessions_per_build]
+    stats["pending"] = len(pending)
+    if not pending or dry_run:
+        return stats
+
+    for start in range(0, len(pending), batch_size):
+        chunk = pending[start:start + batch_size]
+        batch_input = []
+        chunk_meta = []
+        for sid, source_hash, r in chunk:
+            turns = conn.execute(
+                """SELECT id, role, content, timestamp, cwd, git_branch
+                   FROM raw_turns WHERE session_id = ?
+                   ORDER BY timestamp ASC, id ASC""",
+                (sid,)
+            ).fetchall()
+            body = _build_session_body(turns)
+            batch_input.append((sid, body))
+            chunk_meta.append((sid, source_hash, r, turns))
+
+        summaries = _summarize_session_batch(batch_input)
+        if summaries is None:
+            stats["failed_batches"] += 1
+            continue
+
+        for (sid, source_hash, r, turns), summary in zip(chunk_meta, summaries):
+            if not summary or not summary.get("title"):
+                continue
+            user_count = sum(1 for t in turns if t["role"] == "user")
+            asst_count = sum(1 for t in turns if t["role"] == "assistant")
+            related_ids = [t["id"] for t in turns]
+            cwd = turns[0]["cwd"] if turns else None
+            git_branch = turns[0]["git_branch"] if turns else None
+            card_stats = {
+                "turn_count": r["turn_count"],
+                "user_turns": user_count,
+                "assistant_turns": asst_count,
+                "start_ts": r["start_ts"],
+                "end_ts": r["end_ts"],
+                "cwd": cwd,
+                "git_branch": git_branch,
+                "keywords": summary.get("keywords", []),
+                "topic_slug": summary.get("topic_slug", ""),
+                "status": summary.get("status", "ongoing"),
+                "status_note": summary.get("status_note", ""),
+            }
+            action = _catalog_upsert(
+                conn, "session_index", sid,
+                summary["title"], summary["summary"],
+                related_ids, card_stats, source_hash
+            )
+            stats[action] += 1
+        conn.commit()
+
+    return stats
+
+
+def _summarize_topic_thread(slug, session_cards, timeout=120):
+    """複数 session_index カードから 1 つの topic_thread 要約を作る。
+    session_cards: [{"title":..., "summary":..., "start_ts":..., "end_ts":...}, ...]
+    失敗時は None。"""
+    if not session_cards:
+        return None
+    parts = []
+    for i, c in enumerate(session_cards):
+        parts.append(
+            f"[session {i}] ({c.get('start_ts','')}〜{c.get('end_ts','')})\n"
+            f"  title: {c.get('title','')}\n"
+            f"  summary: {c.get('summary','')}"
+        )
+    body = "\n\n".join(parts)
+    prompt = (
+        "以下は同じ話題に属する複数セッションの要約群。この話題全体を 1 カードに束ねた要約を作れ。\n"
+        "捏造せず、書かれていることだけを統合する。\n\n"
+        "条件:\n"
+        "- title: この話題全体を 1 行（60文字以内）\n"
+        "- summary: この話題がどこから始まり、どう展開し、現状どこまで来たかを 3-5 行（500文字以内）。結論が無ければ「未決」と書け。\n\n"
+        "出力フォーマット（厳密な JSON、前置き後置きなし）:\n"
+        '{"title": "...", "summary": "..."}\n\n'
+        f"話題スラグ: {slug}\n\n"
+        f"セッション要約群:\n{body}"
+    )
+    model = os.environ.get("TOPIC_THREAD_MODEL", _GEMINI_DEFAULT_MODEL)
+    response_text = _gemini_cli_call(prompt, model=model, timeout=timeout)
+    parsed = _parse_gemini_json(response_text)
+    if parsed is None:
+        return None
+    try:
+        return {
+            "title": str(parsed.get("title") or "").strip()[:120],
+            "summary": str(parsed.get("summary") or "").strip()[:900],
+        }
+    except Exception:
+        return None
+
+
+def _cluster_slugs_by_embedding(slug_texts, threshold=0.88):
+    """slug → embed 対象テキスト の dict をクラスタリング。
+    embed 対象には title + keywords を結合した自然文を渡す（短 slug 単独だと
+    e5-small の cosine 空間で区別が弱いため）。
+    戻り値: {representative_slug: [member_slug, ...]}。
+    embedding server or local model が使えなければ、素朴な文字列一致に降格。"""
+    if not slug_texts:
+        return {}
+    try:
+        import numpy as np
+    except ImportError:
+        return {s: [s] for s in slug_texts}
+
+    slugs = list(slug_texts.keys())
+    vectors = []
+    valid_slugs = []
+    for s in slugs:
+        text = slug_texts[s] or s
+        try:
+            v = embed_text(text, is_query=False)
+        except Exception:
+            continue
+        if v is None:
+            continue
+        arr = np.asarray(v, dtype=np.float32)
+        n = float(np.linalg.norm(arr))
+        if n == 0.0:
+            continue
+        vectors.append(arr / n)
+        valid_slugs.append(s)
+
+    if not valid_slugs:
+        return {s: [s] for s in slugs}
+
+    # pairwise cosine（全部正規化済みなので内積 = cosine）
+    mat = np.stack(vectors)
+    sim = mat @ mat.T
+
+    # Union-Find 的に近い slug を束ねる
+    parent = list(range(len(valid_slugs)))
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    n = len(valid_slugs)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if float(sim[i][j]) >= threshold:
+                union(i, j)
+
+    groups = {}
+    for i, s in enumerate(valid_slugs):
+        root = find(i)
+        groups.setdefault(root, []).append(s)
+
+    # 代表 slug は「最頻 or 最短」で選ぶ（短い方が一般的な表記）
+    clusters = {}
+    for members in groups.values():
+        rep = sorted(members, key=lambda x: (len(x), x))[0]
+        clusters[rep] = sorted(members)
+
+    # embedding 失敗した slug は単独クラスタとして追加
+    for s in slugs:
+        if s not in valid_slugs and s not in clusters:
+            clusters[s] = [s]
+
+    return clusters
+
+
+def _catalog_topic_thread(conn, dry_run=False, only_key=None,
+                          similarity_threshold=0.88, min_sessions=2):
+    """session_index カードの topic_slug を embedding 距離で束ね、
+    2 session 以上のクラスタを topic_thread として upsert。
+    session 跨ぎの話題にだけカードを作る（単独 session は session_index で十分）。"""
+    rows = conn.execute(
+        """SELECT key, title, content, related_ids, stats
+           FROM catalog_cards WHERE entry_type='session_index'"""
+    ).fetchall()
+
+    stats_out = {"inserted": 0, "updated": 0, "unchanged": 0,
+                 "clusters_seen": 0, "clusters_kept": 0}
+    if not rows:
+        return stats_out
+
+    # slug → session 情報 + embed 対象テキストのマッピング
+    slug_to_sessions = {}
+    slug_texts = {}  # slug → 代表 title + keywords（embed 用）
+    for r in rows:
+        try:
+            s = json.loads(r["stats"]) if r["stats"] else {}
+        except (json.JSONDecodeError, TypeError):
+            s = {}
+        slug = (s.get("topic_slug") or "").strip()
+        if not slug:
+            continue
+        try:
+            related = json.loads(r["related_ids"]) if r["related_ids"] else []
+        except (json.JSONDecodeError, TypeError):
+            related = []
+        slug_to_sessions.setdefault(slug, []).append({
+            "session_id": r["key"],
+            "title": r["title"],
+            "summary": r["content"],
+            "start_ts": s.get("start_ts"),
+            "end_ts": s.get("end_ts"),
+            "raw_turn_ids": related,
+            "turn_count": s.get("turn_count", 0),
+        })
+        # embed 用テキスト: title + summary + keywords（短文字列だけだと
+        # e5-small の cosine 空間で類似ドメインが区別できない問題の回避）
+        if slug not in slug_texts:
+            kws = s.get("keywords") or []
+            kws_str = " ".join(str(k) for k in kws if isinstance(k, str))
+            summary = r["content"] or ""
+            slug_texts[slug] = f"{r['title']}\n{summary}\n{kws_str}".strip()
+
+    if not slug_to_sessions:
+        return stats_out
+
+    # slug をクラスタリング（embed 対象は title + keywords）
+    clusters = _cluster_slugs_by_embedding(slug_texts, threshold=similarity_threshold)
+
+    for rep_slug, member_slugs in clusters.items():
+        # このクラスタに属する全 session を集約
+        sessions = []
+        for s in member_slugs:
+            sessions.extend(slug_to_sessions.get(s, []))
+        # session_id で dedupe（同じ session が slug 違いで複数ヒットするケースは
+        # 実質ないが念のため）
+        seen = set()
+        unique_sessions = []
+        for ses in sessions:
+            if ses["session_id"] in seen:
+                continue
+            seen.add(ses["session_id"])
+            unique_sessions.append(ses)
+        sessions = unique_sessions
+
+        stats_out["clusters_seen"] += 1
+        if len(sessions) < min_sessions:
+            continue
+        stats_out["clusters_kept"] += 1
+
+        key = f"topic_{rep_slug}"
+        if only_key is not None and key != only_key:
+            continue
+
+        sessions.sort(key=lambda x: x.get("start_ts") or "")
+        session_ids = [s["session_id"] for s in sessions]
+        all_raw_ids = []
+        for s in sessions:
+            all_raw_ids.extend(s.get("raw_turn_ids") or [])
+        turn_count_total = sum(s.get("turn_count", 0) for s in sessions)
+        first_ts = sessions[0].get("start_ts")
+        last_ts = sessions[-1].get("end_ts")
+
+        source_hash = _catalog_hash({
+            "slug": rep_slug,
+            "sids": sorted(session_ids),
+            "members": sorted(member_slugs),
+            "last": last_ts,
+        })
+        existing = conn.execute(
+            "SELECT source_hash FROM catalog_cards WHERE entry_type='topic_thread' AND key=?",
+            (key,)
+        ).fetchone()
+        if existing and existing["source_hash"] == source_hash:
+            stats_out["unchanged"] += 1
+            continue
+
+        if dry_run:
+            continue
+
+        summary = _summarize_topic_thread(rep_slug, sessions)
+        if summary is None or not summary.get("title"):
+            # Gemini 失敗時は簡易 fallback（次回再挑戦）
+            title = f"topic: {rep_slug} ({len(sessions)} sessions)"
+            content = "\n".join(f"- {s['title']}" for s in sessions[:10])
+        else:
+            title = summary["title"]
+            content = summary["summary"]
+
+        card_stats = {
+            "session_ids": session_ids,
+            "session_count": len(sessions),
+            "member_slugs": member_slugs,
+            "turn_count_total": turn_count_total,
+            "first_ts": first_ts,
+            "last_ts": last_ts,
+            "representative_slug": rep_slug,
+        }
+        action = _catalog_upsert(
+            conn, "topic_thread", key, title, content,
+            all_raw_ids, card_stats, source_hash
+        )
+        stats_out[action] += 1
+        conn.commit()
+
+    return stats_out
+
+
 def build_catalog(dry_run=False, full_rebuild=False, only_types=None, only_key=None):
     """catalog_cards を更新する。各 entry_type を個別 try/except で囲み、
     1 つが失敗しても他は進める。
@@ -2410,6 +2911,10 @@ def build_catalog(dry_run=False, full_rebuild=False, only_types=None, only_key=N
         ("time_day", _catalog_time_day),
         ("person_index", _catalog_person_index),
         ("hot_node", _catalog_hot_node),
+        # raw_turn 層を索引する目録（v30.2）
+        ("session_index", _catalog_session_index),
+        # topic_thread は session_index の成果物を束ねるので最後に回す
+        ("topic_thread", _catalog_topic_thread),
     ]
     for name, fn in all_fns:
         if only_types is not None and name not in only_types:
@@ -4000,6 +4505,137 @@ def search_memories(query, limit=10, use_like=False, fuzzy=False, requested_doma
     if fuzzy:
         return scored_results, fuzzy_results
     return scored_results
+
+
+def search_in_scope(query, session_id=None, topic=None, status=None, limit=20):
+    """session / topic / status でスコープした raw_turn 検索。
+    v30.2: session_index / topic_thread を namespace として活用する経路。
+
+    - session_id: 指定 session の raw_turn だけ検索
+    - topic: topic_thread.key（"topic_<slug>"、prefix 省略可）で session 群を引いて検索
+    - status: session_index.stats.status と一致する session 群で検索
+      （"solved" で過去の成功例検索、"unsolved" で未決バックログの絞り込み）
+
+    複数指定時は AND（全条件を満たす session のみ対象）。
+    戻り値: [{"raw_turn_id": int, "session_id": str, "role": str, "content": str,
+              "timestamp": str, "session_title": str | None, "status": str | None}]
+    """
+    conn = get_connection()
+    try:
+        session_filter = None  # None = 制約なし、set = 候補集合
+
+        if session_id:
+            session_filter = {session_id}
+
+        if topic:
+            key = topic if topic.startswith("topic_") else f"topic_{topic}"
+            row = conn.execute(
+                "SELECT stats FROM catalog_cards WHERE entry_type='topic_thread' AND key=?",
+                (key,)
+            ).fetchone()
+            if not row:
+                return []
+            try:
+                stats = json.loads(row["stats"]) if row["stats"] else {}
+            except (json.JSONDecodeError, TypeError):
+                stats = {}
+            topic_sessions = set(stats.get("session_ids") or [])
+            session_filter = (session_filter & topic_sessions) if session_filter is not None else topic_sessions
+
+        if status:
+            status_rows = conn.execute(
+                "SELECT key, stats FROM catalog_cards WHERE entry_type='session_index'"
+            ).fetchall()
+            status_sessions = set()
+            for r in status_rows:
+                try:
+                    s = json.loads(r["stats"]) if r["stats"] else {}
+                except (json.JSONDecodeError, TypeError):
+                    s = {}
+                if s.get("status") == status:
+                    status_sessions.add(r["key"])
+            session_filter = (session_filter & status_sessions) if session_filter is not None else status_sessions
+
+        if session_filter is not None and not session_filter:
+            return []
+
+        # session → session_index の title / status を後で付けられるよう取得
+        session_meta = {}
+        if session_filter is not None:
+            placeholders = ",".join("?" * len(session_filter))
+            meta_rows = conn.execute(
+                f"""SELECT key, title, stats FROM catalog_cards
+                    WHERE entry_type='session_index' AND key IN ({placeholders})""",
+                tuple(session_filter)
+            ).fetchall()
+            for r in meta_rows:
+                try:
+                    s = json.loads(r["stats"]) if r["stats"] else {}
+                except (json.JSONDecodeError, TypeError):
+                    s = {}
+                session_meta[r["key"]] = {"title": r["title"], "status": s.get("status")}
+
+        # FTS5 で検索 + session フィルタ
+        rows = []
+        try:
+            from tokenizer import tokenize
+            tokenized = tokenize(query)
+            if session_filter is not None:
+                placeholders = ",".join("?" * len(session_filter))
+                sql = (
+                    f"""SELECT raw_turns.* FROM raw_turns_fts
+                        JOIN raw_turns ON raw_turns_fts.turn_id = raw_turns.id
+                        WHERE raw_turns_fts MATCH ?
+                          AND raw_turns.session_id IN ({placeholders})
+                        ORDER BY raw_turns.timestamp DESC LIMIT ?"""
+                )
+                params = (tokenized, *tuple(session_filter), limit)
+            else:
+                sql = (
+                    """SELECT raw_turns.* FROM raw_turns_fts
+                       JOIN raw_turns ON raw_turns_fts.turn_id = raw_turns.id
+                       WHERE raw_turns_fts MATCH ?
+                       ORDER BY raw_turns.timestamp DESC LIMIT ?"""
+                )
+                params = (tokenized, limit)
+            rows = conn.execute(sql, params).fetchall()
+        except Exception:
+            rows = []
+
+        # FTS 失敗 or 0 件なら LIKE fallback
+        if not rows:
+            if session_filter is not None:
+                placeholders = ",".join("?" * len(session_filter))
+                sql = (
+                    f"""SELECT * FROM raw_turns
+                        WHERE content LIKE ? AND session_id IN ({placeholders})
+                        ORDER BY timestamp DESC LIMIT ?"""
+                )
+                params = (f"%{query}%", *tuple(session_filter), limit)
+            else:
+                sql = (
+                    "SELECT * FROM raw_turns WHERE content LIKE ? "
+                    "ORDER BY timestamp DESC LIMIT ?"
+                )
+                params = (f"%{query}%", limit)
+            rows = conn.execute(sql, params).fetchall()
+
+        out = []
+        for r in rows:
+            sid = r["session_id"]
+            meta = session_meta.get(sid, {})
+            out.append({
+                "raw_turn_id": r["id"],
+                "session_id": sid,
+                "role": r["role"],
+                "content": r["content"],
+                "timestamp": r["timestamp"],
+                "session_title": meta.get("title"),
+                "status": meta.get("status"),
+            })
+        return out
+    finally:
+        conn.close()
 
 
 # ============================================================
@@ -7210,12 +7846,11 @@ def _json_envelope(cmd, results, query=None, meta=None):
     return envelope
 
 
-def _extract_mentions_batch(fragments, timeout=30):
+def _extract_mentions_batch(fragments, timeout=120):
     """記憶断片のリストから、本文中に言及された人名を抽出する。
-    Gemini を使って fragments 並び順どおりに [[name, ...], ...] を返す。
+    Gemini CLI 経由で fragments 並び順どおりに [[name, ...], ...] を返す。
     失敗時は None（呼び出し側が batch 単位で諦める）。"""
-    gemini_key = os.environ.get("GEMINI_API_KEY", "")
-    if not gemini_key or not fragments:
+    if not fragments:
         return None
     numbered = "\n\n".join(
         f"[{i}] {(frag or '')[:600]}" for i, frag in enumerate(fragments)
@@ -7233,27 +7868,12 @@ def _extract_mentions_batch(fragments, timeout=30):
         '{"results": [{"i": 0, "mentions": ["name1", "name2"]}, ...]}\n\n'
         f"断片:\n{numbered}"
     )
-    model = os.environ.get("MENTIONS_MODEL", "gemini-3-flash-preview")
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/"
-        f"models/{model}:generateContent?key={gemini_key}"
-    )
-    body = json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.1,
-            "maxOutputTokens": 2000,
-            "responseMimeType": "application/json",
-            "thinkingConfig": {"thinkingBudget": 0},
-        },
-    }).encode("utf-8")
+    model = os.environ.get("MENTIONS_MODEL", _GEMINI_DEFAULT_MODEL)
+    response_text = _gemini_cli_call(prompt, model=model, timeout=timeout)
+    parsed = _parse_gemini_json(response_text)
+    if parsed is None:
+        return None
     try:
-        from urllib.request import Request, urlopen
-        req = Request(url, data=body, headers={"Content-Type": "application/json"})
-        with urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        parsed = json.loads(text)
         results = parsed.get("results", [])
         out = [[] for _ in fragments]
         for item in results:
@@ -7334,8 +7954,7 @@ def _distill_state(memories_with_scores, timeout=20):
 
     失敗時は None。呼び出し側は従来形式にフォールバックする。
     """
-    gemini_key = os.environ.get("GEMINI_API_KEY", "")
-    if not gemini_key or not memories_with_scores:
+    if not memories_with_scores:
         return None
 
     fragments_text = "\n---\n".join(
@@ -7358,29 +7977,11 @@ def _distill_state(memories_with_scores, timeout=20):
         f"断片:\n{fragments_text}"
     )
 
-    model = os.environ.get("RECALL_DISTILL_MODEL", "gemini-3-flash-preview")
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/"
-        f"models/{model}:generateContent?key={gemini_key}"
-    )
-    body = json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.7,
-            "maxOutputTokens": 1500,
-            "thinkingConfig": {"thinkingBudget": 0},
-        },
-    }).encode("utf-8")
-
-    try:
-        from urllib.request import Request, urlopen
-        req = Request(url, data=body, headers={"Content-Type": "application/json"})
-        with urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        return text or None
-    except Exception:
+    model = os.environ.get("RECALL_DISTILL_MODEL", _GEMINI_DEFAULT_MODEL)
+    text = _gemini_cli_call(prompt, model=model, timeout=max(timeout, 120))
+    if text is None:
         return None
+    return text.strip() or None
 
 
 def format_memory_compact(row, score=None, fragments_only=False):
@@ -7898,13 +8499,56 @@ def main():
 
     elif cmd == "search":
         if len(sys.argv) < 3:
-            print("使い方: python memory.py search \"検索語\" [--like] [--raw] [--fuzzy] [--json] [--domain D1,D2]")
+            print("使い方: python memory.py search \"検索語\" [--like] [--raw] [--fuzzy] [--json] "
+                  "[--domain D1,D2] [--session SID] [--topic SLUG] [--status solved|unsolved|ongoing|abandoned]")
             return
         use_like = "--like" in sys.argv
         raw_mode = "--raw" in sys.argv
         fuzzy_mode = "--fuzzy" in sys.argv
         json_mode = "--json" in sys.argv
         requested_domains = _parse_domain_flag(sys.argv)
+
+        # スコープフラグ取得（session / topic / status）
+        def _flag_value(flag):
+            if flag in sys.argv:
+                i = sys.argv.index(flag)
+                if i + 1 < len(sys.argv):
+                    return sys.argv[i + 1]
+            return None
+        scope_session = _flag_value("--session")
+        scope_topic = _flag_value("--topic")
+        scope_status = _flag_value("--status")
+
+        # スコープ指定時は raw_turn ベースの search_in_scope に切替
+        if scope_session or scope_topic or scope_status:
+            scope_results = search_in_scope(
+                sys.argv[2],
+                session_id=scope_session, topic=scope_topic, status=scope_status,
+                limit=20
+            )
+            if json_mode:
+                meta = {"count": len(scope_results), "mode": "scope",
+                        "session": scope_session, "topic": scope_topic, "status": scope_status}
+                print(json.dumps(
+                    _json_envelope("search", scope_results, query=sys.argv[2], meta=meta),
+                    ensure_ascii=False, indent=2
+                ))
+            elif scope_results:
+                scope_str = " / ".join(f"{k}={v}" for k, v in
+                    [("session", scope_session), ("topic", scope_topic), ("status", scope_status)] if v)
+                print(f"想起 ({len(scope_results)}件, スコープ: {scope_str}):")
+                for r in scope_results:
+                    ts = (r.get("timestamp") or "")[:16]
+                    title = r.get("session_title") or ""
+                    st = r.get("status") or ""
+                    content = (r.get("content") or "")[:120].replace("\n", " ")
+                    print(f"  raw:{r['raw_turn_id']} [{ts}] [{r['role']}] [{st}] "
+                          f"session: {title}")
+                    print(f"    「{content}」")
+            else:
+                print("想起できませんでした（スコープ内に該当 raw_turn なし）")
+            return
+
         search_result = search_memories(sys.argv[2], use_like=use_like, fuzzy=fuzzy_mode, requested_domains=requested_domains)
         if fuzzy_mode:
             results, fuzzy_results = search_result
