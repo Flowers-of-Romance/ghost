@@ -2645,7 +2645,13 @@ def _catalog_session_index(conn, dry_run=False, only_key=None,
 def _summarize_topic_thread(slug, session_cards, timeout=120):
     """複数 session_index カードから 1 つの topic_thread 要約を作る。
     session_cards: [{"title":..., "summary":..., "start_ts":..., "end_ts":...}, ...]
-    失敗時は None。"""
+    失敗時は None。
+
+    注: slug は関数内部で参照しない（title 生成を誘導しないため）。
+    Gemini には session の内容だけを見せて、横断する話題を自然言語で
+    再命名させる。slug 引数は API 互換性のため残してある。
+    """
+    _ = slug  # 意図的に使わない
     if not session_cards:
         return None
     parts = []
@@ -2657,14 +2663,17 @@ def _summarize_topic_thread(slug, session_cards, timeout=120):
         )
     body = "\n\n".join(parts)
     prompt = (
-        "以下は同じ話題に属する複数セッションの要約群。この話題全体を 1 カードに束ねた要約を作れ。\n"
-        "捏造せず、書かれていることだけを統合する。\n\n"
+        "以下は近い話題に属する複数セッションの要約群。複数を横断する"
+        "共通の主題を見つけて、1 カードに束ねた要約を作れ。\n"
+        "捏造せず、書かれていることだけを統合する。既存の slug やタグは"
+        "与えない — session 群の内容から主題を再命名すること。\n\n"
         "条件:\n"
-        "- title: この話題全体を 1 行（60文字以内）\n"
-        "- summary: この話題がどこから始まり、どう展開し、現状どこまで来たかを 3-5 行（500文字以内）。結論が無ければ「未決」と書け。\n\n"
+        "- title: この話題全体を 1 行（60文字以内）。複数 session に共通する"
+        "中心テーマを表す（特定 session だけの話題に引きずられるな）。\n"
+        "- summary: この話題がどこから始まり、どう展開し、現状どこまで来たかを "
+        "3-5 行（500文字以内）。結論が無ければ「未決」と書け。\n\n"
         "出力フォーマット（厳密な JSON、前置き後置きなし）:\n"
         '{"title": "...", "summary": "..."}\n\n'
-        f"話題スラグ: {slug}\n\n"
         f"セッション要約群:\n{body}"
     )
     model = os.environ.get("TOPIC_THREAD_MODEL", _GEMINI_DEFAULT_MODEL)
@@ -2681,12 +2690,13 @@ def _summarize_topic_thread(slug, session_cards, timeout=120):
         return None
 
 
-def _cluster_slugs_by_embedding(slug_texts, threshold=0.88):
-    """slug → embed 対象テキスト の dict をクラスタリング。
-    embed 対象には title + keywords を結合した自然文を渡す（短 slug 単独だと
-    e5-small の cosine 空間で区別が弱いため）。
+def _cluster_slugs_by_embedding(slug_texts, threshold=0.92):
+    """slug → embed 対象テキスト の dict を単純クラスタリング（再帰分割なし）。
+    embed 対象には title + summary + keywords を結合した自然文を渡す。
     戻り値: {representative_slug: [member_slug, ...]}。
-    embedding server or local model が使えなければ、素朴な文字列一致に降格。"""
+
+    注: 代表 slug は「最短文字列」で選ぶが、title の誘導を避けたい呼び出し側は
+    この結果を _pick_representative_by_keyword_freq で上書きすべき。"""
     if not slug_texts:
         return {}
     try:
@@ -2715,11 +2725,9 @@ def _cluster_slugs_by_embedding(slug_texts, threshold=0.88):
     if not valid_slugs:
         return {s: [s] for s in slugs}
 
-    # pairwise cosine（全部正規化済みなので内積 = cosine）
     mat = np.stack(vectors)
     sim = mat @ mat.T
 
-    # Union-Find 的に近い slug を束ねる
     parent = list(range(len(valid_slugs)))
     def find(x):
         while parent[x] != x:
@@ -2742,13 +2750,11 @@ def _cluster_slugs_by_embedding(slug_texts, threshold=0.88):
         root = find(i)
         groups.setdefault(root, []).append(s)
 
-    # 代表 slug は「最頻 or 最短」で選ぶ（短い方が一般的な表記）
     clusters = {}
     for members in groups.values():
         rep = sorted(members, key=lambda x: (len(x), x))[0]
         clusters[rep] = sorted(members)
 
-    # embedding 失敗した slug は単独クラスタとして追加
     for s in slugs:
         if s not in valid_slugs and s not in clusters:
             clusters[s] = [s]
@@ -2756,8 +2762,64 @@ def _cluster_slugs_by_embedding(slug_texts, threshold=0.88):
     return clusters
 
 
+def _cluster_with_size_limit(slug_texts, slug_session_count,
+                              initial_threshold=0.92, max_size=10, max_threshold=0.98):
+    """巨塊回避付きクラスタリング。
+    巨塊（session_count > max_size）になったクラスタは内部で threshold を
+    0.02 ずつ上げて再分割、max_threshold に達しても分解できなければ破棄。
+
+    slug_texts: {slug: embed_text}
+    slug_session_count: {slug: int} — その slug が持つ session 数
+    戻り値: {representative_slug: [member_slug, ...]}
+    """
+    clusters = _cluster_slugs_by_embedding(slug_texts, threshold=initial_threshold)
+    final = {}
+    for rep, members in clusters.items():
+        total_sessions = sum(slug_session_count.get(s, 0) for s in members)
+        if total_sessions <= max_size:
+            final[rep] = members
+            continue
+        # 巨塊 → 部分 embed 対象で再クラスタ、閾値を段階的に上げる
+        subset = {s: slug_texts[s] for s in members}
+        sub_count = {s: slug_session_count.get(s, 0) for s in members}
+        t = initial_threshold
+        resolved = False
+        while t < max_threshold:
+            t = round(t + 0.02, 4)
+            sub = _cluster_slugs_by_embedding(subset, threshold=t)
+            max_sub_sessions = max(
+                (sum(sub_count.get(s, 0) for s in sm) for sm in sub.values()),
+                default=0,
+            )
+            if max_sub_sessions <= max_size:
+                # 全部 ≤ max_size になった → この分割を採用（ただし再帰で厳密に扱う）
+                for sub_rep, sub_members in sub.items():
+                    final[sub_rep] = sub_members
+                resolved = True
+                break
+        if not resolved:
+            # 最終閾値でも巨塊 → その巨塊の部分だけ破棄（情報は session_index に残る）
+            for sub_rep, sub_members in sub.items():
+                sub_total = sum(sub_count.get(s, 0) for s in sub_members)
+                if sub_total <= max_size:
+                    final[sub_rep] = sub_members
+                # 超えてる塊は不採用
+    return final
+
+
+def _pick_representative_slug(members, slug_sessions):
+    """クラスタの代表 slug を「session を最も多く束ねている slug」で選ぶ。
+    tie-break は slug 文字列の辞書順。最短選定は title の誘導を招くため採用しない。
+    members: [slug, ...]
+    slug_sessions: {slug: [session_info, ...]}
+    """
+    def count(s):
+        return len(slug_sessions.get(s, []))
+    return sorted(members, key=lambda s: (-count(s), s))[0]
+
+
 def _catalog_topic_thread(conn, dry_run=False, only_key=None,
-                          similarity_threshold=0.88, min_sessions=2):
+                          similarity_threshold=0.92, min_sessions=2):
     """session_index カードの topic_slug を embedding 距離で束ね、
     2 session 以上のクラスタを topic_thread として upsert。
     session 跨ぎの話題にだけカードを作る（単独 session は session_index で十分）。"""
@@ -2806,16 +2868,25 @@ def _catalog_topic_thread(conn, dry_run=False, only_key=None,
     if not slug_to_sessions:
         return stats_out
 
-    # slug をクラスタリング（embed 対象は title + keywords）
-    clusters = _cluster_slugs_by_embedding(slug_texts, threshold=similarity_threshold)
+    # slug ごとの session 数（巨塊判定用）
+    slug_session_count = {s: len(slug_to_sessions.get(s, [])) for s in slug_texts}
 
-    for rep_slug, member_slugs in clusters.items():
+    # 巨塊回避付きクラスタリング。初期 threshold で分け、上限超えたら再分割
+    clusters = _cluster_with_size_limit(
+        slug_texts, slug_session_count,
+        initial_threshold=similarity_threshold,
+        max_size=10, max_threshold=0.98,
+    )
+
+    for _cluster_key, member_slugs in clusters.items():
+        # 代表 slug は「session を最も多く束ねている slug」で選ぶ（最短は title 誘導を招く）
+        rep_slug = _pick_representative_slug(member_slugs, slug_to_sessions)
+
         # このクラスタに属する全 session を集約
         sessions = []
         for s in member_slugs:
             sessions.extend(slug_to_sessions.get(s, []))
-        # session_id で dedupe（同じ session が slug 違いで複数ヒットするケースは
-        # 実質ないが念のため）
+        # session_id で dedupe
         seen = set()
         unique_sessions = []
         for ses in sessions:
