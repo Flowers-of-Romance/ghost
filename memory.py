@@ -2387,6 +2387,143 @@ def _catalog_hot_node(conn, dry_run=False, only_key=None):
     return stats
 
 
+def _catalog_current_focus(conn, dry_run=False, only_key=None, window_days=7):
+    """「今ここ」入口カード。key='now' の 1 行を常時保持する。
+    新 session 開始直後に Claude が pull して作業状況を即復元するための目録。
+
+    内容:
+    - 直近 window_days の ongoing session 一覧（end_ts 降順、先頭 10 件）
+    - 直近 window_days の active topic_thread（last_ts 降順、先頭 10 件）
+    - status=unsolved の session 総数（バックログ poke）
+    - 直近 window_days の status 分布
+    """
+    from datetime import datetime, timedelta, timezone
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=window_days)).strftime(
+        '%Y-%m-%dT%H:%M:%SZ'
+    )
+
+    session_rows = conn.execute(
+        """SELECT key, title, stats FROM catalog_cards
+           WHERE entry_type='session_index'"""
+    ).fetchall()
+
+    ongoing = []
+    status_dist_recent = {"solved": 0, "unsolved": 0, "ongoing": 0, "abandoned": 0}
+    unsolved_total = 0
+    for r in session_rows:
+        try:
+            s = json.loads(r["stats"]) if r["stats"] else {}
+        except (json.JSONDecodeError, TypeError):
+            s = {}
+        st = s.get("status") or ""
+        end_ts = s.get("end_ts") or ""
+        if st == "unsolved":
+            unsolved_total += 1
+        if end_ts and end_ts >= cutoff:
+            if st in status_dist_recent:
+                status_dist_recent[st] += 1
+            if st == "ongoing":
+                ongoing.append({
+                    "session_id": r["key"],
+                    "title": r["title"],
+                    "topic_slug": s.get("topic_slug", ""),
+                    "end_ts": end_ts,
+                    "status_note": s.get("status_note", ""),
+                    "turn_count": s.get("turn_count", 0),
+                })
+    ongoing.sort(key=lambda x: x["end_ts"], reverse=True)
+
+    topic_rows = conn.execute(
+        """SELECT key, title, stats FROM catalog_cards
+           WHERE entry_type='topic_thread'"""
+    ).fetchall()
+    active_topics = []
+    for r in topic_rows:
+        try:
+            s = json.loads(r["stats"]) if r["stats"] else {}
+        except (json.JSONDecodeError, TypeError):
+            s = {}
+        last_ts = s.get("last_ts") or ""
+        if last_ts and last_ts >= cutoff:
+            active_topics.append({
+                "key": r["key"],
+                "title": r["title"],
+                "session_count": s.get("session_count", 0),
+                "last_ts": last_ts,
+            })
+    active_topics.sort(key=lambda x: x["last_ts"], reverse=True)
+
+    lines = [f"## 直近 {window_days} 日の ongoing sessions ({len(ongoing)} 件)"]
+    if not ongoing:
+        lines.append("  （なし）")
+    for o in ongoing[:10]:
+        lines.append(
+            f"- {o['title']} "
+            f"[session: {o['session_id'][:8]}, topic: {o['topic_slug']}, "
+            f"{o['turn_count']} turns]"
+        )
+        if o["status_note"]:
+            lines.append(f"    根拠: {o['status_note'][:120]}")
+
+    lines.append("")
+    lines.append(f"## 直近 {window_days} 日の active topics ({len(active_topics)} 件)")
+    if not active_topics:
+        lines.append("  （なし）")
+    for t in active_topics[:10]:
+        lines.append(f"- {t['title']} [{t['key']}, {t['session_count']} sessions]")
+
+    lines.append("")
+    lines.append(
+        f"## 直近 {window_days} 日の status 分布: "
+        f"solved={status_dist_recent['solved']} / "
+        f"unsolved={status_dist_recent['unsolved']} / "
+        f"ongoing={status_dist_recent['ongoing']} / "
+        f"abandoned={status_dist_recent['abandoned']}"
+    )
+    lines.append(
+        f"## 未決 session 総数 (全期間): {unsolved_total}  "
+        f"→ `search --status unsolved` で絞り込み可"
+    )
+
+    content = "\n".join(lines)
+    title = (
+        f"現在地: ongoing {len(ongoing)} / active topics {len(active_topics)} / "
+        f"unsolved total {unsolved_total}"
+    )
+
+    # related_ids: ongoing sessions の session_index key と topic_thread key を混ぜる
+    related_keys = [o["session_id"] for o in ongoing[:10]] + \
+                   [t["key"] for t in active_topics[:10]]
+
+    source_hash = _catalog_hash({
+        "ongoing": [(o["session_id"], o["end_ts"]) for o in ongoing[:10]],
+        "topics": [(t["key"], t["last_ts"]) for t in active_topics[:10]],
+        "unsolved": unsolved_total,
+        "recent_dist": status_dist_recent,
+    })
+
+    card_stats = {
+        "window_days": window_days,
+        "ongoing_count": len(ongoing),
+        "active_topic_count": len(active_topics),
+        "unsolved_total": unsolved_total,
+        "status_dist_recent": status_dist_recent,
+        "ongoing_sessions": [o["session_id"] for o in ongoing[:10]],
+        "active_topics": [t["key"] for t in active_topics[:10]],
+    }
+
+    stats = {"inserted": 0, "updated": 0, "unchanged": 0}
+    if only_key is not None and only_key != "now":
+        return stats
+    if dry_run:
+        return stats
+    action = _catalog_upsert(
+        conn, "current_focus", "now", title, content, related_keys, card_stats, source_hash
+    )
+    stats[action] += 1
+    return stats
+
+
 _GEMINI_CLI_PATH = os.environ.get("GEMINI_CLI_PATH", "/opt/homebrew/bin/gemini")
 _GEMINI_DEFAULT_MODEL = os.environ.get("GEMINI_DEFAULT_MODEL", "gemini-3.1-pro-preview")
 
@@ -2914,11 +3051,33 @@ def _catalog_topic_thread(conn, dry_run=False, only_key=None,
         first_ts = sessions[0].get("start_ts")
         last_ts = sessions[-1].get("end_ts")
 
+        # session_index から各 session の status を引いて集計（未決滞留の可視化）
+        status_counts = {"solved": 0, "unsolved": 0, "ongoing": 0, "abandoned": 0}
+        if session_ids:
+            placeholders = ",".join("?" * len(session_ids))
+            sidx_rows = conn.execute(
+                f"""SELECT stats FROM catalog_cards
+                    WHERE entry_type='session_index' AND key IN ({placeholders})""",
+                tuple(session_ids)
+            ).fetchall()
+            for sr in sidx_rows:
+                try:
+                    ss = json.loads(sr["stats"]) if sr["stats"] else {}
+                except (json.JSONDecodeError, TypeError):
+                    ss = {}
+                st = ss.get("status") or ""
+                if st in status_counts:
+                    status_counts[st] += 1
+        status_total = sum(status_counts.values())
+        unsolved_ratio = round(status_counts["unsolved"] / status_total, 3) \
+            if status_total > 0 else 0.0
+
         source_hash = _catalog_hash({
             "slug": rep_slug,
             "sids": sorted(session_ids),
             "members": sorted(member_slugs),
             "last": last_ts,
+            "status": status_counts,  # status 変化にも追従
         })
         existing = conn.execute(
             "SELECT source_hash FROM catalog_cards WHERE entry_type='topic_thread' AND key=?",
@@ -2948,6 +3107,8 @@ def _catalog_topic_thread(conn, dry_run=False, only_key=None,
             "first_ts": first_ts,
             "last_ts": last_ts,
             "representative_slug": rep_slug,
+            "status_counts": status_counts,
+            "unsolved_ratio": unsolved_ratio,  # 未決滞留度
         }
         action = _catalog_upsert(
             conn, "topic_thread", key, title, content,
@@ -2984,8 +3145,10 @@ def build_catalog(dry_run=False, full_rebuild=False, only_types=None, only_key=N
         ("hot_node", _catalog_hot_node),
         # raw_turn 層を索引する目録（v30.2）
         ("session_index", _catalog_session_index),
-        # topic_thread は session_index の成果物を束ねるので最後に回す
+        # topic_thread は session_index の成果物を束ねるので後に回す
         ("topic_thread", _catalog_topic_thread),
+        # 「今ここ」カード: session_index / topic_thread の後で集計
+        ("current_focus", _catalog_current_focus),
     ]
     for name, fn in all_fns:
         if only_types is not None and name not in only_types:
@@ -5036,6 +5199,120 @@ def format_delusion(item, similarity=None):
 
     meta_line = " ".join(parts)
     return f"{meta_line}\n{content}"
+
+
+def repair_memory_raw_links(limit=500, window_days=1):
+    """raw_turns.memory_ids に未登録の memory を、FTS + 時間窓で対応する
+    raw_turn に紐付ける補修バッチ。
+
+    対象: forgotten=0 かつ content あり の memory のうち、どの raw_turn からも
+    参照されていないもの。
+    探し方:
+      1. memory.created_at 前後 window_days 日の raw_turn に絞る
+      2. memory.content 先頭 200 文字を tokenize して raw_turns_fts で MATCH
+      3. hit あれば最初の 1 件に memory.id を追記（重複は自動 skip）
+    window_days で見つからない場合は次回再挑戦（段階的に窓を広げる運用は呼び側）。
+    """
+    from tokenizer import tokenize
+    conn = get_connection()
+    try:
+        # 既にリンク済みの memory id 集合
+        linked = set()
+        for r in conn.execute(
+            "SELECT memory_ids FROM raw_turns WHERE memory_ids != '[]' AND memory_ids IS NOT NULL"
+        ):
+            try:
+                for mid in json.loads(r["memory_ids"] or "[]"):
+                    if isinstance(mid, int):
+                        linked.add(mid)
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        # orphan memory を importance 降順 / id 新しい順で取る
+        mem_rows = conn.execute(
+            """SELECT id, content, created_at FROM memories
+               WHERE forgotten = 0 AND content IS NOT NULL AND content != ''
+               ORDER BY importance DESC, id DESC"""
+        ).fetchall()
+
+        stats = {"scanned": 0, "linked": 0, "no_match": 0,
+                 "already_linked": 0, "fts_error": 0}
+        for m in mem_rows:
+            if stats["linked"] >= limit:
+                break
+            if m["id"] in linked:
+                stats["already_linked"] += 1
+                continue
+            stats["scanned"] += 1
+            content = (m["content"] or "").strip()
+            if not content:
+                continue
+
+            try:
+                q_raw = tokenize(content[:200])
+            except Exception:
+                stats["fts_error"] += 1
+                continue
+            if not q_raw or not q_raw.strip():
+                continue
+            # FTS5 MATCH は AND デフォルトで厳しすぎるので、上位 10 token を OR 結合。
+            # 短すぎる token（1 文字）は除外。
+            tokens = [t for t in q_raw.split() if len(t) > 1][:10]
+            if not tokens:
+                stats["fts_error"] += 1
+                continue
+            q = " OR ".join(tokens)
+
+            # 時間窓で絞った FTS 検索
+            date_clause = ""
+            date_params = ()
+            created = m["created_at"]
+            if created:
+                # created_at は ISO 8601 想定、±window_days の範囲
+                try:
+                    dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    lo = (dt - timedelta(days=window_days)).strftime('%Y-%m-%dT%H:%M:%SZ')
+                    hi = (dt + timedelta(days=window_days)).strftime('%Y-%m-%dT%H:%M:%SZ')
+                    date_clause = " AND raw_turns.timestamp BETWEEN ? AND ?"
+                    date_params = (lo, hi)
+                except (ValueError, TypeError):
+                    pass
+
+            try:
+                rt = conn.execute(
+                    f"""SELECT raw_turns.id, raw_turns.memory_ids
+                        FROM raw_turns_fts
+                        JOIN raw_turns ON raw_turns_fts.turn_id = raw_turns.id
+                        WHERE raw_turns_fts MATCH ?{date_clause}
+                        ORDER BY raw_turns.timestamp ASC LIMIT 1""",
+                    (q, *date_params)
+                ).fetchone()
+            except Exception:
+                stats["fts_error"] += 1
+                continue
+
+            if not rt:
+                stats["no_match"] += 1
+                continue
+
+            try:
+                ids = json.loads(rt["memory_ids"] or "[]")
+            except (json.JSONDecodeError, TypeError):
+                ids = []
+            if m["id"] in ids:
+                continue
+            ids.append(m["id"])
+            conn.execute(
+                "UPDATE raw_turns SET memory_ids = ? WHERE id = ?",
+                (json.dumps(ids), rt["id"])
+            )
+            stats["linked"] += 1
+            linked.add(m["id"])
+
+        conn.commit()
+        return stats
+    finally:
+        conn.close()
 
 
 def save_raw_turn(session_id, role, content, timestamp=None,
@@ -9248,6 +9525,30 @@ def main():
         else:
             mode = "dry-run" if dry else "live"
             print(f"extract-mentions ({mode}): {stats}")
+
+    elif cmd == "repair-links":
+        # memory → raw_turn の FTS 補修バッチ
+        limit = 500
+        window = 1
+        json_mode = "--json" in sys.argv
+        for i, a in enumerate(sys.argv[2:], start=2):
+            if a == "--limit" and i + 1 < len(sys.argv):
+                try:
+                    limit = int(sys.argv[i + 1])
+                except ValueError:
+                    pass
+            elif a == "--window-days" and i + 1 < len(sys.argv):
+                try:
+                    window = int(sys.argv[i + 1])
+                except ValueError:
+                    pass
+        stats = repair_memory_raw_links(limit=limit, window_days=window)
+        if json_mode:
+            print(json.dumps(_json_envelope("repair-links", [stats],
+                                            meta={"limit": limit, "window_days": window}),
+                             ensure_ascii=False, indent=2))
+        else:
+            print(f"repair-links (window={window} days, limit={limit}): {stats}")
 
     elif cmd == "overview":
         overview()

@@ -1,5 +1,34 @@
 # Changelog
 
+## [v30.3] - 2026-04-23
+
+### pull 経路の穴を埋める — current_focus カード / topic の未決滞留可視化 / memory→raw_turn リンク補修
+
+v30.2 を運用してみて、Claude 側から見た pull パターンに対して図書館側が最適化
+されてない場所が 3 点あった。穴を順に埋めた:
+
+#### 実装（memory.py）
+- **`current_focus` 新 entry_type**: `catalog_cards` に `key='now'` の 1 行を保持する
+  「今ここ」入口カード。直近 N 日（既定 7）の ongoing session 一覧（title / topic_slug /
+  status_note）+ active topic_thread + status 分布 + 未決 session 総数を 1 カードに
+  集約。session 間の context を失う新会話冒頭に Claude が `catalog show current_focus now`
+  を 1 回叩けば作業状況を復元できる。`anchor`（identity 用 5 点）とは別軸の navigation 入口。
+- **`topic_thread` に `status_counts` / `unsolved_ratio` 追加**: session_ids から各
+  session_index.status を引いて集計し、未決滞留度（unsolved / 全体）を stats に保存。
+  `source_hash` にも status を含めて session_index の status 更新に topic_thread が
+  追従するようにした。`catalog list topic_thread` で未決が溜まってる話題が一目で分かる。
+- **`repair-links` CLI**: `raw_turns.memory_ids` の orphan を FTS + 時間窓（既定 ±1 日）
+  で紐付ける補修バッチ。memory.content の先頭 200 文字を tokenize → 上位 10 token を
+  OR 結合して `raw_turns_fts` に MATCH、時間窓内の最初の hit に追記。`--limit` /
+  `--window-days` で実行幅を制御。初回実行で scanned=100 のうち linked=100 / no_match=0
+  の精度を確認。
+
+#### build_catalog / sleep.py
+- `build_catalog()` の all_fns に `current_focus` を追加（session_index / topic_thread
+  の後に集計）。sleep.py は既存の `catalog build` を呼ぶのみなので無変更で自動組込み。
+- `repair-links` は sleep.py の steps にはまだ入れていない（実行コスト未評価。運用して
+  から判断）。当面は手動で `python memory.py repair-links --limit 500` を回す想定。
+
 ## [v30.2] - 2026-04-23
 
 ### raw_turn 層の目録化 — session_index / topic_thread + Gemini CLI 統一 + スコープ検索
