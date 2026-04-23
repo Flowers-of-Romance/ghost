@@ -1323,6 +1323,81 @@ def _rebuild_fts_index(conn):
 
 
 # ============================================================
+# FTS5 ヘルパー — BM25 重み・snippet 整形・OR フォールバック
+# ============================================================
+# Namazu 的な「転置インデックス + TF-IDF + ヒット周辺の切り出し」を FTS5
+# ネイティブ機能で実現する共通レイヤ。検索各経路から呼び出される。
+
+# FTS5 MATCH がデフォルト AND で厳しすぎるケース用。repair-links で実績。
+_FTS_OR_MAX_TOKENS = 10
+
+
+def _tokenize_or_query(query, max_tokens=_FTS_OR_MAX_TOKENS):
+    """クエリを形態素解析して `token1 OR token2 OR ...` 形の MATCH 式を返す。
+
+    FTS5 の AND デフォルトで 0 件になるケースの二段目フォールバックに使う。
+    短すぎる (1 文字) トークンは除く。tokenize 不能時は None。
+    """
+    try:
+        from tokenizer import tokenize
+        tokenized = tokenize(query or "")
+    except Exception:
+        return None
+    if not tokenized.strip():
+        return None
+    tokens = [t for t in tokenized.split() if len(t) > 1][:max_tokens]
+    if not tokens:
+        return None
+    return " OR ".join(tokens)
+
+
+def _bm25_bonus_map(conn, query, fts_table, id_col, max_rows=200, bonus_min=0.05, bonus_max=0.10):
+    """FTS5 の bm25() をランク基準に [bonus_min, bonus_max] のボーナスへ正規化。
+
+    ヒットした id に対する dict を返す。BM25 は小さいほど関連度高 (負値が多い)。
+    最良ヒットが bonus_max、最悪ヒットが bonus_min。FTS 使用不可時は空 dict。
+    """
+    try:
+        from tokenizer import tokenize
+        tokenized = tokenize(query or "")
+    except Exception:
+        return {}
+    if not tokenized.strip():
+        return {}
+    try:
+        rows = conn.execute(
+            f"""SELECT {id_col} AS id, bm25({fts_table}) AS s
+                FROM {fts_table} WHERE {fts_table} MATCH ?
+                ORDER BY s LIMIT ?""",
+            (tokenized, max_rows)
+        ).fetchall()
+    except Exception:
+        return {}
+    if not rows:
+        return {}
+    scores = [r["s"] for r in rows]
+    s_min, s_max = min(scores), max(scores)
+    rng = (s_max - s_min) or 1.0
+    return {r["id"]: bonus_min + (bonus_max - bonus_min) * (s_max - r["s"]) / rng
+            for r in rows}
+
+
+def _rejoin_tokenized_snippet(s):
+    """FTS5 snippet() の出力 (空白区切り形態素) を可読な形に寄せる。
+
+    memories_fts / raw_turns_fts は tokenize 済みテキストをそのまま格納しており、
+    snippet() も同じ空白区切りで返る。隣接する CJK 文字間のスペースだけ除き、
+    英単語 (ASCII) 間のスペースは保つ。
+    """
+    if not s:
+        return s
+    return re.sub(
+        r'([぀-ヿ一-鿿])\s+(?=[぀-ヿ一-鿿])',
+        r'\1', s
+    )
+
+
+# ============================================================
 # 5. 再固定化 — 想起するたびに記憶が変化する
 # ============================================================
 
@@ -3304,30 +3379,63 @@ def _catalog_cli(args):
             for i, a in enumerate(args):
                 if a == "--type" and i + 1 < len(args):
                     filter_type = args[i + 1]
-            # tier 1: FTS5 全文検索
+            # tier 1: FTS5 全文検索 (BM25 降順 + content snippet)
             rows = []
             source = "fts"
             try:
                 fts_q = query.replace('"', '""')
                 if filter_type:
                     rows = conn.execute(
-                        """SELECT c.* FROM catalog_cards c
+                        """SELECT c.*,
+                                  snippet(catalog_fts, 1, '【', '】', '...', 16) AS snippet
+                           FROM catalog_cards c
                            JOIN catalog_fts f ON f.key = c.key
                            WHERE catalog_fts MATCH ? AND c.entry_type = ?
-                           LIMIT 20""",
+                           ORDER BY bm25(catalog_fts) LIMIT 20""",
                         (f'"{fts_q}"', filter_type)
                     ).fetchall()
                 else:
                     rows = conn.execute(
-                        """SELECT c.* FROM catalog_cards c
+                        """SELECT c.*,
+                                  snippet(catalog_fts, 1, '【', '】', '...', 16) AS snippet
+                           FROM catalog_cards c
                            JOIN catalog_fts f ON f.key = c.key
                            WHERE catalog_fts MATCH ?
-                           LIMIT 20""",
+                           ORDER BY bm25(catalog_fts) LIMIT 20""",
                         (f'"{fts_q}"',)
                     ).fetchall()
             except sqlite3.OperationalError:
                 rows = []
                 source = "like"
+            # tier 1.5: 厳密 phrase が 0 件なら tokenize+OR で緩めて再検索
+            if not rows and source == "fts":
+                or_expr = _tokenize_or_query(query)
+                if or_expr:
+                    try:
+                        if filter_type:
+                            rows = conn.execute(
+                                """SELECT c.*,
+                                          snippet(catalog_fts, 1, '【', '】', '...', 16) AS snippet
+                                   FROM catalog_cards c
+                                   JOIN catalog_fts f ON f.key = c.key
+                                   WHERE catalog_fts MATCH ? AND c.entry_type = ?
+                                   ORDER BY bm25(catalog_fts) LIMIT 20""",
+                                (or_expr, filter_type)
+                            ).fetchall()
+                        else:
+                            rows = conn.execute(
+                                """SELECT c.*,
+                                          snippet(catalog_fts, 1, '【', '】', '...', 16) AS snippet
+                                   FROM catalog_cards c
+                                   JOIN catalog_fts f ON f.key = c.key
+                                   WHERE catalog_fts MATCH ?
+                                   ORDER BY bm25(catalog_fts) LIMIT 20""",
+                                (or_expr,)
+                            ).fetchall()
+                        if rows:
+                            source = "fts_or"
+                    except sqlite3.OperationalError:
+                        pass
             # tier 2: FTS5 が 0 件なら embedding fallback
             if not rows and source == "fts":
                 try:
@@ -3372,8 +3480,17 @@ def _catalog_cli(args):
                     ).fetchall()
                 if rows:
                     source = "like"
-            cards = [{"entry_type": r["entry_type"], "key": r["key"], "title": r["title"],
-                      "content": (r["content"] or "")[:200], "_source": source} for r in rows]
+            cards = []
+            for r in rows:
+                card = {"entry_type": r["entry_type"], "key": r["key"], "title": r["title"],
+                        "content": (r["content"] or "")[:200], "_source": source}
+                try:
+                    sn = r["snippet"]
+                    if sn:
+                        card["snippet"] = sn
+                except (IndexError, KeyError):
+                    pass
+                cards.append(card)
             if json_mode:
                 print(json.dumps(_json_envelope("catalog find", cards, query=query),
                                  ensure_ascii=False, indent=2))
@@ -3381,6 +3498,9 @@ def _catalog_cli(args):
                 print(f"catalog find '{query}' ({len(cards)}件, via {source}):")
                 for c in cards:
                     print(f"  [{c['entry_type']}/{c['key']}] {c['title']}")
+                    sn = c.get("snippet")
+                    if sn:
+                        print(f"      …{sn.replace(chr(10), ' ')}")
         else:
             print(usage)
     finally:
@@ -4596,6 +4716,37 @@ def _temporal_boost(row):
     return 1.0
 
 
+def _like_or_fts_fallback(conn, query, limit, forgotten_filter=True):
+    """embedding 不在 / --like 指定時のメモリ検索フォールバック。
+
+    1. tokenize+OR で memories_fts を MATCH (形態素の曖昧一致、BM25 降順)
+    2. 0 件なら従来の LIKE
+    repair-links 方式の逆輸入 — 単純 LIKE より精度が出る。
+    """
+    forgot_mem = "AND m.forgotten = 0" if forgotten_filter else ""
+    forgot_like = "AND forgotten = 0" if forgotten_filter else ""
+    or_expr = _tokenize_or_query(query)
+    if or_expr:
+        try:
+            rows = conn.execute(
+                f"""SELECT m.*, bm25(memories_fts) AS bm25_score
+                    FROM memories_fts
+                    JOIN memories m ON memories_fts.memory_id = m.id
+                    WHERE memories_fts MATCH ? {forgot_mem}
+                    ORDER BY bm25_score LIMIT ?""",
+                (or_expr, limit)
+            ).fetchall()
+            if rows:
+                return rows
+        except Exception:
+            pass
+    return conn.execute(
+        f"""SELECT * FROM memories WHERE content LIKE ? {forgot_like}
+            ORDER BY importance DESC LIMIT ?""",
+        (f"%{query}%", limit)
+    ).fetchall()
+
+
 def search_memories(query, limit=10, use_like=False, fuzzy=False, requested_domains=None):
     conn = get_connection()
     fuzzy_results = []  # 舌先現象: 類似度0.45-0.65のもやもや記憶
@@ -4606,21 +4757,13 @@ def search_memories(query, limit=10, use_like=False, fuzzy=False, requested_doma
     check_prospective(conn, query)
 
     if use_like or (not is_embed_server_alive() and get_model() is None):
-        rows = conn.execute(
-            """SELECT * FROM memories WHERE forgotten = 0 AND content LIKE ?
-               ORDER BY importance DESC LIMIT ?""",
-            (f"%{query}%", limit)
-        ).fetchall()
+        rows = _like_or_fts_fallback(conn, query, limit, forgotten_filter=True)
         scored_results = [(row, None) for row in rows]
     else:
         import numpy as np
         query_vec = embed_text(query, is_query=True)
         if query_vec is None:
-            rows = conn.execute(
-                """SELECT * FROM memories WHERE forgotten = 0 AND content LIKE ?
-                   ORDER BY importance DESC LIMIT ?""",
-                (f"%{query}%", limit)
-            ).fetchall()
+            rows = _like_or_fts_fallback(conn, query, limit, forgotten_filter=True)
             scored_results = [(row, None) for row in rows]
             # LIKE検索時はここで終了
             conn.close()
@@ -4628,6 +4771,10 @@ def search_memories(query, limit=10, use_like=False, fuzzy=False, requested_doma
 
         # sqlite-vecで候補を取得し、左脳/右脳スコアリング
         vec_candidates = vec_search(conn, query_vec, k=max(limit * 5, 100), forgotten=False)
+
+        # FTS5 BM25 ボーナス (語の希少性を重みに)
+        fts_bonus_map = _bm25_bonus_map(conn, query, "memories_fts", "memory_id",
+                                        max_rows=max(limit * 5, 200))
 
         scored = []
         if vec_candidates:
@@ -4651,6 +4798,7 @@ def search_memories(query, limit=10, use_like=False, fuzzy=False, requested_doma
                 L = _left_score(row, sim=sim, domain_weight=dw) * temporal
                 R = _right_score(conn, row)
                 score = corpus_callosum(L, R, balance=0.5)
+                score *= (1.0 + fts_bonus_map.get(mid, 0.0))
                 scored.append((row, score, sim))
         else:
             # sqlite-vecが使えない場合のフォールバック（旧方式）
@@ -4665,6 +4813,7 @@ def search_memories(query, limit=10, use_like=False, fuzzy=False, requested_doma
                 L = _left_score(row, sim=sim, domain_weight=dw) * temporal
                 R = _right_score(conn, row)
                 score = corpus_callosum(L, R, balance=0.5)
+                score *= (1.0 + fts_bonus_map.get(row["id"], 0.0))
                 scored.append((row, score, sim))
 
         scored.sort(key=lambda x: x[1], reverse=True)
@@ -4809,34 +4958,76 @@ def search_in_scope(query, session_id=None, topic=None, status=None, limit=20):
                     s = {}
                 session_meta[r["key"]] = {"title": r["title"], "status": s.get("status")}
 
-        # FTS5 で検索 + session フィルタ
+        # FTS5 で検索 + session フィルタ (BM25 降順 + snippet)
         rows = []
+        has_snippet = False
         try:
             from tokenizer import tokenize
             tokenized = tokenize(query)
             if session_filter is not None:
                 placeholders = ",".join("?" * len(session_filter))
                 sql = (
-                    f"""SELECT raw_turns.* FROM raw_turns_fts
+                    f"""SELECT raw_turns.*,
+                               snippet(raw_turns_fts, 0, '【', '】', '...', 16) AS snippet,
+                               bm25(raw_turns_fts) AS bm25_score
+                        FROM raw_turns_fts
                         JOIN raw_turns ON raw_turns_fts.turn_id = raw_turns.id
                         WHERE raw_turns_fts MATCH ?
                           AND raw_turns.session_id IN ({placeholders})
-                        ORDER BY raw_turns.timestamp DESC LIMIT ?"""
+                        ORDER BY bm25_score LIMIT ?"""
                 )
                 params = (tokenized, *tuple(session_filter), limit)
             else:
                 sql = (
-                    """SELECT raw_turns.* FROM raw_turns_fts
+                    """SELECT raw_turns.*,
+                              snippet(raw_turns_fts, 0, '【', '】', '...', 16) AS snippet,
+                              bm25(raw_turns_fts) AS bm25_score
+                       FROM raw_turns_fts
                        JOIN raw_turns ON raw_turns_fts.turn_id = raw_turns.id
                        WHERE raw_turns_fts MATCH ?
-                       ORDER BY raw_turns.timestamp DESC LIMIT ?"""
+                       ORDER BY bm25_score LIMIT ?"""
                 )
                 params = (tokenized, limit)
             rows = conn.execute(sql, params).fetchall()
+            has_snippet = bool(rows)
         except Exception:
             rows = []
 
-        # FTS 失敗 or 0 件なら LIKE fallback
+        # FTS AND で 0 件なら tokenize+OR で緩めて再検索
+        if not rows:
+            or_expr = _tokenize_or_query(query)
+            if or_expr:
+                try:
+                    if session_filter is not None:
+                        placeholders = ",".join("?" * len(session_filter))
+                        sql = (
+                            f"""SELECT raw_turns.*,
+                                       snippet(raw_turns_fts, 0, '【', '】', '...', 16) AS snippet,
+                                       bm25(raw_turns_fts) AS bm25_score
+                                FROM raw_turns_fts
+                                JOIN raw_turns ON raw_turns_fts.turn_id = raw_turns.id
+                                WHERE raw_turns_fts MATCH ?
+                                  AND raw_turns.session_id IN ({placeholders})
+                                ORDER BY bm25_score LIMIT ?"""
+                        )
+                        params = (or_expr, *tuple(session_filter), limit)
+                    else:
+                        sql = (
+                            """SELECT raw_turns.*,
+                                      snippet(raw_turns_fts, 0, '【', '】', '...', 16) AS snippet,
+                                      bm25(raw_turns_fts) AS bm25_score
+                               FROM raw_turns_fts
+                               JOIN raw_turns ON raw_turns_fts.turn_id = raw_turns.id
+                               WHERE raw_turns_fts MATCH ?
+                               ORDER BY bm25_score LIMIT ?"""
+                        )
+                        params = (or_expr, limit)
+                    rows = conn.execute(sql, params).fetchall()
+                    has_snippet = bool(rows)
+                except Exception:
+                    rows = []
+
+        # 最終フォールバック: LIKE (snippet なし)
         if not rows:
             if session_filter is not None:
                 placeholders = ",".join("?" * len(session_filter))
@@ -4858,7 +5049,7 @@ def search_in_scope(query, session_id=None, topic=None, status=None, limit=20):
         for r in rows:
             sid = r["session_id"]
             meta = session_meta.get(sid, {})
-            out.append({
+            entry = {
                 "raw_turn_id": r["id"],
                 "session_id": sid,
                 "role": r["role"],
@@ -4866,7 +5057,13 @@ def search_in_scope(query, session_id=None, topic=None, status=None, limit=20):
                 "timestamp": r["timestamp"],
                 "session_title": meta.get("title"),
                 "status": meta.get("status"),
-            })
+            }
+            if has_snippet:
+                try:
+                    entry["snippet"] = _rejoin_tokenized_snippet(r["snippet"])
+                except (IndexError, KeyError):
+                    pass
+            out.append(entry)
         return out
     finally:
         conn.close()
@@ -4942,20 +5139,29 @@ def delusion_search(query=None, limit=50, date=None, after=None, before=None,
     # --- ベクトル検索 (sqlite-vec + FTS5ハイブリッド) ---
     results = []
 
-    # FTS5検索を先に試す（テキスト完全一致に強い）
-    fts_ids = set()
-    try:
-        from tokenizer import tokenize
-        tokenized_query = tokenize(query)
-        fts_rows = conn.execute(
-            f"""SELECT memory_id FROM memories_fts
-                WHERE memories_fts MATCH ?
-                LIMIT ?""",
-            (tokenized_query, limit)
-        ).fetchall()
-        fts_ids = {row[0] for row in fts_rows}
-    except Exception:
-        pass
+    # FTS5検索を先に試す（テキスト完全一致に強い、bm25 で語の希少性を重みに）
+    # ヒット 0 のときは tokenize+OR フォールバックで拾い直す。
+    fts_bonus_map = _bm25_bonus_map(conn, query, "memories_fts", "memory_id",
+                                    max_rows=max(limit * 5, 200))
+    if not fts_bonus_map:
+        or_expr = _tokenize_or_query(query)
+        if or_expr:
+            try:
+                or_rows = conn.execute(
+                    """SELECT memory_id AS id, bm25(memories_fts) AS s
+                       FROM memories_fts WHERE memories_fts MATCH ?
+                       ORDER BY s LIMIT ?""",
+                    (or_expr, max(limit * 5, 200))
+                ).fetchall()
+                if or_rows:
+                    scores = [r["s"] for r in or_rows]
+                    s_min, s_max = min(scores), max(scores)
+                    rng = (s_max - s_min) or 1.0
+                    # OR フォールバックは半信半疑なので上限を 0.05 に抑える
+                    fts_bonus_map = {r["id"]: 0.02 + 0.03 * (s_max - r["s"]) / rng
+                                     for r in or_rows}
+            except Exception:
+                pass
 
     # ベクトル検索
     import numpy as np
@@ -4966,7 +5172,7 @@ def delusion_search(query=None, limit=50, date=None, after=None, before=None,
         vec_candidates = vec_search(conn, query_vec, k=max(limit * 5, 200), forgotten=None)
 
         if vec_candidates:
-            # 日付フィルタ + FTSボーナス
+            # 日付フィルタ + BM25 重みボーナス
             scored = []
             for mid, _, sim in vec_candidates:
                 row = conn.execute(
@@ -4975,7 +5181,7 @@ def delusion_search(query=None, limit=50, date=None, after=None, before=None,
                 ).fetchone()
                 if not row:
                     continue
-                fts_bonus = 0.05 if row["id"] in fts_ids else 0.0
+                fts_bonus = fts_bonus_map.get(row["id"], 0.0)
                 scored.append((row, sim + fts_bonus, sim))
         else:
             # フォールバック: 旧方式
@@ -4987,7 +5193,7 @@ def delusion_search(query=None, limit=50, date=None, after=None, before=None,
             for row in all_rows:
                 mem_vec = bytes_to_vec(row["embedding"])
                 sim = cosine_similarity(query_vec, mem_vec)
-                fts_bonus = 0.05 if row["id"] in fts_ids else 0.0
+                fts_bonus = fts_bonus_map.get(row["id"], 0.0)
                 scored.append((row, sim + fts_bonus, sim))
 
         scored.sort(key=lambda x: x[1], reverse=True)
@@ -5073,23 +5279,47 @@ def _delusion_raw_search(conn, query, limit=20, date=None, after=None, before=No
             date_clause += " AND timestamp < ?"
             date_params.append(f"{next_day}T00:00:00Z")
 
-    # FTS5検索（fugashi形態素解析）
+    # FTS5検索（fugashi形態素解析）: BM25 降順 + ヒット箇所 snippet
     try:
         from tokenizer import tokenize
         tokenized_query = tokenize(query)
         fts_rows = conn.execute(
-            f"""SELECT raw_turns.* FROM raw_turns_fts
+            f"""SELECT raw_turns.*,
+                       snippet(raw_turns_fts, 0, '【', '】', '...', 16) AS snippet,
+                       bm25(raw_turns_fts) AS bm25_score
+                FROM raw_turns_fts
                 JOIN raw_turns ON raw_turns_fts.turn_id = raw_turns.id
                 WHERE raw_turns_fts MATCH ?{date_clause}
-                LIMIT ?""",
+                ORDER BY bm25_score LIMIT ?""",
             (tokenized_query, *date_params, limit)
         ).fetchall()
         if fts_rows:
-            return [(_raw_turn_to_format(row), None) for row in fts_rows]
+            return [(_raw_turn_to_format(row, snippet=_rejoin_tokenized_snippet(row["snippet"])), None)
+                    for row in fts_rows]
     except Exception:
         pass
 
-    # LIKE検索フォールバック
+    # FTS5 AND で 0 件なら tokenize+OR で緩めて再検索
+    or_expr = _tokenize_or_query(query)
+    if or_expr:
+        try:
+            or_rows = conn.execute(
+                f"""SELECT raw_turns.*,
+                           snippet(raw_turns_fts, 0, '【', '】', '...', 16) AS snippet,
+                           bm25(raw_turns_fts) AS bm25_score
+                    FROM raw_turns_fts
+                    JOIN raw_turns ON raw_turns_fts.turn_id = raw_turns.id
+                    WHERE raw_turns_fts MATCH ?{date_clause}
+                    ORDER BY bm25_score LIMIT ?""",
+                (or_expr, *date_params, limit)
+            ).fetchall()
+            if or_rows:
+                return [(_raw_turn_to_format(row, snippet=_rejoin_tokenized_snippet(row["snippet"])), None)
+                        for row in or_rows]
+        except Exception:
+            pass
+
+    # 最終フォールバック: LIKE 検索
     rows = conn.execute(
         f"SELECT * FROM raw_turns WHERE content LIKE ?{date_clause} ORDER BY timestamp DESC LIMIT ?",
         (f"%{query}%", *date_params, limit)
@@ -5097,9 +5327,12 @@ def _delusion_raw_search(conn, query, limit=20, date=None, after=None, before=No
     return [(_raw_turn_to_format(row), None) for row in rows]
 
 
-def _raw_turn_to_format(row):
-    """raw_turn rowをdelusion用フォーマットに変換。"""
-    return {
+def _raw_turn_to_format(row, snippet=None):
+    """raw_turn rowをdelusion用フォーマットに変換。
+
+    snippet: FTS5 snippet() の結果 (任意)。ヒット位置中心の抜粋表示用。
+    """
+    out = {
         "id": f"raw:{row['id']}",
         "content": row["content"],
         "category": f"raw_turn ({row['role']})",
@@ -5114,6 +5347,9 @@ def _raw_turn_to_format(row):
         "session_id": row["session_id"],
         "role": row["role"],
     }
+    if snippet:
+        out["snippet"] = snippet
+    return out
 
 
 def _delusion_context(conn, memory_id):
@@ -8889,10 +9125,15 @@ def main():
                     ts = (r.get("timestamp") or "")[:16]
                     title = r.get("session_title") or ""
                     st = r.get("status") or ""
-                    content = (r.get("content") or "")[:120].replace("\n", " ")
+                    # snippet があればヒット位置中心の抜粋、なければ先頭切り詰め
+                    sn = r.get("snippet")
+                    if sn:
+                        excerpt = sn.replace("\n", " ")
+                    else:
+                        excerpt = (r.get("content") or "")[:120].replace("\n", " ")
                     print(f"  raw:{r['raw_turn_id']} [{ts}] [{r['role']}] [{st}] "
                           f"session: {title}")
-                    print(f"    「{content}」")
+                    print(f"    「{excerpt}」")
             else:
                 print("想起できませんでした（スコープ内に該当 raw_turn なし）")
             return
