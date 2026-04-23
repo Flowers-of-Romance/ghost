@@ -1,12 +1,13 @@
 ---
 name: sleep
-description: 記憶の睡眠処理（夢 → 海馬リプレイ → 統合 → 夢解釈）。脳の夜間バッチ処理に相当。
+description: 記憶の睡眠処理（夢 → 海馬リプレイ → 統合 → 目録の更新 → 夢解釈）。脳の夜間バッチ処理に相当。
 user-invocable: true
 ---
 
 # 睡眠（記憶の整理）
 
-脳の睡眠中の記憶処理を実行する。
+脳の睡眠中の記憶処理を実行する。神経学的な整理（replay / consolidate / schema /
+proceduralize）と、navigability の整理（catalog）を並行して回す。
 
 ## 手順
 
@@ -20,8 +21,11 @@ user-invocable: true
 4. `python memory.py replay` — 海馬リプレイ
 5. `python memory.py consolidate` — 類似記憶の統合
 6. `python memory.py schema` — メタ記憶の自動生成
-7. `python memory.py proceduralize` — 反復記憶の手続き記憶昇格
-8. `python memory.py stats` — 統計
+7. `python memory.py catalog build` — 目録の更新（session_index / topic_thread / current_focus 含む）
+   - session_index は Gemini pro-preview を叩くので **差分のある session が多い時は 20-30 分かかる**
+   - 初回や長期間回してなかった時は `max_sessions_per_build=40` でキャップされるので、未処理分は翌日以降に繰り越す
+8. `python memory.py proceduralize` — 反復記憶の手続き記憶昇格
+9. `python memory.py stats` — 統計
 
 ### 2. 報告素材の生成
 
@@ -35,7 +39,7 @@ ghost.toml の `[brain]` セクションを確認する。
   ```bash
   echo "出力" | <right_cmd> "以下は記憶システムの夢と自由連想の出力です。情動的に印象に残る断片を3-5個抽出してください。解釈や説明は不要。断片だけ。"
   ```
-- replay, consolidate, schema, proceduralize, stats の出力 → `left_cmd` にパイプ:
+- replay, consolidate, schema, catalog, proceduralize, stats の出力 → `left_cmd` にパイプ:
   ```bash
   echo "出力" | <left_cmd> "以下は記憶の整理処理の結果です。何が統合され、何が強化され、何が忘れられたか。2-3行で要約してください。"
   ```

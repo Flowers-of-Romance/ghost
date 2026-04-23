@@ -33,13 +33,14 @@ v30.2 を運用してみて、Claude 側から見た pull パターンに対し�
 
 ### raw_turn 層の目録化 — session_index / topic_thread + Gemini CLI 統一 + スコープ検索
 
-v30.1 までの catalog は memory 層（忘却を経た層）だけを索引していた。だが意味は
-raw_turn（原文、忘却なし）にしか残らない場面が多い。raw_turn 層にも並立で目録を
-立てて、navigation の覆いを広げた。
+v30.1 までの catalog は memory 層（要約・索引・忘却を経た channel）だけを索引して
+いた。raw_turn（append-only で decay しにくい channel）は別の性格を持ち、memory 側
+だけでは navigate の入口が偏る。raw_turn 層にも並立で目録を立てて、両方の channel
+に navigation を張れるようにした。
 
-比喩: memory catalog = 海馬の索引、raw_turn catalog = 日誌のインデックス。
-人間も記憶と日記は別に管理する。ghost が日誌（raw_turn）を持ってるのに目録が
-記憶側だけなのは片側ブラインド、を埋める。
+どちらが「真の意味」という話ではなく、同じ practice（navigate）に参加する異なる
+channel が 2 系統ある、という構成。memory catalog と raw_turn catalog は同じ図書館
+に対する異なる索引軸。
 
 #### 実装（memory.py）
 - **新 entry_type `session_index`**: `session_id` 単位で raw_turn を集約、Gemini で
