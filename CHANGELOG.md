@@ -1,5 +1,57 @@
 # Changelog
 
+## [v30.4] - 2026-04-23
+
+### FTS5 を使い倒す — BM25 スコア / snippet ヒット抜粋 / tokenize+OR フォールバック
+
+検索補助である FTS5 の既存機能を本気で活用する。これまで「ヒットしたら +0.05」
+の定数加点・LIKE フォールバック・先頭切り詰め表示だった経路を、語の希少性・
+ヒット位置中心の抜粋・形態素の曖昧一致に置き換えた。ghost の検索は
+「ベクトル (sqlite-vec) 主 / FTS5 補助」の構成だが、補助側の芯を入れ替えた形。
+
+#### 共通ヘルパー (memory.py, `_rebuild_fts_index` 直後)
+- **`_tokenize_or_query(query)`**: 形態素を OR 結合した MATCH 式を返す。FTS5
+  の AND デフォルトで 0 件になる場合の二段目フォールバックに使う。v30.3 の
+  `repair-links` 方式の逆輸入。短すぎる (1 文字) トークンは除外、上位 10 個。
+- **`_bm25_bonus_map(conn, query, fts_table, id_col, bonus_min=0.05, bonus_max=0.10)`**:
+  `bm25()` を `[bonus_min, bonus_max]` のボーナスへ正規化した dict を返す。
+  BM25 は小さいほど関連度高 (負値) なので順位正規化。
+- **`_rejoin_tokenized_snippet(s)`**: fugashi 区切りで返る snippet の隣接 CJK 間
+  スペースを消して可読化。英単語間の空白は保つ (`運用 レポート` → `運用レポート`、
+  `SQLite FTS5` はそのまま)。
+
+#### 実装 (memory.py)
+- **`delusion_search` (memory 経路)**: 定数 `+0.05` を `_bm25_bonus_map` の
+  `[0.05, 0.10]` ボーナスに置換。最良ヒットが上限、最悪ヒットが下限。FTS AND で
+  0 件なら `tokenize+OR` で緩く再検索し、この場合のみボーナス上限を 0.05 に抑える
+  (半信半疑)。
+- **`_delusion_raw_search`**: FTS 経路に `ORDER BY bm25(raw_turns_fts)` と
+  `snippet(..., 0, '【', '】', '...', 16)` を追加。0 件時の `tokenize+OR` 中間段を
+  LIKE の前に挿入。`_raw_turn_to_format` に `snippet` 引数を追加。
+- **`search_in_scope`**: FTS 経路を timestamp 降順 → BM25 降順に変更 (時間より
+  関連度優先)、snippet を出力辞書に伝播。`tokenize+OR` 中間段を追加。CLI 表示で
+  snippet があればそれを優先 (ヒット中心の抜粋)。
+- **`search_memories`**: `_like_or_fts_fallback` を新設 — `--like` / embedding
+  不在時にまず `tokenize+OR+BM25` で拾い、0 件で従来の LIKE に落ちる。通常経路の
+  最終スコアに `(1.0 + fts_bonus_map.get(id, 0.0))` を乗算。
+- **`catalog find`**: tier 1 に `ORDER BY bm25(catalog_fts)` + `snippet(catalog_fts, 1)`
+  を追加。tier 1.5 として `tokenize+OR` を挿入 (`source=fts_or`)。`catalog_fts` は
+  `unicode61` なので、厳密 phrase で取りこぼした場合の補完。CLI 表示に snippet
+  行を追加。
+
+#### 動作確認
+- `search "ghost" --like` → LIKE じゃなく OR+MATCH で 10 件、BM25 順
+- `delusion "転置インデックス"` → BM25 重みが乗った ranking、raw も混在
+- `search "転置インデックス" --status ongoing` → BM25 順 + 【インデックス】ハイライト
+  付き snippet 8 件
+- `catalog find "ghost"` → unicode61 の自然な snippet 9 件
+
+#### 位置づけ
+ベクトル検索は意味の類似に強いが、固有名詞・エラーコード・コマンド名のような
+1 トークンの厳密一致に弱い。また cosine の性質上「ありふれた語が多い文ほど似る」
+バイアスがあり、topic_thread 巨塊化 (v30.2 巨塊対策) の遠因にもなっていた。BM25 の
+IDF が語の希少性を重みとして直接反映するので、意味空間の欠点を補う構成になる。
+
 ## [v30.3] - 2026-04-23
 
 ### pull 経路の穴を埋める — current_focus カード / topic の未決滞留可視化 / memory→raw_turn リンク補修
