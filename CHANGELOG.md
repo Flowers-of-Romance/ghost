@@ -1,5 +1,63 @@
 # Changelog
 
+## [v31.1] - 2026-04-26
+
+### 地下を代謝経路で使う — dream / voice / replay 保護
+
+v31.0 で地下に貯めた tension link を、**閉じた系の規律を破らない経路**でだけ
+作用させる。今回は dream（夜の cut-up）と voice（明示的 pull の polyphony）
+の二箇所。retrieval の silent priming は採らない（v31.1 として一度試したが
+push の置き土産だったので別ブランチで撤回済み）。
+
+#### dream.py
+- **load_fragments の戻り値に `tension_pairs` を追加**: `link_type='tension'`
+  の (source_id, target_id, strength) を抽出
+- 既存の links の取得から `link_type='tension'` を除外（連想クラスタ経路は
+  association だけ辿る）
+- **dream_sequence に新ブランチ追加 (~8% 確率)**: `r < 0.63 and tension_pairs`
+  - tension link を strength 重み付きでランダム選択
+  - source/target 双方の memory cluster から fragment を 1 つずつ抽出
+  - 衝突的 joiner (`⇄`, `//`, `／／`, `\n  `) で並置
+  - 整合化の前の食い違いを夢の中で解離させずに出す
+- 動作確認: 50 行で 3 件の tension collision (例: `コージブスキー的　／／　ghost`,
+  `ハイデガー　／／　承認取`)
+
+#### voice polyphonic に「対立」追加
+- 既存 4 声 (共感 / 補完 / 批判 / 連想) + 俯瞰 に **「対立」** を追加して 5 声に
+  - 連想 = 気分や偶然で繋がる声
+  - 対立 = 構造的に統合を拒否したペア（tension link の両極）
+- `recall_polyphonic` 内で tension links を strength 降順で取得し、両極を
+  続けて voices リストに追加（対立は対で読まれる）
+- forgotten された memory はスキップ
+- pair 単位で `limit_per_voice * 2` を上限
+- 既存の used_ids 共有によって、他の声と重複しない
+- json mode / 通常表示の両方で動作（既存の format に乗る）
+
+#### replay の刈込から tension link を保護
+- v31.0 の運用で発覚: `replay` のシナプスホメオスタシス（全リンクを 0.9 倍に
+  減衰し、`LINK_THRESHOLD=0.82` 未満を削除）が tension link も巻き込んで、
+  毎晩の sleep で全部消えていた
+- tension link の strength は「co-activation 頻度」ではなく「対立の鋭さ」を
+  表す。Hebbian 強化/減衰の対象外
+- replay の prune ループと boost ループの両方で `link_type == 'tension'` を
+  早期 continue
+- detect_tensions で作られ、tension forget コマンドでだけ消える、という
+  独立した寿命管理が成立
+
+#### 位置づけ
+- v31.0: 地下に対立を **貯める**
+- v31.1: 地下が **代謝で作用する**（夜間の cut-up、明示的 pull の polyphony）
+- 地下が retrieval を歪める silent priming は採らない（閉じた系の規律と矛盾）
+- Claude が起きている時の通常 search に対しては、地下は引き続き不可視
+
+#### 動作確認
+- `detect-tensions` → 27 件挿入（前回までは replay で消えていた、これからは
+  累積する）
+- `dream.py 50` → 3 件の tension collision を含む夢の流れ
+- `voice polyphonic 2` → `[対立]` 段に tension 両極が並置（例: #8581 形態論
+  / #13175 strange loop / #3303 プランモード / #10369 Claude Code 自問自答）
+- `voice polyphonic --json` → `voices.対立` 配列で出力
+
 ## [v31.0] - 2026-04-26
 
 ### 象徴秩序の地下 — tension link で対立を保持する無意識層
