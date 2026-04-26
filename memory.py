@@ -95,6 +95,31 @@ INTERFERENCE_THRESHOLD = 0.90
 # 統合: この類似度を超える記憶ペアを統合候補とする
 CONSOLIDATION_THRESHOLD = 0.94
 
+# 緊張保持 (tension link): 類似トピックだが情動極性が対立する記憶ペアを
+# 統合せず別レーンで保持する。象徴秩序の地下＝無意識層の最初の機能。
+# - 検出器であって生成器ではない（既にあるデータの中の対立を救出するだけ）
+# - 同じ話題と認める類似度の下限。これ未満は別話題なので無関係
+TENSION_SIM_LOW = 0.72
+# - これを超えたら consolidate へ送る（対立よりも統合が優先される強い類似）
+TENSION_SIM_HIGH = 0.93
+# - 情動極性ギャップの最小値（-1..+1 軸での絶対差。1.5 = 強極性 vs 反対極性）
+TENSION_POLARITY_GAP_MIN = 1.5
+# - 両方の arousal が低い対立は記録しない（凪いだ食い違いはノイズ扱い）
+TENSION_AROUSAL_FLOOR = 0.35
+# - keyword overlap の最小数（同じ話題の追加保証。embedding だけでは弱い）
+TENSION_KEYWORD_OVERLAP_MIN = 1
+
+# 情動の極性: emotions タグを正負中性に分類する。
+# 緊張検出に使う。surprise は中性（驚きそのものは方向を持たない）。
+EMOTION_POLARITY = {
+    "insight": +1,
+    "determination": +1,
+    "connection": +1,
+    "conflict": -1,
+    "anxiety": -1,
+    "surprise": 0,
+}
+
 # プライミング: 最近N分以内にアクセスした記憶からプライミング効果
 PRIMING_WINDOW_MINUTES = 30
 
@@ -1458,6 +1483,239 @@ def reconsolidate(conn, memory_id):
 
 
 # ============================================================
+# 緊張保持 — 統合せずに対立を別レーンで残す
+# ============================================================
+
+def _emotion_polarity(emotions_list):
+    """emotions タグの極性平均を -1..+1 で返す。空なら 0。"""
+    if not emotions_list:
+        return 0.0
+    scores = [EMOTION_POLARITY.get(e, 0) for e in emotions_list]
+    return sum(scores) / len(scores)
+
+
+def _detect_tension(a, b, sim):
+    """
+    類似トピックだが対立する記憶ペアか判定する。
+    対立を生成しない。既存データの中で merge に紛れ込もうとする対立を救出する。
+
+    Returns: (is_tension: bool, strength: float in 0..1)
+    """
+    emo_a = json.loads(a["emotions"]) if a["emotions"] else []
+    emo_b = json.loads(b["emotions"]) if b["emotions"] else []
+    pa = _emotion_polarity(emo_a)
+    pb = _emotion_polarity(emo_b)
+    polarity_gap = abs(pa - pb)
+
+    if polarity_gap < TENSION_POLARITY_GAP_MIN:
+        return False, 0.0
+
+    # 両方が凪いでいたら対立として記録に値しない
+    if a["arousal"] < TENSION_AROUSAL_FLOOR and b["arousal"] < TENSION_AROUSAL_FLOOR:
+        return False, 0.0
+
+    # 両方とも極性持ちの emotion を一つは持っていること（中性 vs 強極性は弱いシグナル）
+    has_pol_a = any(EMOTION_POLARITY.get(e, 0) != 0 for e in emo_a)
+    has_pol_b = any(EMOTION_POLARITY.get(e, 0) != 0 for e in emo_b)
+    if not (has_pol_a and has_pol_b):
+        return False, 0.0
+
+    # keyword overlap：embedding が近いだけでは「同じ話題」と言いきれない
+    kw_a = set(json.loads(a["keywords"]) if a["keywords"] else [])
+    kw_b = set(json.loads(b["keywords"]) if b["keywords"] else [])
+    overlap = kw_a & kw_b
+    if len(overlap) < TENSION_KEYWORD_OVERLAP_MIN:
+        return False, 0.0
+
+    # 同じ極性が混じっている場合は弱める（純粋な対立ではないので）
+    common_emo = set(emo_a) & set(emo_b)
+    common_polarity_present = any(EMOTION_POLARITY.get(e, 0) != 0 for e in common_emo)
+    overlap_dampening = 0.5 if common_polarity_present else 1.0
+
+    strength = sim * (polarity_gap / 2.0) * overlap_dampening
+    return True, min(1.0, strength)
+
+
+def _insert_tension_link(conn, source_id, target_id, strength):
+    """tension link を挿入。既存リンクがあれば link_type を tension に更新し
+    strength は max を取る。"""
+    existing = conn.execute(
+        "SELECT id, strength, link_type FROM links "
+        "WHERE (source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?)",
+        (source_id, target_id, target_id, source_id)
+    ).fetchone()
+
+    if existing:
+        new_strength = max(existing["strength"], strength)
+        conn.execute(
+            "UPDATE links SET strength = ?, link_type = 'tension' WHERE id = ?",
+            (new_strength, existing["id"])
+        )
+        return False  # 新規ではない
+    else:
+        conn.execute(
+            "INSERT INTO links (source_id, target_id, strength, link_type) "
+            "VALUES (?, ?, ?, 'tension')",
+            (source_id, target_id, strength)
+        )
+        return True
+
+
+def detect_tensions(dry_run=False, sim_low=None, sim_high=None):
+    """
+    moderate な類似度範囲（sim_low..sim_high）の記憶ペアをスキャンして、
+    情動極性が対立しているペアに tension link を貼る。
+    consolidate より広い範囲（同じ話題だが merge には至らない）を担当する。
+
+    consolidate_memories の中での tension 救出と独立に動く。
+    sleep の一段階として呼ばれる想定。
+    """
+    if sim_low is None:
+        sim_low = TENSION_SIM_LOW
+    if sim_high is None:
+        sim_high = TENSION_SIM_HIGH
+
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT id, content, keywords, embedding, importance, arousal, emotions, category "
+        "FROM memories WHERE forgotten = 0 AND embedding IS NOT NULL"
+    ).fetchall()
+
+    if len(rows) < 2:
+        print("緊張検出: 記憶が足りません")
+        conn.close()
+        return {"scanned": 0, "detected": 0, "inserted": 0, "updated": 0}
+
+    scanned = 0
+    detected = 0
+    inserted = 0
+    updated = 0
+    examples = []
+
+    for i, a in enumerate(rows):
+        vec_a = bytes_to_vec(a["embedding"])
+        if vec_a is None:
+            continue
+        for b in rows[i+1:]:
+            vec_b = bytes_to_vec(b["embedding"])
+            if vec_b is None:
+                continue
+            sim = cosine_similarity(vec_a, vec_b)
+            if sim < sim_low or sim >= sim_high:
+                continue
+            scanned += 1
+            is_tension, strength = _detect_tension(a, b, sim)
+            if not is_tension:
+                continue
+            detected += 1
+            if dry_run:
+                if len(examples) < 10:
+                    examples.append((a, b, sim, strength))
+            else:
+                is_new = _insert_tension_link(conn, a["id"], b["id"], strength)
+                if is_new:
+                    inserted += 1
+                else:
+                    updated += 1
+
+    if not dry_run:
+        conn.commit()
+    conn.close()
+
+    if dry_run:
+        print(f"緊張候補: {detected}件 (スキャン {scanned}ペア、sim {sim_low}〜{sim_high})")
+        for a, b, sim, strength in examples:
+            print(f"  sim={sim:.2f} strength={strength:.2f}")
+            print(f"    #{a['id']}: {a['content'][:60]}")
+            print(f"    #{b['id']}: {b['content'][:60]}")
+    else:
+        print(f"✓ 緊張検出: 新規 {inserted}件 / 更新 {updated}件 / 検出 {detected}件 / スキャン {scanned}ペア")
+
+    return {"scanned": scanned, "detected": detected, "inserted": inserted, "updated": updated}
+
+
+def list_tensions(limit=30):
+    """tension link を一覧表示。"""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT l.id, l.source_id, l.target_id, l.strength, l.created_at,
+                  ma.content AS content_a, mb.content AS content_b,
+                  ma.emotions AS emo_a, mb.emotions AS emo_b
+           FROM links l
+           JOIN memories ma ON ma.id = l.source_id
+           JOIN memories mb ON mb.id = l.target_id
+           WHERE l.link_type = 'tension'
+             AND ma.forgotten = 0 AND mb.forgotten = 0
+           ORDER BY l.strength DESC, l.created_at DESC
+           LIMIT ?""",
+        (limit,)
+    ).fetchall()
+    conn.close()
+    if not rows:
+        print("tension link はありません")
+        return
+    print(f"tension links ({len(rows)}件):")
+    for r in rows:
+        emo_a = " ".join(EMOTION_EMOJI.get(e, "·") for e in (json.loads(r["emo_a"]) if r["emo_a"] else []))
+        emo_b = " ".join(EMOTION_EMOJI.get(e, "·") for e in (json.loads(r["emo_b"]) if r["emo_b"] else []))
+        print(f"  [{r['id']}] strength={r['strength']:.2f}")
+        print(f"    #{r['source_id']} {emo_a} {r['content_a'][:60]}")
+        print(f"    #{r['target_id']} {emo_b} {r['content_b'][:60]}")
+
+
+def forget_tension(link_id):
+    """誤検出された tension link を消す。"""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT link_type FROM links WHERE id = ?", (link_id,)
+    ).fetchone()
+    if not row:
+        print(f"link #{link_id} は存在しません")
+        conn.close()
+        return
+    if row["link_type"] != "tension":
+        print(f"link #{link_id} は tension ではありません (link_type={row['link_type']})")
+        conn.close()
+        return
+    conn.execute("DELETE FROM links WHERE id = ?", (link_id,))
+    conn.commit()
+    conn.close()
+    print(f"✓ tension link #{link_id} を削除しました")
+
+
+def _tension_cli(args):
+    if not args:
+        print("使い方: python memory.py tension {list|detect|forget <id>}")
+        return
+    sub = args[0]
+    if sub == "list":
+        limit = 30
+        for i, a in enumerate(args[1:], start=1):
+            if a == "--limit" and i + 1 < len(args):
+                try:
+                    limit = int(args[i + 1])
+                except ValueError:
+                    pass
+        list_tensions(limit=limit)
+    elif sub == "detect":
+        dry = "--dry-run" in args
+        detect_tensions(dry_run=dry)
+    elif sub == "forget":
+        if len(args) < 2:
+            print("使い方: python memory.py tension forget <link_id>")
+            return
+        try:
+            lid = int(args[1])
+        except ValueError:
+            print(f"link_id が不正です: {args[1]}")
+            return
+        forget_tension(lid)
+    else:
+        print(f"不明なサブコマンド: {sub}")
+        print("使い方: python memory.py tension {list|detect|forget <id>}")
+
+
+# ============================================================
 # 6. 統合・圧縮 — 類似する記憶を一つにまとめる
 # ============================================================
 
@@ -1506,9 +1764,25 @@ def consolidate_memories(dry_run=False):
 
     merged_ids = set()
     consolidation_count = 0
+    tension_count = 0
 
     for a, b, sim in pairs:
         if a["id"] in merged_ids or b["id"] in merged_ids:
+            continue
+
+        # 緊張保持: 高類似度でも情動極性が対立しているなら統合せず別レーンで残す
+        is_tension, t_strength = _detect_tension(a, b, sim)
+        if is_tension:
+            if dry_run:
+                print(f"  緊張保持 (sim:{sim:.3f}, strength:{t_strength:.2f}):")
+                print(f"    #{a['id']}: {a['content'][:50]}")
+                print(f"    #{b['id']}: {b['content'][:50]}")
+            else:
+                _insert_tension_link(conn, a["id"], b["id"], t_strength)
+            tension_count += 1
+            # この二つは統合せずに残す（merged_ids には入れない＝今後の merge 候補からは除外）
+            merged_ids.add(a["id"])
+            merged_ids.add(b["id"])
             continue
 
         # 統合記憶の内容を生成
@@ -1607,9 +1881,12 @@ def consolidate_memories(dry_run=False):
     conn.close()
 
     if dry_run:
-        print(f"\n統合候補: {len(pairs)}ペア")
+        print(f"\n統合候補: {len(pairs)}ペア（うち緊張保持 {tension_count}件）")
     else:
-        print(f"✓ 統合完了: {consolidation_count}件の記憶を統合")
+        msg = f"✓ 統合完了: {consolidation_count}件の記憶を統合"
+        if tension_count:
+            msg += f"、緊張保持 {tension_count}件"
+        print(msg)
 
 
 # ============================================================
@@ -9723,6 +10000,14 @@ def main():
     elif cmd == "consolidate":
         dry = "--dry-run" in sys.argv
         consolidate_memories(dry_run=dry)
+
+    elif cmd == "tension":
+        _tension_cli(sys.argv[2:])
+
+    elif cmd == "detect-tensions":
+        # sleep に組み込みやすい単独コマンド（detect_tensions の薄いエイリアス）
+        dry = "--dry-run" in sys.argv
+        detect_tensions(dry_run=dry)
 
     elif cmd == "schema":
         dry = "--dry-run" in sys.argv
