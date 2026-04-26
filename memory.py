@@ -3515,6 +3515,112 @@ def build_catalog(dry_run=False, full_rebuild=False, only_types=None, only_key=N
     return results
 
 
+def catalog_find_cards(conn, query, filter_type=None, limit=20):
+    """catalog_cards を query で FTS5 / tokenize+OR / embedding / LIKE のチェーンで検索。
+    返り値は (rows, source) のタプル。
+
+    pull の主な surface は catalog なので、search のデフォルトもこれを叩く。
+    memory.content は表に出さない（無意識規律）。
+    """
+    rows = []
+    source = "fts"
+    try:
+        fts_q = query.replace('"', '""')
+        if filter_type:
+            rows = conn.execute(
+                """SELECT c.*, snippet(catalog_fts, 1, '【', '】', '...', 16) AS snippet
+                   FROM catalog_cards c JOIN catalog_fts f ON f.key = c.key
+                   WHERE catalog_fts MATCH ? AND c.entry_type = ?
+                   ORDER BY bm25(catalog_fts) LIMIT ?""",
+                (f'"{fts_q}"', filter_type, limit)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT c.*, snippet(catalog_fts, 1, '【', '】', '...', 16) AS snippet
+                   FROM catalog_cards c JOIN catalog_fts f ON f.key = c.key
+                   WHERE catalog_fts MATCH ?
+                   ORDER BY bm25(catalog_fts) LIMIT ?""",
+                (f'"{fts_q}"', limit)
+            ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+        source = "like"
+
+    # tier 1.5: 厳密 phrase が 0 件なら tokenize+OR で緩めて再検索
+    if not rows and source == "fts":
+        or_expr = _tokenize_or_query(query)
+        if or_expr:
+            try:
+                if filter_type:
+                    rows = conn.execute(
+                        """SELECT c.*, snippet(catalog_fts, 1, '【', '】', '...', 16) AS snippet
+                           FROM catalog_cards c JOIN catalog_fts f ON f.key = c.key
+                           WHERE catalog_fts MATCH ? AND c.entry_type = ?
+                           ORDER BY bm25(catalog_fts) LIMIT ?""",
+                        (or_expr, filter_type, limit)
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        """SELECT c.*, snippet(catalog_fts, 1, '【', '】', '...', 16) AS snippet
+                           FROM catalog_cards c JOIN catalog_fts f ON f.key = c.key
+                           WHERE catalog_fts MATCH ?
+                           ORDER BY bm25(catalog_fts) LIMIT ?""",
+                        (or_expr, limit)
+                    ).fetchall()
+                if rows:
+                    source = "fts_or"
+            except sqlite3.OperationalError:
+                pass
+
+    # tier 2: FTS5 が 0 件なら embedding fallback
+    if not rows and source == "fts":
+        try:
+            qvec = embed_text(query, is_query=True)
+        except Exception:
+            qvec = None
+        if qvec is not None:
+            hits = vec_search(conn, qvec, k=30, forgotten=False)
+            hit_ids = [mid for mid, _d, _s in hits]
+            if hit_ids:
+                placeholders = ",".join("?" * len(hit_ids))
+                if filter_type:
+                    sql = (f"""SELECT DISTINCT c.* FROM catalog_cards c,
+                               json_each(c.related_ids) j
+                               WHERE j.value IN ({placeholders}) AND c.entry_type = ?
+                               LIMIT ?""")
+                    rows = conn.execute(sql, (*hit_ids, filter_type, limit)).fetchall()
+                else:
+                    sql = (f"""SELECT DISTINCT c.* FROM catalog_cards c,
+                               json_each(c.related_ids) j
+                               WHERE j.value IN ({placeholders})
+                               LIMIT ?""")
+                    rows = conn.execute(sql, (*hit_ids, limit)).fetchall()
+                if rows:
+                    source = "embedding"
+
+    # tier 3: 最終フォールバック LIKE
+    if not rows:
+        like = f"%{query}%"
+        if filter_type:
+            rows = conn.execute(
+                """SELECT * FROM catalog_cards
+                   WHERE (title LIKE ? OR content LIKE ?) AND entry_type = ?
+                   LIMIT ?""",
+                (like, like, filter_type, limit)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT * FROM catalog_cards
+                   WHERE title LIKE ? OR content LIKE ?
+                   LIMIT ?""",
+                (like, like, limit)
+            ).fetchall()
+        if rows:
+            source = "like"
+
+    return rows, source
+
+
 def _catalog_cli(args):
     """catalog サブコマンド: build / summary / list / show / find"""
     usage = (
@@ -3656,107 +3762,7 @@ def _catalog_cli(args):
             for i, a in enumerate(args):
                 if a == "--type" and i + 1 < len(args):
                     filter_type = args[i + 1]
-            # tier 1: FTS5 全文検索 (BM25 降順 + content snippet)
-            rows = []
-            source = "fts"
-            try:
-                fts_q = query.replace('"', '""')
-                if filter_type:
-                    rows = conn.execute(
-                        """SELECT c.*,
-                                  snippet(catalog_fts, 1, '【', '】', '...', 16) AS snippet
-                           FROM catalog_cards c
-                           JOIN catalog_fts f ON f.key = c.key
-                           WHERE catalog_fts MATCH ? AND c.entry_type = ?
-                           ORDER BY bm25(catalog_fts) LIMIT 20""",
-                        (f'"{fts_q}"', filter_type)
-                    ).fetchall()
-                else:
-                    rows = conn.execute(
-                        """SELECT c.*,
-                                  snippet(catalog_fts, 1, '【', '】', '...', 16) AS snippet
-                           FROM catalog_cards c
-                           JOIN catalog_fts f ON f.key = c.key
-                           WHERE catalog_fts MATCH ?
-                           ORDER BY bm25(catalog_fts) LIMIT 20""",
-                        (f'"{fts_q}"',)
-                    ).fetchall()
-            except sqlite3.OperationalError:
-                rows = []
-                source = "like"
-            # tier 1.5: 厳密 phrase が 0 件なら tokenize+OR で緩めて再検索
-            if not rows and source == "fts":
-                or_expr = _tokenize_or_query(query)
-                if or_expr:
-                    try:
-                        if filter_type:
-                            rows = conn.execute(
-                                """SELECT c.*,
-                                          snippet(catalog_fts, 1, '【', '】', '...', 16) AS snippet
-                                   FROM catalog_cards c
-                                   JOIN catalog_fts f ON f.key = c.key
-                                   WHERE catalog_fts MATCH ? AND c.entry_type = ?
-                                   ORDER BY bm25(catalog_fts) LIMIT 20""",
-                                (or_expr, filter_type)
-                            ).fetchall()
-                        else:
-                            rows = conn.execute(
-                                """SELECT c.*,
-                                          snippet(catalog_fts, 1, '【', '】', '...', 16) AS snippet
-                                   FROM catalog_cards c
-                                   JOIN catalog_fts f ON f.key = c.key
-                                   WHERE catalog_fts MATCH ?
-                                   ORDER BY bm25(catalog_fts) LIMIT 20""",
-                                (or_expr,)
-                            ).fetchall()
-                        if rows:
-                            source = "fts_or"
-                    except sqlite3.OperationalError:
-                        pass
-            # tier 2: FTS5 が 0 件なら embedding fallback
-            if not rows and source == "fts":
-                try:
-                    qvec = embed_text(query, is_query=True)
-                except Exception:
-                    qvec = None
-                if qvec is not None:
-                    hits = vec_search(conn, qvec, k=30, forgotten=False)
-                    hit_ids = [mid for mid, _d, _s in hits]
-                    if hit_ids:
-                        placeholders = ",".join("?" * len(hit_ids))
-                        if filter_type:
-                            sql = (f"""SELECT DISTINCT c.* FROM catalog_cards c,
-                                       json_each(c.related_ids) j
-                                       WHERE j.value IN ({placeholders}) AND c.entry_type = ?
-                                       LIMIT 20""")
-                            rows = conn.execute(sql, (*hit_ids, filter_type)).fetchall()
-                        else:
-                            sql = (f"""SELECT DISTINCT c.* FROM catalog_cards c,
-                                       json_each(c.related_ids) j
-                                       WHERE j.value IN ({placeholders})
-                                       LIMIT 20""")
-                            rows = conn.execute(sql, hit_ids).fetchall()
-                        if rows:
-                            source = "embedding"
-            # tier 3: FTS5 が壊れていた、もしくは embedding もダメなら LIKE
-            if not rows:
-                like = f"%{query}%"
-                if filter_type:
-                    rows = conn.execute(
-                        """SELECT * FROM catalog_cards
-                           WHERE (title LIKE ? OR content LIKE ?) AND entry_type = ?
-                           LIMIT 20""",
-                        (like, like, filter_type)
-                    ).fetchall()
-                else:
-                    rows = conn.execute(
-                        """SELECT * FROM catalog_cards
-                           WHERE title LIKE ? OR content LIKE ?
-                           LIMIT 20""",
-                        (like, like)
-                    ).fetchall()
-                if rows:
-                    source = "like"
+            rows, source = catalog_find_cards(conn, query, filter_type=filter_type, limit=20)
             cards = []
             for r in rows:
                 card = {"entry_type": r["entry_type"], "key": r["key"], "title": r["title"],
@@ -9399,11 +9405,16 @@ def main():
 
     elif cmd == "search":
         if len(sys.argv) < 3:
-            print("使い方: python memory.py search \"検索語\" [--like] [--raw] [--fuzzy] [--json] "
+            print("使い方: python memory.py search \"検索語\" [--raw] [--memory] [--fuzzy] [--json] "
                   "[--domain D1,D2] [--session SID] [--topic SLUG] [--status solved|unsolved|ongoing|abandoned]")
+            print("  デフォルト: catalog find (整理された surface を引く)")
+            print("  --raw: raw_turn 検索 (生の発話)")
+            print("  --memory: memory 層検索 (admin/debug)")
             return
+        query = sys.argv[2]
         use_like = "--like" in sys.argv
-        raw_mode = "--raw" in sys.argv
+        raw_mode = "--raw" in sys.argv  # raw_turn 検索（drill-down）
+        memory_mode = "--memory" in sys.argv  # 旧 memory 層検索（admin）
         fuzzy_mode = "--fuzzy" in sys.argv
         json_mode = "--json" in sys.argv
         requested_domains = _parse_domain_flag(sys.argv)
@@ -9419,23 +9430,30 @@ def main():
         scope_topic = _flag_value("--topic")
         scope_status = _flag_value("--status")
 
-        # スコープ指定時は raw_turn ベースの search_in_scope に切替
-        if scope_session or scope_topic or scope_status:
+        # ルーティング:
+        # 1. --raw or scope → search_in_scope (raw_turn)
+        # 2. --memory → search_memories (admin / 旧経路)
+        # 3. デフォルト → catalog find (整理された surface)
+
+        if scope_session or scope_topic or scope_status or raw_mode:
             scope_results = search_in_scope(
-                sys.argv[2],
+                query,
                 session_id=scope_session, topic=scope_topic, status=scope_status,
                 limit=20
             )
             if json_mode:
-                meta = {"count": len(scope_results), "mode": "scope",
+                mode_str = "raw" if raw_mode and not (scope_session or scope_topic or scope_status) else "scope"
+                meta = {"count": len(scope_results), "mode": mode_str,
                         "session": scope_session, "topic": scope_topic, "status": scope_status}
                 print(json.dumps(
-                    _json_envelope("search", scope_results, query=sys.argv[2], meta=meta),
+                    _json_envelope("search", scope_results, query=query, meta=meta),
                     ensure_ascii=False, indent=2
                 ))
             elif scope_results:
                 scope_str = " / ".join(f"{k}={v}" for k, v in
                     [("session", scope_session), ("topic", scope_topic), ("status", scope_status)] if v)
+                if not scope_str:
+                    scope_str = "raw"
                 print(f"想起 ({len(scope_results)}件, スコープ: {scope_str}):")
                 for r in scope_results:
                     ts = (r.get("timestamp") or "")[:16]
@@ -9451,10 +9469,54 @@ def main():
                           f"session: {title}")
                     print(f"    「{excerpt}」")
             else:
-                print("想起できませんでした（スコープ内に該当 raw_turn なし）")
+                print("想起できませんでした（該当 raw_turn なし）")
             return
 
-        search_result = search_memories(sys.argv[2], use_like=use_like, fuzzy=fuzzy_mode, requested_domains=requested_domains)
+        if not memory_mode:
+            # デフォルト: catalog find（整理された surface を引く。
+            # memory.content は地下に置いて Claude には surface しない規律）
+            conn = get_connection()
+            try:
+                rows, source = catalog_find_cards(conn, query, limit=20)
+                if json_mode:
+                    cards = []
+                    for r in rows:
+                        card = {"entry_type": r["entry_type"], "key": r["key"],
+                                "title": r["title"],
+                                "content": (r["content"] or "")[:200],
+                                "_source": source}
+                        try:
+                            sn = r["snippet"]
+                            if sn:
+                                card["snippet"] = sn
+                        except (IndexError, KeyError):
+                            pass
+                        cards.append(card)
+                    meta = {"count": len(cards), "mode": "catalog", "source": source}
+                    print(json.dumps(
+                        _json_envelope("search", cards, query=query, meta=meta),
+                        ensure_ascii=False, indent=2
+                    ))
+                else:
+                    if rows:
+                        print(f"想起 ({len(rows)}件, catalog, via {source}):")
+                        for r in rows:
+                            print(f"  [{r['entry_type']}/{r['key']}] {r['title']}")
+                            try:
+                                sn = r["snippet"]
+                                if sn:
+                                    print(f"      …{sn.replace(chr(10), ' ')}")
+                            except (IndexError, KeyError):
+                                pass
+                    else:
+                        print("想起できませんでした（catalog にヒットなし）")
+                        print("  ヒント: --raw で raw_turn 検索、--memory で memory 層検索")
+            finally:
+                conn.close()
+            return
+
+        # --memory: 旧 memory 層検索（admin / debug）
+        search_result = search_memories(query, use_like=use_like, fuzzy=fuzzy_mode, requested_domains=requested_domains)
         if fuzzy_mode:
             results, fuzzy_results = search_result
         else:
@@ -9541,13 +9603,20 @@ def main():
 
     elif cmd == "detail":
         if len(sys.argv) < 3:
-            print("使い方: python memory.py detail ID [--json]")
+            print("使い方: python memory.py detail ID [--json] [--memory]")
+            print("  デフォルト: メタデータ + linked raw_turn ids")
+            print("  --memory: memory.content も表示（admin/debug）")
             return
+        mid = int(sys.argv[2])
+        admin_mode = "--memory" in sys.argv
         conn = get_connection()
-        row = conn.execute("SELECT * FROM memories WHERE id = ?", (int(sys.argv[2]),)).fetchone()
+        row = conn.execute("SELECT * FROM memories WHERE id = ?", (mid,)).fetchone()
         if "--json" in sys.argv:
             if row:
                 h = format_handle(conn, row, full=True)
+                # admin でない場合は content を抜く
+                if not admin_mode and isinstance(h, dict) and "content" in h:
+                    h = {k: v for k, v in h.items() if k != "content"}
                 print(json.dumps(
                     _json_envelope("detail", [{"handle": h}], query=sys.argv[2]),
                     ensure_ascii=False, indent=2
@@ -9557,18 +9626,53 @@ def main():
                                                 meta={"error": "not found"}),
                                  ensure_ascii=False))
         elif row:
-            print(format_memory_detail(row))
+            if admin_mode:
+                print(format_memory_detail(row))
+            else:
+                # memory.content は地下に置く規律。メタデータと linked raw_turns だけ surface する
+                emotions = json.loads(row["emotions"]) if row["emotions"] else []
+                keywords = json.loads(row["keywords"]) if row["keywords"] else []
+                print(f"  記憶 #{row['id']} (memory; --memory で生 content 表示)")
+                print(f"  カテゴリ: {row['category']} | 重要度: {'★' * row['importance']}")
+                print(f"  情動: {', '.join(emotions) if emotions else '中立'} (覚醒度:{row['arousal']:.2f})")
+                print(f"  断片: [{', '.join(keywords[:8])}]")
+                print(f"  鮮度: {freshness(row['created_at']):.0%} | 参照: {row['access_count']}回")
+                print(f"  記録: {row['created_at'][:10]}")
+            # 連想リンク（content は出さない、ID と strength のみ）
             links = conn.execute(
-                """SELECT l.target_id, l.strength, m.content
+                """SELECT l.target_id, l.strength, l.link_type
                    FROM links l JOIN memories m ON l.target_id = m.id
                    WHERE l.source_id = ? AND m.forgotten = 0
                    ORDER BY l.strength DESC LIMIT 10""",
-                (int(sys.argv[2]),)
+                (mid,)
             ).fetchall()
             if links:
                 print(f"  連想リンク ({len(links)}件):")
                 for link in links:
-                    print(f"    → #{link['target_id']} ({link['strength']:.3f}) {link['content'][:40]}")
+                    lt = link["link_type"] or "association"
+                    mark = "⇄" if lt == "tension" else "→"
+                    print(f"    {mark} #{link['target_id']} ({link['strength']:.3f}) [{lt}]")
+            # この memory に linked back している raw_turn ids（drill-down 経路）
+            raw_rows = conn.execute(
+                "SELECT id FROM raw_turns WHERE memory_ids LIKE ? LIMIT 10",
+                (f"%{mid}%",)
+            ).fetchall()
+            raw_ids = []
+            for r in raw_rows:
+                # JSON parse で厳密 filter
+                turn_row = conn.execute(
+                    "SELECT memory_ids FROM raw_turns WHERE id = ?", (r["id"],)
+                ).fetchone()
+                try:
+                    mids = json.loads(turn_row["memory_ids"]) if turn_row and turn_row["memory_ids"] else []
+                except (json.JSONDecodeError, TypeError):
+                    mids = []
+                if mid in mids:
+                    raw_ids.append(r["id"])
+            if raw_ids:
+                ids_str = ", ".join(f"#{r}" for r in raw_ids)
+                print(f"  linked raw_turns: {ids_str}")
+                print(f"     drill down: search \"...\" --raw  または手動で raw_turn を取得")
         else:
             print("見つかりません")
         conn.close()
@@ -9779,7 +9883,11 @@ def main():
         else:
             print(f"#{mid} の隣接 ({len(results_raw)}件):")
             for r, s in results_raw:
-                print(f"  → #{r['id']} ({s:.3f}) {(r['content'] or '')[:60]}")
+                emos = json.loads(r["emotions"]) if r["emotions"] else []
+                kws = json.loads(r["keywords"]) if r["keywords"] else []
+                emo_str = " ".join(EMOTION_EMOJI.get(e, "·") for e in emos[:3]) if emos else "·"
+                kw_str = ", ".join(kws[:5])
+                print(f"  → #{r['id']} ({s:.3f}) {emo_str} [{kw_str}]")
 
     elif cmd == "walk":
         if len(sys.argv) < 3:
@@ -9806,7 +9914,11 @@ def main():
             print(f"#{mid} から {depth} 歩先まで ({len(nodes)}件):")
             for r, d in nodes:
                 indent = "  " + "  " * d
-                print(f"{indent}[{d}] #{r['id']} {(r['content'] or '')[:60]}")
+                emos = json.loads(r["emotions"]) if r["emotions"] else []
+                kws = json.loads(r["keywords"]) if r["keywords"] else []
+                emo_str = " ".join(EMOTION_EMOJI.get(e, "·") for e in emos[:3]) if emos else "·"
+                kw_str = ", ".join(kws[:5])
+                print(f"{indent}[{d}] #{r['id']} {emo_str} [{kw_str}]")
 
     elif cmd == "at":
         if len(sys.argv) < 3:
@@ -9833,7 +9945,11 @@ def main():
             print(f"domain={domain} のノード ({len(rows)}件):")
             for r in rows:
                 stars = "★" * (r["importance"] or 0)
-                print(f"  #{r['id']} {stars} {(r['content'] or '')[:60]}")
+                emos = json.loads(r["emotions"]) if r["emotions"] else []
+                kws = json.loads(r["keywords"]) if r["keywords"] else []
+                emo_str = " ".join(EMOTION_EMOJI.get(e, "·") for e in emos[:3]) if emos else "·"
+                kw_str = ", ".join(kws[:5])
+                print(f"  #{r['id']} {stars} {emo_str} [{kw_str}]")
 
     elif cmd == "anchor":
         # v30 identity anchor: dive 時の最小注入用

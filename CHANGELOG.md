@@ -1,5 +1,103 @@
 # Changelog
 
+## [v31.2] - 2026-04-27
+
+### memory.content を地下に — pull の主 surface を catalog に切替
+
+「Claude が pull した時に読むのは catalog（整理された surface）であり、memory 層
+の digestate は地下に置く」という規律をコードレベルで実装する。memories.content
+テキストが Claude の context に直接 surface する経路を、admin/debug 用の opt-in
+ルートを除いて閉じる。
+
+#### 3 層モデル（明示化）
+
+| 層 | 役割 | pull |
+|---|---|---|
+| catalog | 整理された surface（session_index / topic_thread / hot_node / current_focus / schema / cluster_abstract / entry_point 等） | デフォルト |
+| raw_turn | 生の対話、verbatim drill-down | `--raw` または scope flag |
+| memory | 地下＝無意識（digestate, links, tension, decay 等） | surface しない（admin/debug のみ） |
+
+memory 層は引き続き内部で動く（consolidate / replay / decay / Hebbian / detect_tensions
+/ schema 生成 / mood propagation）が、その content テキストは Claude の通常 pull
+には現れない。voice / dream / catalog 経由でだけ間接的に surface する。
+
+#### 実装 (memory.py)
+
+**`catalog_find_cards(conn, query, filter_type=None, limit=20)` 抽出**
+- `_catalog_cli` の find ブランチに inline されていた FTS5 / tokenize+OR / embedding
+  / LIKE のチェーンを関数化
+- `(rows, source)` を返す。source は "fts" / "fts_or" / "embedding" / "like" のいずれか
+- `_catalog_cli` の find ブランチも新関数を呼ぶように差し替え（重複コード除去）
+
+**`search` コマンドのルーティング切替**
+- デフォルト → `catalog_find_cards` を呼ぶ。catalog cards を BM25 順に返す
+- `--raw` → `search_in_scope` を呼ぶ（scope flag 無くても raw_turn 全体を検索）
+- `--memory` → `search_memories` を呼ぶ（旧経路、admin/debug 用に残す）
+- `--session/--topic/--status` → 既存通り `search_in_scope` (scope filter 付き)
+- 旧来の `--raw` フラグ（display mode）は廃止（実質 dead code だった）
+
+**`detail` の表示変更**
+- デフォルト → メタデータのみ（id / category / importance / 情動 / keywords / 鮮度 /
+  access_count / 記録日）+ 連想リンク（id, strength, link_type のみ、content 出さず）
+  + linked raw_turn ids（drill-down 経路のヒント）
+- `--memory` → 旧 `format_memory_detail`（content 表示、admin/debug 用）
+
+**`neighbors` の表示変更**
+- 隣接 memory の content テキスト出力を停止
+- 代わりに emotion emoji + keywords[:5] を表示
+
+**`walk` の表示変更**
+- 経路上の memory の content テキスト出力を停止
+- emotion emoji + keywords[:5] を表示
+
+**`at` の表示変更**
+- domain 内 memory の content テキスト出力を停止
+- importance stars + emotion emoji + keywords[:5] を表示
+
+#### dive skill (.claude/skills/dive/SKILL.md)
+- 3 層モデル（catalog / raw_turn / memory）を明示的に記述
+- 使える tool 一覧を新しい flag 体系に合わせて更新
+- `--raw` / `--memory` / `--session` 等の用途を明記
+- 「memory.content は地下に置く規律」のセクション追加
+
+#### 規律の意味
+
+旧 dive: `search` のデフォルトが `search_memories` で、memory.content が Claude の
+context にテキストとして surface していた。これは v30 で打ち出した「Claude が読むのは
+raw_turn」と矛盾し、無意識（memories 層）の digestate を意識（context）に直接読ませて
+いた。reconsolidate が走り、内容が文脈に向かってドリフトし、再度読まれるとさらに
+ドリフトする再帰があり、地下が地上に染み出していた。
+
+v31.2 で:
+- 通常の `search` は **catalog**（整理された surface）を返す
+- `--raw` で **raw_turn**（生の発話）に drill-down
+- `--memory` は **admin/debug** にロールバック
+- detail / neighbors / walk / at は memory.content テキストを出さない
+
+memory 層は引き続き retrieval の **ranking バイアス**（mood propagation, importance,
+arousal, link 強度）として作動する。これは silent reweighting で、content の silent
+injection ではない。Freud 的に言えば「無意識は思考を形作るが、思考そのものではない」。
+
+#### 動作確認
+- `search "Claude Code"` → 9 件の catalog card（topic_thread / session_index /
+  entry_point）が BM25 順、それぞれの title + snippet 付き
+- `search "Claude Code" --raw` → raw_turn 検索、4 件の生発話（タイムスタンプ + role
+  + snippet）
+- `search "Claude Code" --memory` → 旧 memory 層検索（4 件、再構成モード表示）
+- `detail 13010` → メタデータ + 連想リンク 8 件 (link_type 表示) + linked raw_turns
+  なし（この memory は raw_turn back-link を持たない例）
+- `detail 13010 --memory` → 旧 format_memory_detail（content 表示）
+- `neighbors 13010 --limit 4` → 4 件、emotion emoji + keywords のみ
+- `walk 13010 --depth 1` → 6 件、メタデータのみ
+
+#### 残課題
+
+- (4) dream phase が tension を素材にする（v31.1 で実装済み）
+- (5) voice 経路で tension を polyphony に反映（v31.1 で「対立」voice 追加済み）
+- (6) delusion mode は何もしない（サヴァン定義、変更なしで正しい）
+- 当初リストの (2)（memory.content 規律のコード強制）が完了したので、当初設計の
+  全項目はこれで一旦カバー。地下が育つのを待つ段階に入る
+
 ## [v31.1] - 2026-04-26
 
 ### 地下を代謝経路で使う — dream / voice / replay 保護

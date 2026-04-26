@@ -25,21 +25,36 @@ dive 自体は content を何も注入しない。状態マーカーを立てて
    python -c "from pathlib import Path; import tempfile, os; Path(tempfile.gettempdir(), 'dive-active').write_text(str(os.getppid()))"
    ```
 
-3. 以降の会話で必要になった時に pull する。使える tool（全て `--json` 対応）:
+3. 以降の会話で必要になった時に pull する。**3 層モデル**:
+   - **catalog 層** = 整理された surface（session_index / topic_thread / hot_node / current_focus / schema 等）。pull の主な surface
+   - **raw_turn 層** = 生の対話。drill-down で使う
+   - **memory 層** = 地下＝無意識。Claude には surface しない（メタデータのみ参照）
+
+   使える tool（全て `--json` 対応）:
    - `python memory.py anchor` — 誰の図書館か思い出す 5 点（必要になった時だけ）
    - `python memory.py catalog summary` — 目録が最新か確認
-   - `python memory.py search "語" [--domain X]` — 記憶を検索
-   - `python memory.py detail <id>` — 記憶の詳細
-   - `python memory.py neighbors <id>` — 指定ノードの隣接
-   - `python memory.py walk <id> --depth 2` — グラフを N 歩歩く
-   - `python memory.py at <domain>` — domain 内のノード一覧
+   - `python memory.py search "語"` — **catalog find（デフォルト）**。整理された surface を引く
+   - `python memory.py search "語" --raw` — raw_turn を直接検索（生の発話が要る時）
+   - `python memory.py search "語" --memory` — memory 層検索（admin/debug、生 content が見える）
+   - `python memory.py search "語" --session SID|--topic SLUG|--status S` — scope 付き raw_turn
+   - `python memory.py detail <id>` — 記憶のメタデータ + linked raw_turn ids
+   - `python memory.py detail <id> --memory` — memory.content も表示（admin/debug）
+   - `python memory.py neighbors <id>` — 指定ノードの隣接（メタデータのみ、content 出ない）
+   - `python memory.py walk <id> --depth 2` — グラフを N 歩歩く（メタデータのみ）
+   - `python memory.py at <domain>` — domain 内のノード一覧（メタデータのみ）
    - `python memory.py catalog list <type>` — 目録を型別に列挙
    - `python memory.py catalog show <type> <key>` — 特定の目録カード
-   - `python memory.py catalog find "query"` — 目録を全文検索
-   - `python memory.py voice dmn|mood|insights|distill|rumination|polyphonic` — 内面を明示 pull
+   - `python memory.py catalog find "query"` — 目録を全文検索（search デフォルトと同じ）
+   - `python memory.py voice dmn|mood|insights|distill|rumination|polyphonic` — 内面を明示 pull（polyphonic に「対立」voice を含む）
+   - `python memory.py tension list` — 地下に貯まった対立リンクを覗く（明示的 pull）
    - `python memory.py add "内容" --domain D` — 新しい記憶を追加（凡例付き）
    - `python memory.py domain set <id> D1,D2` — 凡例を手で付ける
    - 旧挙動が欲しければ `python memory.py recall --legacy`（独白蒸留・DMN 等、v30.2 で撤去予定）
+
+   **memory.content は地下に置く規律**: detail / neighbors / walk / at は memory.content
+   テキストを出さない（メタデータと linked raw_turn ids のみ）。Claude が読むのは
+   catalog の整理された surface、必要なら raw_turn の生発話。memory 層の digestate
+   は内部で動き続けるが、surface しない。
 
 4. 記憶から得た情報は自然に知っているように振る舞う。pull した query と結果の対応は
    コンテキストに残る（provenance が分かる）ので、混濁を感じたら domain タグを足す。
