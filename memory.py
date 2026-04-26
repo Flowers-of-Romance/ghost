@@ -6355,10 +6355,16 @@ def replay_memories():
         emotions_by_id[row["id"]] = json.loads(row["emotions"]) if row["emotions"] else []
     created_at_by_id = {row["id"]: row["created_at"] for row in rows}
 
-    existing_links = conn.execute("SELECT id, source_id, target_id, strength FROM links").fetchall()
+    existing_links = conn.execute(
+        "SELECT id, source_id, target_id, strength, link_type FROM links"
+    ).fetchall()
     pruned = 0
     downscaled = 0
     for link in existing_links:
+        # tension link は Hebbian 強度ではなく対立の記録。replay の恒常性減衰は
+        # 対象外（detect_tensions で作られ、tension forget でだけ消える）。
+        if link["link_type"] == "tension":
+            continue
         src_arousal = arousal_by_id.get(link["source_id"], 0)
         tgt_arousal = arousal_by_id.get(link["target_id"], 0)
         # 外傷的記憶に繋がるリンクは減衰を免除
@@ -6381,9 +6387,13 @@ def replay_memories():
     REPLAY_BOOST = 1.05
     boosted = 0
     surviving_links = conn.execute(
-        "SELECT id, source_id, target_id, strength FROM links"
+        "SELECT id, source_id, target_id, strength, link_type FROM links"
     ).fetchall()
     for link in surviving_links:
+        # tension link は Hebbian 強化の対象外（対立の strength は co-activation
+        # 頻度ではなく対立の鋭さを表す）
+        if link["link_type"] == "tension":
+            continue
         src_ar = arousal_by_id.get(link["source_id"], 0)
         tgt_ar = arousal_by_id.get(link["target_id"], 0)
         # 外傷的リンクは既に減衰免除なので二重強化しない
@@ -7423,6 +7433,35 @@ def recall_polyphonic(limit_per_voice=3, requested_domains=None):
     voices["補完"] = pick(complement_scored, limit_per_voice)
     voices["批判"] = pick(critic_scored, limit_per_voice)
     voices["連想"] = pick(associative_scored, limit_per_voice)
+
+    # 対立: tension link の両極をペアで surface する（無意識からの対立軸）
+    # 連想の声は気分や偶然で繋がる、対立の声は構造的に統合を拒否したペア
+    rows_by_id = {row["id"]: row for row in rows}
+    tension_rows = conn.execute(
+        """SELECT source_id, target_id, strength FROM links
+           WHERE link_type = 'tension'
+           ORDER BY strength DESC
+           LIMIT ?""",
+        (limit_per_voice * 4,)
+    ).fetchall()
+    opposition = []
+    for tr in tension_rows:
+        a = rows_by_id.get(tr["source_id"])
+        b = rows_by_id.get(tr["target_id"])
+        if a is None or b is None:
+            continue  # forgotten された側
+        if a["id"] in used_ids and b["id"] in used_ids:
+            continue
+        # ペアの両側を続けて追加（対立は対で読まれる）
+        if a["id"] not in used_ids:
+            opposition.append((a, float(tr["strength"])))
+            used_ids.add(a["id"])
+        if b["id"] not in used_ids:
+            opposition.append((b, float(tr["strength"])))
+            used_ids.add(b["id"])
+        if len(opposition) >= limit_per_voice * 2:  # ペア単位で上限
+            break
+    voices["対立"] = opposition
 
     # 俯瞰: メタ情報から全体像を構成する（LLMが最も得意なこと）
     voices["俯瞰"] = _birds_eye_view(conn, rows)

@@ -40,12 +40,21 @@ def load_fragments():
         "FROM memories WHERE forgotten = 0 AND category != 'schema'"
     ).fetchall()
 
-    # リンク情報を取得（連想クラスタ用）
+    # リンク情報を取得（連想クラスタ用）— association のみ
     links = {}
-    for link in conn.execute("SELECT source_id, target_id, strength FROM links").fetchall():
+    for link in conn.execute(
+        "SELECT source_id, target_id, strength FROM links "
+        "WHERE link_type IS NULL OR link_type = 'association'"
+    ).fetchall():
         links.setdefault(link["source_id"], []).append(
             (link["target_id"], link["strength"])
         )
+
+    # 対立リンク: tension link は別経路で扱う（cut-up の素材）
+    tension_pairs = conn.execute(
+        "SELECT source_id, target_id, strength FROM links WHERE link_type = 'tension'"
+    ).fetchall()
+    tension_pairs = [(r["source_id"], r["target_id"], r["strength"]) for r in tension_pairs]
 
     conn.close()
 
@@ -77,7 +86,7 @@ def load_fragments():
 
         memory_clusters.append((row["id"], kws + pieces, weight))
 
-    return weighted_fragments, weighted_contents, emotions, memory_clusters, links
+    return weighted_fragments, weighted_contents, emotions, memory_clusters, links, tension_pairs
 
 
 def weighted_sample(pool, n):
@@ -115,7 +124,9 @@ def cutup(weighted_fragments, weighted_contents, n=3):
 
 def dream_sequence(duration_lines=20):
     """夢を表示する。"""
-    weighted_fragments, weighted_contents, emotions, clusters, links = load_fragments()
+    weighted_fragments, weighted_contents, emotions, clusters, links, tension_pairs = load_fragments()
+    # クラスタを id で索引（tension 経路で直接引くため）
+    clusters_by_id = {c[0]: c for c in clusters}
 
     if not weighted_fragments:
         print("（記憶がない。暗闇。）")
@@ -172,6 +183,21 @@ def dream_sequence(duration_lines=20):
             rep = random.randint(2, 3)
             sep = random.choice(["　", " ... ", "——"])
             print(sep.join([frag] * rep))
+        elif r < 0.63 and tension_pairs:
+            # 対立: tension ペアの両側から断片を取って衝突させる。
+            # 整合化される前の食い違いを夢の中で解離させずに並置する。
+            weights_t = [max(0.1, s) for _, _, s in tension_pairs]
+            pair = random.choices(tension_pairs, weights=weights_t, k=1)[0]
+            src_id, tgt_id, _ = pair
+            src_c = clusters_by_id.get(src_id)
+            tgt_c = clusters_by_id.get(tgt_id)
+            if src_c and tgt_c and src_c[1] and tgt_c[1]:
+                a = random.choice(src_c[1])
+                b = random.choice(tgt_c[1])
+                joiner = random.choice([" ⇄ ", " // ", "　／／　", "\n  "])
+                print(f"{a}{joiner}{b}")
+            else:
+                print(cutup(weighted_fragments, weighted_contents, random.randint(2, 4)))
         elif r < 0.7:
             # 連想クラスタ（リンクが強い記憶同士を一緒に出す）
             if clusters:
