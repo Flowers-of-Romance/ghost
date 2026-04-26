@@ -19,13 +19,14 @@ proceduralize）と、navigability の整理（catalog）を並行して回す�
 2. `python dream.py 30` — 夢生成
 3. `python wander.py 5` — 自由連想（モデルがなければ無言で終了）
 4. `python memory.py replay` — 海馬リプレイ
-5. `python memory.py consolidate` — 類似記憶の統合
-6. `python memory.py schema` — メタ記憶の自動生成
-7. `python memory.py catalog build` — 目録の更新（session_index / topic_thread / current_focus 含む）
+5. `python memory.py consolidate` — 類似記憶の統合（極性が対立するペアは緊張保持に回される）
+6. `python memory.py detect-tensions` — moderate な類似度範囲の対立を tension link で保存（象徴秩序の地下＝無意識層）
+7. `python memory.py schema` — メタ記憶の自動生成
+8. `python memory.py catalog build` — 目録の更新（session_index / topic_thread / current_focus 含む）
    - session_index は Gemini pro-preview を叩くので **差分のある session が多い時は 20-30 分かかる**
    - 初回や長期間回してなかった時は `max_sessions_per_build=40` でキャップされるので、未処理分は翌日以降に繰り越す
-8. `python memory.py proceduralize` — 反復記憶の手続き記憶昇格
-9. `python memory.py stats` — 統計
+9. `python memory.py proceduralize` — 反復記憶の手続き記憶昇格
+10. `python memory.py stats` — 統計
 
 ### 2. 報告素材の生成
 

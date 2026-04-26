@@ -1,5 +1,85 @@
 # Changelog
 
+## [v31.0] - 2026-04-26
+
+### 象徴秩序の地下 — tension link で対立を保持する無意識層
+
+memories 層は v30 以降「Claude が直接 pull するのは raw_turn」という運用に
+シフトした結果、content 貯蔵庫としては冗長になっていた。整合化機構（schema /
+topic_thread / catalog）はあるが、対立や緊張を保持する装置はなく、「raw_turn
+しか見ないのに緊張が立ち上がらない」という観察に行き着いた。
+
+v31.0 はこの非対称を埋める第一歩。memories 層を「raw_turn の見え方を歪める、
+意識化されない予測・矛盾保持層＝象徴秩序の地下（無意識）」として位置づけ
+直す方向で、その第一機能 tension link を実装した。**対立を生成しない。
+既にデータの中にある対立を merge 経路から救出するだけ。**
+
+#### 検出器 (memory.py, `consolidate_memories` 直前)
+- **`EMOTION_POLARITY` mapping**: `insight/determination/connection: +1`,
+  `conflict/anxiety: -1`, `surprise: 0`。情動タグの極性軸。
+- **`_emotion_polarity(emotions)`**: タグ列の極性平均を `-1..+1` で返す。
+- **`_detect_tension(a, b, sim)`**: 二つの memory が「類似トピックだが対立」
+  かを判定。条件:
+  - 極性ギャップ ≥ `TENSION_POLARITY_GAP_MIN` (=1.5)
+  - 少なくとも片方の arousal ≥ `TENSION_AROUSAL_FLOOR` (=0.35)
+  - 両方とも極性持ちの emotion を含む（中性 vs 強極性は除外）
+  - keyword overlap ≥ `TENSION_KEYWORD_OVERLAP_MIN` (=1)
+  - strength は `sim × (polarity_gap / 2)`、共通極性タグがあれば 0.5 倍に
+    減衰（純粋な対立ではないため）
+- **`_insert_tension_link(conn, a, b, strength)`**: `links.link_type='tension'`
+  でリンク挿入。既存リンクがあれば link_type を tension に更新し strength は
+  max を取る（スキーマ変更なし、汎用 link_type の値追加のみ）。
+
+#### sweep / consolidate 連携
+- **`detect_tensions(dry_run=False)`**: sim 範囲
+  `[TENSION_SIM_LOW=0.72, TENSION_SIM_HIGH=0.93]` の memory ペアをスキャンし、
+  `_detect_tension` が真のペアに tension link を貼る。consolidate より広い範囲
+  （同じ話題だが merge には至らない領域）を担当する独立コマンド。
+- **`consolidate_memories` に分岐追加**: `sim > CONSOLIDATION_THRESHOLD (0.94)`
+  の高類似度ペアでも、対立検出されたら merge せず tension link を挿入し
+  `merged_ids` に登録（今後の merge 候補からも除外）。出力末尾に
+  `緊張保持 N 件` を併記。
+
+#### CLI
+- **`tension list [--limit N]`**: 既存の tension link を strength 降順で一覧
+  表示（双方の content 先頭 60 字 + emotion emoji）。
+- **`tension detect [--dry-run]`**: `detect_tensions` の薄いラッパ。dry-run で
+  候補をプレビューしてから書き込める。
+- **`tension forget <link_id>`**: 誤検出された tension link を消す。link_type
+  が tension でない link は触らない。
+- **`detect-tensions [--dry-run]`**: sleep skill から呼びやすい単独コマンド
+  （`tension detect` と等価のエイリアス）。
+
+#### sleep skill 統合
+- `.claude/skills/sleep/SKILL.md` の手順に **6. `python memory.py detect-tensions`** を
+  consolidate と schema の間に挿入。consolidate 内で高類似度の対立は救出されるので、
+  detect-tensions は moderate な類似度範囲を補完するスイープ。
+
+#### 自己調整
+v31.0 の `TENSION_*` 定数は `_TUNABLE_DEFAULTS` には登録していない（直書きの
+定数のまま）。手続き記憶ベースの自己調整に乗せるには「精度・網羅率」に当たる
+信号が要るが、tension link は新規機能で運用実績がない。`tension forget` の頻度
+（false positive proxy）と pull 経路での使用頻度（v31.1 で実装予定の priming
+経路 hit 率）が貯まってから tunable 昇格を検討する。
+
+#### 位置づけ
+- 象徴秩序の地下＝無意識層は、**意識（context に出る raw_turn）には現れず、
+  raw_turn の retrieval を歪めることで作動する**設計を目指す。v31.0 はその
+  地下に「対立」を貯める第一機能。
+- 対立は **検出のみ**。生成しない（adversarial layer / red team 化を避ける）。
+  既存データの中で merge に呑まれそうな対立を救出する装置。Freud 的に言えば、
+  抑圧を強めるのではなく、抑圧されない場所を作る。
+- v31.0 では tension link は **貯まるだけ**。pull / search 経路は触っていない
+  ので、緊張が context に立ち上がるのは v31.1（priming 経路）以降。
+
+#### 動作確認
+- `tension detect --dry-run` → 8772 ペアスキャン中 20 件検出
+- `tension detect` → 新規 20 件挿入（links 562 → 1064 件）
+- `tension list --limit 8` → strength 降順、両極の emotion emoji と memory 内容を
+  並置表示
+- sleep cycle 一周（v31.0 後初回） → consolidate で緊張保持 0 件 + detect-tensions で
+  新規 20 件保持。総 link 数増加が `replay` の刈込/減衰サイクルと両立することを確認。
+
 ## [v30.4] - 2026-04-23
 
 ### FTS5 を使い倒す — BM25 スコア / snippet ヒット抜粋 / tokenize+OR フォールバック
