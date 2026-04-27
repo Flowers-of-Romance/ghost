@@ -217,10 +217,12 @@ def _context_search(prompt):
     if not os.path.exists(DB_PATH):
         return
 
+    # get_connection() を使うことで lindera_tokenizer が conn に登録される。
+    # FTS5 の memories_fts は lindera で索引されているので、別経路で開いた conn では MATCH できない。
     try:
-        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
-        conn.row_factory = sqlite3.Row
-    except sqlite3.OperationalError:
+        from memory import get_connection
+        conn = get_connection()
+    except Exception:
         return
 
     try:

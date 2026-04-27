@@ -1,0 +1,52 @@
+diff --git a/src/extension.rs b/src/extension.rs
+index 21992bf..305a423 100644
+--- a/src/extension.rs
++++ b/src/extension.rs
+@@ -129,7 +129,7 @@ impl<'a> SqliteApi<'a> {
+         sql: *const c_uchar,
+     ) -> Result<PreparedStatement<'a>, c_int> {
+         let mut stmt = null_mut::<Sqlite3Stmt>();
+-        let prepare = self.raw.prepare.ok_or(SQLITE_INTERNAL)?;
++        let prepare = self.raw.prepare_v2.ok_or(SQLITE_INTERNAL)?;
+         let rc = unsafe { prepare(db, sql.cast::<c_char>(), -1, &mut stmt, null_mut()) };
+         if rc != SQLITE_OK {
+             return Err(rc);
+@@ -143,11 +143,15 @@ impl<'a> SqliteApi<'a> {
+         target: &mut *mut FTS5API,
+     ) -> Result<(), c_int> {
+         let bind_pointer = self.raw.bind_pointer.ok_or(SQLITE_INTERNAL)?;
++        // Bind the *address of the slot* so SQLite can write the FTS5 API
++        // pointer into it. `target.cast()` would auto-deref and cast the
++        // current (null) value instead — that was a bug in upstream.
++        let slot_addr = (target as *mut *mut FTS5API) as *mut c_void;
+         let rc = unsafe {
+             bind_pointer(
+                 stmt,
+                 1,
+-                target.cast::<c_void>(),
++                slot_addr,
+                 c"fts5_api_ptr".as_ptr() as *const c_char,
+                 None,
+             )
+@@ -191,8 +195,8 @@ impl<'api> PreparedStatement<'api> {
+         self.api.bind_fts5_pointer(self.stmt, target)
+     }
+ 
+-    fn step(&mut self) {
+-        self.api.step(self.stmt);
++    fn step(&mut self) -> c_int {
++        self.api.step(self.stmt)
+     }
+ 
+     fn finalize(mut self) -> Result<(), c_int> {
+@@ -307,7 +311,9 @@ fn lindera_fts_tokenizer_internal_init(
+ }
+ 
+ fn ensure_fts5_api_version(fts5_api: &FTS5API) -> Result<(), c_int> {
+-    if fts5_api.i_version == FTS5_API_VERSION {
++    // SQLite 3.48+ uses iVersion=3; we only call x_create_tokenizer which is
++    // present in all versions, so accept >= 2.
++    if fts5_api.i_version >= FTS5_API_VERSION {
+         Ok(())
+     } else {
+         Err(SQLITE_MISUSE)

@@ -16,3 +16,9 @@ memo/
 prayer/audio/
 prayer/frames/
 prayer/models/
+
+# lindera-sqlite build workspace
+ext/.build/
+
+# pre-migration backups
+memory.db.bak-*
