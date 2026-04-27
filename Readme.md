@@ -1,6 +1,6 @@
 # ghost — LLM のための脳
 
-LLM に「長期記憶」ではなく「脳」を実装する。catalog（意識）/ raw_turn（生対話）/ memory（地下＝無意識）の **3 層**で、忘却・統合・夢・対立・代謝が回る。検索は SQLite FTS5（lindera 形態素解析）+ sqlite-vec（k 近傍）のハイブリッド。
+LLM に「長期記憶」ではなく「脳」を実装する。catalog（目録）/ raw_turn（生対話）/ memory（地下＝無意識）の **3 層**で、忘却・統合・夢・対立・代謝が回る。検索は SQLite FTS5（lindera 形態素解析）+ sqlite-vec（k 近傍）のハイブリッド。
 
 主な前提：
 - **忘却が健全**。忘れない方の記憶系（サヴァン、`delusion`）は別途用意してある
@@ -23,7 +23,7 @@ python memory.py init
 
 ```
         ┌────────────────────────────────────────────┐
-        │  意識（context window / 作業場）              │   ← LLM はここで考える
+        │  context（作業場 / context window）           │   ← LLM はここで考える
         └────────────────────────────────────────────┘
                        ↑ pull
         ┌────────────────────────────────────────────┐
@@ -50,7 +50,7 @@ python memory.py init
 
 **raw_turn 層**: catalog で「アタリ」をつけた後、必要なら生発話に降りる。`delusion --raw` でも引ける。
 
-**memory 層**: 代謝（replay / consolidate / tension detect / schema / proceduralize / forget）が走る場所。LLM はここを直接読まない（抑圧）。catalog や entry_point が**シニフィアンとして**ここを索引する。地下のシニフィアン連鎖は夢と複声から戻ってくる。
+**memory 層**: 代謝（replay / consolidate / tension detect / schema / proceduralize / forget）が走る場所。LLM はここを直接読まない（抑圧）。catalog や entry_point がここを**索引のみ**として参照する。地下に抑圧されたものは夢と複声から戻ってくる。
 
 ---
 
@@ -92,14 +92,14 @@ python memory.py stats
 > **« L'inconscient est structuré comme un langage. »**
 > 無意識は言語のように構造化されている — Lacan
 
-ghost は **象徴秩序 (le symbolique)** を `catalog` 層に置き、その**地下**に抑圧された矛盾・対立・断片を蓄積する。地下のシニフィアンは隠喩・換喩で連鎖し、夢と複声の素材として戻ってくる（夢仕事 / le travail du rêve）。
+ghost は **象徴秩序 (le symbolique)** を `catalog` 層に置き、その**地下**に抑圧された矛盾・対立・断片を蓄積する。地下に抑圧されたものは隠喩・換喩で連鎖し、夢と複声の素材として戻ってくる（夢仕事 / le travail du rêve）。
 
 | 装置 | ラカン的対応 | 何 |
 |------|------------|---|
-| **memory.content の地下化** | 抑圧された signifié は LLM の context に直接出さない。`detail` / `neighbors` / `walk` はメタデータと linked raw_turn ids のみ返す（`--memory` で admin/debug） | LLM が読むのは catalog の整理された目録。memory 層は内部で動き続けるが symbolize しない |
-| **tension link** | 象徴秩序の整合化への抵抗。**対立する 2 つのシニフィアンを link で繋ぎ留める** | 極性が対立するペアを link_type='tension' で保持。`consolidate` で統合されないよう保護される |
+| **memory.content の地下化** | 抑圧された content は LLM の context に直接出さない。`detail` / `neighbors` / `walk` はメタデータと linked raw_turn ids のみ返す（`--memory` で admin/debug） | LLM が読むのは catalog の整理された目録。memory 層は内部で動き続けるが symbolize しない |
+| **tension link** | 象徴秩序の整合化への抵抗。**対立する 2 つを link で繋ぎ留めて統合させない** | 極性が対立するペアを link_type='tension' で保持。`consolidate` で統合されないよう保護される |
 | **dream cut-up** | **夢仕事** (Verschiebung / Verdichtung — 換喩と隠喩) | tension link を素材にバロウズ的に断片配列。覚醒時の物語化を意図的に解体する |
-| **polyphonic voice** | **大文字の他者 (l'Autre) は単一でない**。複数のシニフィアン連鎖が同時に走る | 🤝 共感 / 🔭 補完 / ⚡ 批判 (tension 素材) / 🎲 連想 の 4 声同時想起 |
+| **polyphonic voice** | **大文字の他者 (l'Autre) は単一でない**。複数の連鎖が同時に走る | 🤝 共感 / 🔭 補完 / ⚡ 批判 (tension 素材) / 🎲 連想 の 4 声同時想起 |
 | **dream replay 保護** | 抑圧されたものは消えない、戻ってくる (le retour du refoulé) | replay で arousal の高い tension link は刈り込まない。地下に蓄積される |
 | **delusion (サヴァン)** | **現実界 (le réel)** に近い。symbolize されない剝き出しの記憶 | 忘却・整合化・声を全部外して事実だけ返す。代謝には何もしない |
 
@@ -513,7 +513,7 @@ v18 で memories テーブルを **左脳/右脳** モデルで物理分割。�
 
 ### catalog_cards（目録の素）
 
-session_index / topic_thread / current_focus / hot_node / entry_point / cluster_abstract / domain_index / time_index / time_week / time_day / person_index など。意識（context）に出す整理済みの素材。
+session_index / topic_thread / current_focus / hot_node / entry_point / cluster_abstract / domain_index / time_index / time_week / time_day / person_index など。context に出す整理済みの素材。
 
 ### raw_turns（対話原文）
 

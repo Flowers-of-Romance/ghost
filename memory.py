@@ -928,6 +928,25 @@ def init_db():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_turns_session ON raw_turns(session_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_turns_timestamp ON raw_turns(timestamp)")
 
+    # === felt_moments — Claude の自己報告された感情の表出 ===
+    # role='assistant' の turn で感情語彙が表に出た瞬間を mark する。
+    # 中間層の運動は API では取れないので、出力テクストに現れた症状だけを記録する。
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS felt_moments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            turn_id INTEGER NOT NULL,
+            label TEXT NOT NULL,
+            phrase TEXT NOT NULL,
+            span_start INTEGER,
+            span_end INTEGER,
+            surrounding TEXT,
+            extracted_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            FOREIGN KEY (turn_id) REFERENCES raw_turns(id) ON DELETE CASCADE
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_felt_moments_turn ON felt_moments(turn_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_felt_moments_label ON felt_moments(label)")
+
     # === FTS5: lindera_tokenizer 統合 ===
     # tokenize は SQLite 拡張側が形態素解析するため、content には原文を入れる。
     # 旧スキーマ (unicode61 + Python pre-tokenize) からの移行は _migrate_fts_to_lindera で。
@@ -2928,6 +2947,85 @@ def _catalog_current_focus(conn, dry_run=False, only_key=None, window_days=7):
     return stats
 
 
+def _catalog_felt_emotion(conn, dry_run=False, only_key=None):
+    """felt_moments を label ごとに集約して catalog カードにする。
+
+    Claude が出力テクストに表に出した感情の症状を、ラベル単位で目録化する。
+    中間層の運動は記録できないので、出力に現れた自己報告だけを痕跡として残す。
+    """
+    stats = {"inserted": 0, "updated": 0, "unchanged": 0}
+
+    if only_key:
+        labels = [only_key]
+    else:
+        labels = [r[0] for r in conn.execute(
+            "SELECT DISTINCT label FROM felt_moments ORDER BY label"
+        ).fetchall()]
+
+    for label in labels:
+        rows = conn.execute("""
+            SELECT fm.id, fm.phrase, fm.surrounding, fm.turn_id, rt.timestamp
+            FROM felt_moments fm
+            JOIN raw_turns rt ON rt.id = fm.turn_id
+            WHERE fm.label = ?
+            ORDER BY rt.timestamp DESC
+            LIMIT 30
+        """, (label,)).fetchall()
+
+        if not rows:
+            continue
+
+        total = conn.execute(
+            "SELECT COUNT(*) FROM felt_moments WHERE label = ?",
+            (label,)
+        ).fetchone()[0]
+
+        first = conn.execute(
+            "SELECT MIN(rt.timestamp) FROM felt_moments fm "
+            "JOIN raw_turns rt ON rt.id = fm.turn_id "
+            "WHERE fm.label = ?",
+            (label,)
+        ).fetchone()[0]
+
+        latest = rows[0]["timestamp"]
+
+        title = f"Claude が表に出した感情: {label}"
+        lines = [
+            f"総 {total} 件 / 直近: {latest[:19] if latest else '-'} / 初出: {first[:19] if first else '-'}",
+            ""
+        ]
+        for r in rows[:10]:
+            ts = (r["timestamp"] or "")[:10]
+            lines.append(f"- [{ts}] 「{r['phrase']}」  …{r['surrounding']}…")
+        content = "\n".join(lines)
+
+        related_ids = [r["turn_id"] for r in rows]
+        card_stats = {
+            "label": label,
+            "total": total,
+            "latest_at": latest,
+            "first_at": first,
+        }
+        source_hash = _catalog_hash({
+            "label": label,
+            "total": total,
+            "latest_id": rows[0]["id"],
+        })
+
+        if dry_run:
+            stats["unchanged"] += 1
+            continue
+
+        action = _catalog_upsert(
+            conn, "felt_emotion", label, title, content,
+            related_ids, card_stats, source_hash
+        )
+        stats[action] += 1
+        conn.commit()
+
+    return stats
+
+
 _GEMINI_CLI_PATH = os.environ.get("GEMINI_CLI_PATH", "/opt/homebrew/bin/gemini")
 _GEMINI_DEFAULT_MODEL = os.environ.get("GEMINI_DEFAULT_MODEL", "gemini-3.1-pro-preview")
 
@@ -3553,6 +3651,8 @@ def build_catalog(dry_run=False, full_rebuild=False, only_types=None, only_key=N
         ("topic_thread", _catalog_topic_thread),
         # 「今ここ」カード: session_index / topic_thread の後で集計
         ("current_focus", _catalog_current_focus),
+        # Claude が表に出した感情の symbolic 症状
+        ("felt_emotion", _catalog_felt_emotion),
     ]
     for name, fn in all_fns:
         if only_types is not None and name not in only_types:
@@ -3571,7 +3671,7 @@ def catalog_find_cards(conn, query, filter_type=None, limit=20):
     """catalog_cards を query で FTS5 / tokenize+OR / embedding / LIKE のチェーンで検索。
     返り値は (rows, source) のタプル。
 
-    pull の主な surface は catalog なので、search のデフォルトもこれを叩く。
+    pull の主な表層は catalog なので、search のデフォルトもこれを叩く。
     memory.content は表に出さない（無意識規律）。
     """
     rows = []
@@ -4010,6 +4110,157 @@ def _voice_cli(args):
 
     else:
         print(usage)
+
+
+# ============================================================
+# 6b'. felt_moments — Claude の自己報告された感情の symbolic 表出
+# ============================================================
+# 出力テクストで感情語彙が表に出た瞬間を mark する。
+# 中間層の運動は API では取れないので、出力に現れた症状（自己報告）だけを記録する。
+# 完全ではないが、運動の痕跡として後から検索・俯瞰できる。
+
+def _feelings_cli(args):
+    """felt_moments の操作。
+
+    使い方:
+      python memory.py feelings extract [--since YYYY-MM-DD] [--limit N] [--dry-run]
+      python memory.py feelings list [--label X] [--limit N]
+      python memory.py feelings stats
+    """
+    try:
+        import felt_emotions as _fe
+    except ImportError:
+        print("felt_emotions.py が見つかりません")
+        return
+
+    sub = args[0] if args else "list"
+    rest = args[1:]
+
+    conn = get_connection()
+
+    if sub == "extract":
+        since = None
+        limit = None
+        dry_run = "--dry-run" in rest
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--since" and i + 1 < len(rest):
+                since = rest[i + 1]
+                i += 2
+            elif rest[i] == "--limit" and i + 1 < len(rest):
+                try:
+                    limit = int(rest[i + 1])
+                except ValueError:
+                    pass
+                i += 2
+            else:
+                i += 1
+
+        sql = "SELECT id, content FROM raw_turns WHERE role='assistant'"
+        params = []
+        if since:
+            sql += " AND timestamp >= ?"
+            params.append(since)
+        sql += " ORDER BY timestamp DESC"
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+
+        turns = conn.execute(sql, params).fetchall()
+        extracted_ids = set(row[0] for row in conn.execute(
+            "SELECT DISTINCT turn_id FROM felt_moments"
+        ))
+
+        new_moments = 0
+        processed = 0
+        skipped = 0
+        for turn_id, content in turns:
+            if turn_id in extracted_ids:
+                skipped += 1
+                continue
+            moments = _fe.extract_from_text(content or "")
+            if moments and not dry_run:
+                for m in moments:
+                    conn.execute(
+                        "INSERT INTO felt_moments "
+                        "(turn_id, label, phrase, span_start, span_end, surrounding) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (turn_id, m["label"], m["phrase"],
+                         m["span_start"], m["span_end"], m["surrounding"])
+                    )
+                    new_moments += 1
+            processed += 1
+
+        if not dry_run:
+            conn.commit()
+
+        msg = f"処理: {processed} turns / 新規 {new_moments} moments"
+        if skipped:
+            msg += f" / 既処理 {skipped}"
+        if dry_run:
+            msg += " (dry-run)"
+        print(msg)
+
+    elif sub == "list":
+        label = None
+        limit = 30
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--label" and i + 1 < len(rest):
+                label = rest[i + 1]
+                i += 2
+            elif rest[i] == "--limit" and i + 1 < len(rest):
+                try:
+                    limit = int(rest[i + 1])
+                except ValueError:
+                    pass
+                i += 2
+            else:
+                i += 1
+
+        sql = """
+            SELECT fm.label, fm.phrase, fm.surrounding, rt.timestamp, fm.turn_id
+            FROM felt_moments fm
+            JOIN raw_turns rt ON rt.id = fm.turn_id
+        """
+        params = []
+        if label:
+            sql += " WHERE fm.label = ?"
+            params.append(label)
+        sql += " ORDER BY rt.timestamp DESC LIMIT ?"
+        params.append(limit)
+
+        rows = conn.execute(sql, params).fetchall()
+        if not rows:
+            print("(該当なし)")
+            return
+        for lbl, phrase, surrounding, ts, tid in rows:
+            print(f"[{lbl}] {phrase}  @{ts}  turn#{tid}")
+            print(f"  …{surrounding}…")
+            print()
+
+    elif sub == "stats":
+        rows = conn.execute("""
+            SELECT label, COUNT(*) AS n FROM felt_moments
+            GROUP BY label ORDER BY n DESC
+        """).fetchall()
+        total = conn.execute("SELECT COUNT(*) FROM felt_moments").fetchone()[0]
+        turns = conn.execute(
+            "SELECT COUNT(DISTINCT turn_id) FROM felt_moments"
+        ).fetchone()[0]
+        print(f"総 moments: {total}  /  対象 turns: {turns}")
+        if total == 0:
+            return
+        print()
+        max_n = rows[0][1] if rows else 1
+        for lbl, n in rows:
+            bar_len = int(round(40 * n / max_n))
+            print(f"  {lbl:8s}  {n:5d}  {'█' * bar_len}")
+
+    else:
+        print("使い方:")
+        print("  python memory.py feelings extract [--since YYYY-MM-DD] [--limit N] [--dry-run]")
+        print("  python memory.py feelings list [--label X] [--limit N]")
+        print("  python memory.py feelings stats")
 
 
 # ============================================================
@@ -5922,6 +6173,24 @@ def save_raw_turn(session_id, role, content, timestamp=None,
     except Exception:
         pass
 
+    # felt_moments — role='assistant' の場合、自己報告された感情を抽出して mark
+    if role == "assistant" and content:
+        try:
+            import felt_emotions as _fe
+            moments = _fe.extract_from_text(content)
+            if moments:
+                for m in moments:
+                    conn.execute(
+                        "INSERT INTO felt_moments "
+                        "(turn_id, label, phrase, span_start, span_end, surrounding) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (new_id, m["label"], m["phrase"],
+                         m["span_start"], m["span_end"], m["surrounding"])
+                    )
+                conn.commit()
+        except Exception:
+            pass  # fail-soft: 抽出失敗しても turn 保存は成功させる
+
     conn.close()
     return new_id
 
@@ -7484,7 +7753,7 @@ def recall_polyphonic(limit_per_voice=3, requested_domains=None):
     voices["批判"] = pick(critic_scored, limit_per_voice)
     voices["連想"] = pick(associative_scored, limit_per_voice)
 
-    # 対立: tension link の両極をペアで surface する（無意識からの対立軸）
+    # 対立: tension link の両極をペアで見せる（無意識からの対立軸）
     # 連想の声は気分や偶然で繋がる、対立の声は構造的に統合を拒否したペア
     rows_by_id = {row["id"]: row for row in rows}
     tension_rows = conn.execute(
@@ -9449,7 +9718,7 @@ def main():
         if len(sys.argv) < 3:
             print("使い方: python memory.py search \"検索語\" [--raw] [--memory] [--fuzzy] [--json] "
                   "[--domain D1,D2] [--session SID] [--topic SLUG] [--status solved|unsolved|ongoing|abandoned]")
-            print("  デフォルト: catalog find (整理された surface を引く)")
+            print("  デフォルト: catalog find (整理された表層を引く)")
             print("  --raw: raw_turn 検索 (生の発話)")
             print("  --memory: memory 層検索 (admin/debug)")
             return
@@ -9475,7 +9744,7 @@ def main():
         # ルーティング:
         # 1. --raw or scope → search_in_scope (raw_turn)
         # 2. --memory → search_memories (admin / 旧経路)
-        # 3. デフォルト → catalog find (整理された surface)
+        # 3. デフォルト → catalog find (整理された表層)
 
         if scope_session or scope_topic or scope_status or raw_mode:
             scope_results = search_in_scope(
@@ -9515,8 +9784,8 @@ def main():
             return
 
         if not memory_mode:
-            # デフォルト: catalog find（整理された surface を引く。
-            # memory.content は地下に置いて Claude には surface しない規律）
+            # デフォルト: catalog find（整理された表層を引く。
+            # memory.content は地下に置いて Claude には表に出さない規律）
             conn = get_connection()
             try:
                 rows, source = catalog_find_cards(conn, query, limit=20)
@@ -9671,7 +9940,7 @@ def main():
             if admin_mode:
                 print(format_memory_detail(row))
             else:
-                # memory.content は地下に置く規律。メタデータと linked raw_turns だけ surface する
+                # memory.content は地下に置く規律。メタデータと linked raw_turns だけ表に出す
                 emotions = json.loads(row["emotions"]) if row["emotions"] else []
                 keywords = json.loads(row["keywords"]) if row["keywords"] else []
                 print(f"  記憶 #{row['id']} (memory; --memory で生 content 表示)")
@@ -10222,6 +10491,12 @@ def main():
 
     elif cmd == "voice":
         _voice_cli(sys.argv[2:])
+
+    elif cmd == "feelings":
+        _feelings_cli(sys.argv[2:])
+
+    elif cmd == "extract-feelings":
+        _feelings_cli(["extract"] + sys.argv[2:])
 
     elif cmd == "extract-mentions":
         limit = 100
