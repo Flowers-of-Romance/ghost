@@ -641,18 +641,29 @@ def get_mood_congruence_boost(row):
 
 # --- DB操作 ---
 
+_LINDERA_DYLIB = str(Path(__file__).parent / "ext" / "lindera_fts5.dylib")
+_LINDERA_CONFIG = str(Path(__file__).parent / "ext" / "lindera.yml")
+
+
 def get_connection():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
-    # sqlite-vec を読み込み
+    # 拡張を読み込み (sqlite-vec, lindera FTS5 tokenizer)
+    # AttributeError は load_extension 非対応の Python (Apple system python など)
     try:
-        import sqlite_vec
         conn.enable_load_extension(True)
-        sqlite_vec.load(conn)
+        try:
+            import sqlite_vec
+            sqlite_vec.load(conn)
+        except ImportError:
+            pass
+        if os.path.exists(_LINDERA_DYLIB):
+            os.environ.setdefault("LINDERA_CONFIG_PATH", _LINDERA_CONFIG)
+            conn.load_extension(_LINDERA_DYLIB, entrypoint="lindera_fts5_tokenizer_init")
         conn.enable_load_extension(False)
-    except ImportError:
-        pass  # sqlite-vec 未インストール時はフォールバック
+    except (ImportError, AttributeError):
+        pass
     return conn
 
 
@@ -917,27 +928,32 @@ def init_db():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_turns_session ON raw_turns(session_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_turns_timestamp ON raw_turns(timestamp)")
 
-    # === FTS5: memories用（形態素解析済みテキスト） ===
+    # === FTS5: lindera_tokenizer 統合 ===
+    # tokenize は SQLite 拡張側が形態素解析するため、content には原文を入れる。
+    # 旧スキーマ (unicode61 + Python pre-tokenize) からの移行は _migrate_fts_to_lindera で。
     try:
         conn.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
                 content,
-                memory_id UNINDEXED
+                memory_id UNINDEXED,
+                tokenize='lindera_tokenizer'
             )
         """)
     except Exception:
-        pass  # FTS5が使えない環境
+        pass  # FTS5 / lindera が使えない環境
 
-    # === FTS5: raw_turns用（形態素解析済みテキスト） ===
     try:
         conn.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS raw_turns_fts USING fts5(
                 content,
-                turn_id UNINDEXED
+                turn_id UNINDEXED,
+                tokenize='lindera_tokenizer'
             )
         """)
     except Exception:
-        pass  # FTS5が使えない環境
+        pass
+
+    _migrate_fts_to_lindera(conn)
 
     # 既存memoriesのFTSインデックスを構築（まだ入っていないもの）
     _rebuild_fts_index(conn)
@@ -1030,11 +1046,11 @@ def init_db():
     try:
         conn.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS catalog_fts USING fts5(
-                title, content, key, tokenize='unicode61'
+                title, content, key, tokenize='lindera_tokenizer'
             )
         """)
     except sqlite3.OperationalError:
-        pass  # FTS5 未ビルドの場合は諦める
+        pass  # FTS5 / lindera 未ビルドの場合は諦める
 
     # === 左脳/右脳テーブル分割 (v17.1) ===
     # cortex（左脳）: 意味的・分析的データ
@@ -1308,20 +1324,61 @@ def _sync_vec_delete(conn, memory_id):
         pass
 
 
+def _migrate_fts_to_lindera(conn):
+    """旧 (unicode61 + Python pre-tokenize) スキーマを lindera_tokenizer に置き換える。
+
+    sqlite_master から CREATE 文を読み、'lindera_tokenizer' を含まない FTS5 vtable
+    があれば DROP して新スキーマで作り直し、primary table から再 populate する。
+    冪等。新規 DB では何もしない。
+    """
+    targets = [
+        # (fts_table, columns_def, repopulate_sql)
+        (
+            "memories_fts",
+            "content, memory_id UNINDEXED, tokenize='lindera_tokenizer'",
+            "INSERT INTO memories_fts(content, memory_id) "
+            "SELECT content, id FROM memories WHERE content IS NOT NULL",
+        ),
+        (
+            "raw_turns_fts",
+            "content, turn_id UNINDEXED, tokenize='lindera_tokenizer'",
+            "INSERT INTO raw_turns_fts(content, turn_id) "
+            "SELECT content, id FROM raw_turns WHERE content IS NOT NULL",
+        ),
+        (
+            "catalog_fts",
+            "title, content, key, tokenize='lindera_tokenizer'",
+            "INSERT INTO catalog_fts(title, content, key) "
+            "SELECT COALESCE(title,''), COALESCE(content,''), key FROM catalog_cards",
+        ),
+    ]
+    for table, cols, repop in targets:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if not row or not row["sql"]:
+            continue  # vtable がまだない (init 中の新規作成側で作られる)
+        if "lindera_tokenizer" in row["sql"]:
+            continue  # 既に lindera 化済み
+        try:
+            conn.execute(f"DROP TABLE {table}")
+            conn.execute(f"CREATE VIRTUAL TABLE {table} USING fts5({cols})")
+            conn.execute(repop)
+            print(f"  ✓ FTS5 lindera 化: {table}")
+        except Exception as e:
+            print(f"  ⚠️ {table} migration failed: {e}")
+
+
 def _rebuild_fts_index(conn):
-    """既存memoriesのFTSインデックスを差分構築する。"""
+    """既存memoriesのFTSインデックスを差分構築する。
+
+    lindera_tokenizer 統合後は content をそのまま FTS5 に渡すだけ。
+    """
     try:
-        # memories_ftsテーブルが存在するか確認
         conn.execute("SELECT count(*) FROM memories_fts").fetchone()
     except Exception:
         return  # FTS5テーブルなし
 
-    try:
-        from tokenizer import tokenize
-    except ImportError:
-        return
-
-    # 既にインデックス済みのmemory_idを取得
     indexed_ids = set(
         row[0] for row in conn.execute(
             "SELECT memory_id FROM memories_fts"
@@ -1336,10 +1393,9 @@ def _rebuild_fts_index(conn):
     for row in rows:
         if str(row["id"]) in indexed_ids or row["id"] in indexed_ids:
             continue
-        tokenized = tokenize(row["content"])
         conn.execute(
             "INSERT INTO memories_fts (content, memory_id) VALUES (?, ?)",
-            (tokenized, row["id"])
+            (row["content"], row["id"])
         )
         added += 1
 
@@ -1381,20 +1437,16 @@ def _bm25_bonus_map(conn, query, fts_table, id_col, max_rows=200, bonus_min=0.05
 
     ヒットした id に対する dict を返す。BM25 は小さいほど関連度高 (負値が多い)。
     最良ヒットが bonus_max、最悪ヒットが bonus_min。FTS 使用不可時は空 dict。
+    lindera_tokenizer が MATCH 側で形態素解析するため、query は原文のまま渡す。
     """
-    try:
-        from tokenizer import tokenize
-        tokenized = tokenize(query or "")
-    except Exception:
-        return {}
-    if not tokenized.strip():
+    if not query or not query.strip():
         return {}
     try:
         rows = conn.execute(
             f"""SELECT {id_col} AS id, bm25({fts_table}) AS s
                 FROM {fts_table} WHERE {fts_table} MATCH ?
                 ORDER BY s LIMIT ?""",
-            (tokenized, max_rows)
+            (query, max_rows)
         ).fetchall()
     except Exception:
         return {}
@@ -4165,13 +4217,11 @@ def correct_memory(memory_id, new_content):
         (new_content, blob, kw_json, CONFIDENCE_USER_EXPLICIT, memory_id)
     )
 
-    # FTSインデックスを更新
+    # FTSインデックスを更新（lindera が tokenize するため content そのまま）
     try:
-        from tokenizer import tokenize
-        tokenized = tokenize(new_content)
         conn.execute("DELETE FROM memories_fts WHERE memory_id = ?", (memory_id,))
         conn.execute("INSERT INTO memories_fts (content, memory_id) VALUES (?, ?)",
-                     (tokenized, memory_id))
+                     (new_content, memory_id))
     except Exception:
         pass
 
@@ -4595,13 +4645,11 @@ def add_memory(content, category="fact", source=None, confidence=None, provenanc
     )
     conn.commit()
 
-    # FTSインデックスに追加
+    # FTSインデックスに追加（lindera が tokenize するため content そのまま）
     try:
-        from tokenizer import tokenize
-        tokenized = tokenize(content)
         conn.execute(
             "INSERT INTO memories_fts (content, memory_id) VALUES (?, ?)",
-            (tokenized, new_id)
+            (content, new_id)
         )
         conn.commit()
     except Exception:
@@ -5242,11 +5290,10 @@ def search_in_scope(query, session_id=None, topic=None, status=None, limit=20):
                 session_meta[r["key"]] = {"title": r["title"], "status": s.get("status")}
 
         # FTS5 で検索 + session フィルタ (BM25 降順 + snippet)
+        # lindera が MATCH 側で形態素解析するため query は原文のまま。
         rows = []
         has_snippet = False
         try:
-            from tokenizer import tokenize
-            tokenized = tokenize(query)
             if session_filter is not None:
                 placeholders = ",".join("?" * len(session_filter))
                 sql = (
@@ -5259,7 +5306,7 @@ def search_in_scope(query, session_id=None, topic=None, status=None, limit=20):
                           AND raw_turns.session_id IN ({placeholders})
                         ORDER BY bm25_score LIMIT ?"""
                 )
-                params = (tokenized, *tuple(session_filter), limit)
+                params = (query, *tuple(session_filter), limit)
             else:
                 sql = (
                     """SELECT raw_turns.*,
@@ -5270,7 +5317,7 @@ def search_in_scope(query, session_id=None, topic=None, status=None, limit=20):
                        WHERE raw_turns_fts MATCH ?
                        ORDER BY bm25_score LIMIT ?"""
                 )
-                params = (tokenized, limit)
+                params = (query, limit)
             rows = conn.execute(sql, params).fetchall()
             has_snippet = bool(rows)
         except Exception:
@@ -5562,10 +5609,8 @@ def _delusion_raw_search(conn, query, limit=20, date=None, after=None, before=No
             date_clause += " AND timestamp < ?"
             date_params.append(f"{next_day}T00:00:00Z")
 
-    # FTS5検索（fugashi形態素解析）: BM25 降順 + ヒット箇所 snippet
+    # FTS5検索（lindera 形態素解析）: BM25 降順 + ヒット箇所 snippet
     try:
-        from tokenizer import tokenize
-        tokenized_query = tokenize(query)
         fts_rows = conn.execute(
             f"""SELECT raw_turns.*,
                        snippet(raw_turns_fts, 0, '【', '】', '...', 16) AS snippet,
@@ -5574,7 +5619,7 @@ def _delusion_raw_search(conn, query, limit=20, date=None, after=None, before=No
                 JOIN raw_turns ON raw_turns_fts.turn_id = raw_turns.id
                 WHERE raw_turns_fts MATCH ?{date_clause}
                 ORDER BY bm25_score LIMIT ?""",
-            (tokenized_query, *date_params, limit)
+            (query, *date_params, limit)
         ).fetchall()
         if fts_rows:
             return [(_raw_turn_to_format(row, snippet=_rejoin_tokenized_snippet(row["snippet"])), None)
@@ -5867,12 +5912,11 @@ def save_raw_turn(session_id, role, content, timestamp=None,
     conn.commit()
     new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
-    # FTS5にも追加（fugashi形態素解析）
+    # FTS5にも追加（lindera が tokenize するため content そのまま）
     try:
-        from tokenizer import tokenize
         conn.execute(
             "INSERT INTO raw_turns_fts (content, turn_id) VALUES (?, ?)",
-            (tokenize(content), new_id)
+            (content, new_id)
         )
         conn.commit()
     except Exception:
@@ -7921,13 +7965,11 @@ def _set_param_as_memory(conn, key, new_value, reason, avg_precision=None, avg_r
                 except Exception:
                     pass
 
-    # FTSインデックス
+    # FTSインデックス（lindera が tokenize するため content そのまま）
     try:
-        from tokenizer import tokenize
-        tokenized = tokenize(content)
         conn.execute(
             "INSERT INTO memories_fts (content, memory_id) VALUES (?, ?)",
-            (tokenized, new_id)
+            (content, new_id)
         )
     except Exception:
         pass
