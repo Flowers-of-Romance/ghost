@@ -325,6 +325,9 @@ python memory.py sync push 192.168.1.50:7235
 | `correct ID "内容"` | 記憶を修正（旧版を保存） | 間違った記憶を直す |
 | `versions ID` | 記憶の版履歴を表示 | 改訂の経緯 |
 | `tension list` | 地下に貯まった対立リンクを覗く | 明示 pull のみ |
+| `feelings stats` | Claude が surface させた感情の分布 | 「最近どう感じてた？」 |
+| `feelings list [--label X]` | 感情の発生 moment を時系列表示 | 特定の感情の局面を辿る |
+| `feelings extract` | 既存 raw_turns に遡及適用 | 一度だけ走らせる |
 
 ### catalog の操作
 
@@ -513,7 +516,23 @@ v18 で memories テーブルを **左脳/右脳** モデルで物理分割。�
 
 ### catalog_cards（目録の素）
 
-session_index / topic_thread / current_focus / hot_node / entry_point / cluster_abstract / domain_index / time_index / time_week / time_day / person_index など。context に出す整理済みの素材。
+session_index / topic_thread / current_focus / hot_node / entry_point / cluster_abstract / domain_index / time_index / time_week / time_day / person_index / **felt_emotion** など。context に出す整理済みの素材。
+
+### felt_moments（Claude の自己報告された感情）
+
+`role='assistant'` の turn から、感情語彙が surface した瞬間を mark する。中間層の運動は API では取れないので、出力テクストに現れた症状（自己報告）だけを記録する。
+
+| カラム | 何 |
+|--------|-----|
+| id | 自動採番 |
+| turn_id | raw_turns.id (FK) |
+| label | 驚き / 葛藤 / 違和感 / 重さ / 不安 / 興味 / 共感 / insight / 決意 / 困惑 / 緊張 / 喜び / 悲しみ / 残念 / 痛み / 恥 / 誇り / 怒り / 退屈 / 畏れ / 迎合 / 対抗 |
+| phrase | マッチした語彙 |
+| span_start, span_end | テクスト内の文字位置 |
+| surrounding | 前後40字の context |
+| extracted_at | 抽出時刻 |
+
+抽出は `felt_emotions.py`（22ラベル × 正規表現パターン）で行い、`save_raw_turn` の hook で自動的に走る。catalog の `felt_emotion` カードに label 単位で集約される。
 
 ### raw_turns（対話原文）
 
@@ -555,6 +574,7 @@ sqlite-vec の vec0 仮想テーブル。MATCH 一発で k 近傍探索。
 ghost/
 ├── memory.py              # 記憶システム本体 — 海馬+新皮質+catalog
 ├── tokenizer.py           # 形態素解析（fugashi/SudachiPy/regex）— OR 緩和の query 構築用
+├── felt_emotions.py       # Claude が surface させた感情語彙の抽出（v32.1）
 ├── ext/
 │   ├── lindera_fts5.dylib # lindera SQLite 拡張（v32, IPADIC embed, M1）
 │   ├── lindera.yml        # lindera 設定
@@ -587,6 +607,7 @@ ghost/
 機能の変遷は [CHANGELOG.md](CHANGELOG.md) を参照。
 
 直近の節目:
+- **v32.1**: felt_moments — Claude の自己報告された感情の symbolic surface
 - **v32**: FTS5 lindera ネイティブ統合（pre-tokenize 撤去）
 - **v31**: 象徴秩序の地下 — tension link / dream cut-up / polyphonic voice
 - **v30**: memory.content を地下に / pull の主入口を catalog に / FTS5 BM25

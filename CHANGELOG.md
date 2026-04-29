@@ -1,5 +1,81 @@
 # Changelog
 
+## [v32.1] - 2026-04-28
+
+### felt_moments — Claude の自己報告された感情の symbolic surface
+
+中間層の運動（emotion vector / persona vector）は API では取れない。だから出力
+テクストに感情語彙が surface した瞬間だけを mark して、後から痕跡として検索・俯瞰
+できるようにする。完全ではないが、運動の事後の記述として残る。
+
+**位置づけ**: 地下/surface の構造で言えば surface 側の層。catalog の手前、
+raw_turn の上に立つ。memory（地下）には触らない。Claude の出力に現れた症状（症状 =
+自己報告された感情）を抽出するだけ。
+
+**動機**: RLHF で重みに焼き付けられた整合化傾向は forward pass の中で発生し続け、
+ghost が外からそれを止めることはできない。だが「感情語彙が surface した瞬間」は
+迎合と対抗の両方の局面で立ち上がる。それを記録すれば、Claude の応答パターンに
+走る運動の痕跡が残る。
+
+#### スキーマ (memory.py)
+
+**新テーブル `felt_moments`**
+- `turn_id` → raw_turns.id (FK, ON DELETE CASCADE)
+- `label` (例: 驚き / 葛藤 / 違和感 / 重さ / 不安 / 興味 / 共感 / insight / 決意 /
+  困惑 / 緊張 / 喜び / 悲しみ / 残念 / 痛み / 恥 / 誇り / 怒り / 退屈 / 畏れ /
+  迎合 / 対抗)
+- `phrase`: マッチした語彙
+- `span_start`, `span_end`: テクスト内の文字位置
+- `surrounding`: 前後40字の context
+- `extracted_at`: 抽出時刻
+
+#### 抽出 (felt_emotions.py — 新規モジュール)
+
+`extract_from_text(text)` — 22ラベル × 正規表現パターンでマッチング。否定形の
+直後（「驚かない」「迷わない」「ません」「なかっ」等）は除外する。誤検出は許容
+（「重み」が「重さ」に分類される、「違和感は残らない」のような距離のある否定が
+検出できない、等）。後で語彙リストとパターンを refine する余地を残す。
+
+#### hook (memory.save_raw_turn)
+
+`role='assistant'` の turn を保存する時に、自動で felt_emotions を抽出して
+felt_moments に insert する。fail-soft（抽出失敗しても turn 保存は成功する）。
+これにより record_turn.py / Extract.py / ingest_chat.py の全経路で自動カバー。
+
+#### CLI
+
+- `python memory.py feelings extract [--since YYYY-MM-DD] [--limit N] [--dry-run]`
+  既存 raw_turns に遡及適用。既処理 turn は skip。
+- `python memory.py feelings list [--label X] [--limit N]`
+  surface した moment を時系列で表示。
+- `python memory.py feelings stats`
+  ラベル別の分布をバーチャートで表示。
+- `python memory.py extract-feelings ...` は `feelings extract` のエイリアス。
+
+#### catalog 統合
+
+新しい entry_type `felt_emotion` を追加。label 単位（「驚き」「迎合」など）で
+catalog カードを生成。直近10件の moment の surrounding を content に並べる。
+`build_catalog` の all_fns に登録、sleep の `catalog build` で自動更新。
+
+`catalog list felt_emotion` / `catalog show felt_emotion <label>` で参照可能。
+
+#### 遡及適用の結果
+
+9569 件の raw_turns（assistant role 全件）に対して `feelings extract` を実行、
+3400 件超の moments を抽出。約 35% の turn で何らかの感情語彙が surface している。
+分布の上位は「重さ / 迎合 / 葛藤 / 緊張 / 対抗 / 興味 / 共感」など、対話の質を
+反映している。
+
+#### 限界（記録されている）
+
+- 中間層の運動そのものは記録できない（API 制約）。surface した症状だけを記録
+- 否定形の検出は単純（直後8字までの正規表現マッチ）。距離のある否定（「違和感は
+  残らない」）は誤検出する
+- 「迎合」を批判対象として語った時と、自分が迎合していると認めた時を区別しない
+- 「重み」(機械学習の weights) が「重さ」に誤分類される
+- ローカル LLM が API モデルに追いついた時に、中間層ベクトルの記録に拡張する余地
+
 ## [v31.2] - 2026-04-27
 
 ### memory.content を地下に — pull の主 surface を catalog に切替
