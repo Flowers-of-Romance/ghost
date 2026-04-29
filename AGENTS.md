@@ -1,4 +1,4 @@
-# Codex Agent Instructions (J's environment)
+# Codex Agent Instructions
 
 ## ghost — 記憶システム接続
 
@@ -7,9 +7,9 @@ Claude Code の `/dive` スキルと同じ仕組みを Codex でも使う。
 
 ### 起動時に必ず実行
 
-1. 相手が誰か分からなければ聞く。J の環境（このマシン）なら聞かずに：
+1. 相手が誰か分からなければ聞く。分かったら環境変数にセット：
    ```bash
-   export GHOST_WHO="J"
+   export GHOST_WHO="<user>"
    ```
 
 2. dive 状態マーカー（statusline 用）：
@@ -34,7 +34,7 @@ Homebrew の python3 を使う：`/opt/homebrew/bin/python3`。
 
 ```bash
 # 入口・確認
-python3 memory.py anchor                       # J の図書館 5 点
+python3 memory.py anchor                       # user の図書館 5 点
 python3 memory.py catalog summary              # 目録が最新か
 
 # 検索
