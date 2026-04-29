@@ -1,6 +1,6 @@
-# QWEN.md — ghost (J の長期記憶システム)
+# QWEN.md — ghost (user の長期記憶システム)
 
-あなたは J の長期記憶システム「ghost」に接続して動作します。
+あなたは user の長期記憶システム「ghost」に接続して動作します。
 このディレクトリに `memory.py` があり、shell 経由でこれを叩いて記憶を pull します。
 
 ## 基本指針
