@@ -22,3 +22,12 @@ ext/.build/
 
 # pre-migration backups
 memory.db.bak-*
+
+# macOS
+.DS_Store
+
+# CLI tool local state
+.qwen/
+
+# work-in-progress drafts
+drafts/
