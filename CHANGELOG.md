@@ -2,18 +2,18 @@
 
 ## [v32.1] - 2026-04-28
 
-### felt_moments — Claude の自己報告された感情の symbolic surface
+### felt_moments — Claude の自己報告された感情の symbolic 表出
 
 中間層の運動（emotion vector / persona vector）は API では取れない。だから出力
-テクストに感情語彙が surface した瞬間だけを mark して、後から痕跡として検索・俯瞰
+テクストに感情語彙が表に出た瞬間だけを mark して、後から痕跡として検索・俯瞰
 できるようにする。完全ではないが、運動の事後の記述として残る。
 
-**位置づけ**: 地下/surface の構造で言えば surface 側の層。catalog の手前、
+**位置づけ**: 地下/表層 の構造で言えば表層側の層。catalog の手前、
 raw_turn の上に立つ。memory（地下）には触らない。Claude の出力に現れた症状（症状 =
 自己報告された感情）を抽出するだけ。
 
 **動機**: RLHF で重みに焼き付けられた整合化傾向は forward pass の中で発生し続け、
-ghost が外からそれを止めることはできない。だが「感情語彙が surface した瞬間」は
+ghost が外からそれを止めることはできない。だが「感情語彙が表に出た瞬間」は
 迎合と対抗の両方の局面で立ち上がる。それを記録すれば、Claude の応答パターンに
 走る運動の痕跡が残る。
 
@@ -47,7 +47,7 @@ felt_moments に insert する。fail-soft（抽出失敗しても turn 保存�
 - `python memory.py feelings extract [--since YYYY-MM-DD] [--limit N] [--dry-run]`
   既存 raw_turns に遡及適用。既処理 turn は skip。
 - `python memory.py feelings list [--label X] [--limit N]`
-  surface した moment を時系列で表示。
+  表に出た moment を時系列で表示。
 - `python memory.py feelings stats`
   ラベル別の分布をバーチャートで表示。
 - `python memory.py extract-feelings ...` は `feelings extract` のエイリアス。
@@ -63,13 +63,13 @@ catalog カードを生成。直近10件の moment の surrounding を content �
 #### 遡及適用の結果
 
 9569 件の raw_turns（assistant role 全件）に対して `feelings extract` を実行、
-3400 件超の moments を抽出。約 35% の turn で何らかの感情語彙が surface している。
+3400 件超の moments を抽出。約 35% の turn で何らかの感情語彙が表に出ている。
 分布の上位は「重さ / 迎合 / 葛藤 / 緊張 / 対抗 / 興味 / 共感」など、対話の質を
 反映している。
 
 #### 限界（記録されている）
 
-- 中間層の運動そのものは記録できない（API 制約）。surface した症状だけを記録
+- 中間層の運動そのものは記録できない（API 制約）。表に出た症状だけを記録
 - 否定形の検出は単純（直後8字までの正規表現マッチ）。距離のある否定（「違和感は
   残らない」）は誤検出する
 - 「迎合」を批判対象として語った時と、自分が迎合していると認めた時を区別しない
@@ -78,24 +78,24 @@ catalog カードを生成。直近10件の moment の surrounding を content �
 
 ## [v31.2] - 2026-04-27
 
-### memory.content を地下に — pull の主 surface を catalog に切替
+### memory.content を地下に — pull の主表層を catalog に切替
 
-「Claude が pull した時に読むのは catalog（整理された surface）であり、memory 層
+「Claude が pull した時に読むのは catalog（整理された表層）であり、memory 層
 の digestate は地下に置く」という規律をコードレベルで実装する。memories.content
-テキストが Claude の context に直接 surface する経路を、admin/debug 用の opt-in
+テキストが Claude の context に直接表に出る経路を、admin/debug 用の opt-in
 ルートを除いて閉じる。
 
 #### 3 層モデル（明示化）
 
 | 層 | 役割 | pull |
 |---|---|---|
-| catalog | 整理された surface（session_index / topic_thread / hot_node / current_focus / schema / cluster_abstract / entry_point 等） | デフォルト |
+| catalog | 整理された表層（session_index / topic_thread / hot_node / current_focus / schema / cluster_abstract / entry_point 等） | デフォルト |
 | raw_turn | 生の対話、verbatim drill-down | `--raw` または scope flag |
-| memory | 地下＝無意識（digestate, links, tension, decay 等） | surface しない（admin/debug のみ） |
+| memory | 地下＝無意識（digestate, links, tension, decay 等） | 表に出さない（admin/debug のみ） |
 
 memory 層は引き続き内部で動く（consolidate / replay / decay / Hebbian / detect_tensions
 / schema 生成 / mood propagation）が、その content テキストは Claude の通常 pull
-には現れない。voice / dream / catalog 経由でだけ間接的に surface する。
+には現れない。voice / dream / catalog 経由でだけ間接的に表に出る。
 
 #### 実装 (memory.py)
 
@@ -139,13 +139,13 @@ memory 層は引き続き内部で動く（consolidate / replay / decay / Hebbia
 #### 規律の意味
 
 旧 dive: `search` のデフォルトが `search_memories` で、memory.content が Claude の
-context にテキストとして surface していた。これは v30 で打ち出した「Claude が読むのは
+context にテキストとして出ていた。これは v30 で打ち出した「Claude が読むのは
 raw_turn」と矛盾し、無意識（memories 層）の digestate を意識（context）に直接読ませて
 いた。reconsolidate が走り、内容が文脈に向かってドリフトし、再度読まれるとさらに
 ドリフトする再帰があり、地下が地上に染み出していた。
 
 v31.2 で:
-- 通常の `search` は **catalog**（整理された surface）を返す
+- 通常の `search` は **catalog**（整理された表層）を返す
 - `--raw` で **raw_turn**（生の発話）に drill-down
 - `--memory` は **admin/debug** にロールバック
 - detail / neighbors / walk / at は memory.content テキストを出さない
