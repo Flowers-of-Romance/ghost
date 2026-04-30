@@ -2752,7 +2752,12 @@ def _catalog_person_index(conn, dry_run=False, only_key=None):
 def _catalog_hot_node(conn, dry_run=False, only_key=None):
     """recall_log の還流: 過去 30 日で頻出した recalled_ids 上位 30 件を
     hot_node として昇格する。entry_point（bridge 検出）とは別軸 — 実際に
-    よく引かれたノードが目録に上がってくる。only_key で node_<id> だけ再計算。"""
+    よく引かれたノードが目録に上がってくる。only_key で node_<id> だけ再計算。
+
+    v30.x: recall コマンド経由（mode='recall'）と search 経由（mode='catalog'/'memory'）
+    の両方が同じテーブルに入るため、追加分岐なしで自然に集計される。
+    raw/scope は memory_id を出さない（recalled_ids が空）ので頻度に影響しない。
+    """
     cutoff = (datetime.now() - timedelta(days=30)).isoformat()
     try:
         rows = conn.execute(
@@ -6878,7 +6883,9 @@ def _get_recent_context_vec(conn):
 
 
 def _get_session_recalled_ids(conn):
-    """直近セッション（RECALL_HABITUATION_WINDOW_MINUTES以内）で既に想起されたIDのセットを返す。"""
+    """直近セッション（RECALL_HABITUATION_WINDOW_MINUTES以内）で既に想起されたIDのセットを返す。
+    v30.x: recall コマンド経由も search 経由も同じ recall_log に入るので、
+    mode 関係なく recalled_ids を読めば馴化対象になる。"""
     now = datetime.now(timezone.utc)
     window = now - timedelta(minutes=RECALL_HABITUATION_WINDOW_MINUTES)
     window_str = window.strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -6891,8 +6898,12 @@ def _get_session_recalled_ids(conn):
         return set()
     ids = set()
     for r in rows:
-        for mid in json.loads(r["recalled_ids"]):
-            ids.add(mid)
+        try:
+            for mid in json.loads(r["recalled_ids"] or "[]"):
+                if isinstance(mid, int):
+                    ids.add(mid)
+        except (json.JSONDecodeError, TypeError):
+            pass
     return ids
 
 
@@ -7897,7 +7908,16 @@ def resurrect_memories(query):
 ## ===== メタ認知: recall の自己検証 =====
 
 def _ensure_recall_log(conn):
-    """recall_logテーブルがなければ作る（既存DB対応）。"""
+    """recall_logテーブルがなければ作る（既存DB対応）。
+
+    v30.x: pull 駆動の search 経路もここに記録する。mode カラムで区別:
+      'recall'   = recall コマンド経由の自動想起（既存）
+      'catalog'  = search デフォルト（catalog find）
+      'raw'      = search --raw（raw_turn 検索）
+      'scope'    = search --session/--topic/--status
+      'memory'   = search --memory（旧 memory 層検索）
+    既存呼び出しの互換のため mode は default 'recall'。
+    """
     conn.execute("""
         CREATE TABLE IF NOT EXISTS recall_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -7911,10 +7931,17 @@ def _ensure_recall_log(conn):
             evaluated_at TEXT DEFAULT NULL
         )
     """)
-    try:
-        conn.execute("ALTER TABLE recall_log ADD COLUMN voice_attribution TEXT DEFAULT NULL")
-    except Exception:
-        pass
+    for ddl in (
+        "ALTER TABLE recall_log ADD COLUMN voice_attribution TEXT DEFAULT NULL",
+        "ALTER TABLE recall_log ADD COLUMN mode TEXT DEFAULT 'recall'",
+        "ALTER TABLE recall_log ADD COLUMN source TEXT DEFAULT NULL",
+        "ALTER TABLE recall_log ADD COLUMN accessed_keys TEXT DEFAULT NULL",
+        "ALTER TABLE recall_log ADD COLUMN query TEXT DEFAULT NULL",
+    ):
+        try:
+            conn.execute(ddl)
+        except Exception:
+            pass
     # meta_paramsも保証
     conn.execute("""
         CREATE TABLE IF NOT EXISTS meta_params (
@@ -7931,20 +7958,39 @@ def _ensure_recall_log(conn):
     """)
 
 
-def log_recall(recalled_ids, voice_attribution=None):
-    """recallが出した記憶IDを記録する。次回recall時に事後検証される。
-    voice_attribution: {"共感": [id, ...], "補完": [...], ...} — どの声がどの記憶を出したか。
+def log_recall(recalled_ids, voice_attribution=None,
+               mode='recall', source=None, accessed_keys=None, query=None):
+    """recall/search が出した記憶IDを記録する。次回 recall 時に事後検証される。
+
+    mode で経路を区別:
+      'recall'  = recall コマンド経由（自動想起）
+      'catalog' = search デフォルト（catalog find）
+      'raw'     = search --raw
+      'scope'   = search --session/--topic/--status
+      'memory'  = search --memory
+    voice_attribution: {"共感": [id,...], ...} — recall コマンドの voice 別属性
+    accessed_keys: catalog card key や raw_turn_id など memory_id 以外の表層識別子
+    query: search query 文字列（recall コマンド経由なら None）
     """
-    conn = get_connection()
-    _ensure_recall_log(conn)
-    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-    conn.execute(
-        "INSERT INTO recall_log (session_ts, recalled_ids, voice_attribution) VALUES (?, ?, ?)",
-        (now, json.dumps(recalled_ids),
-         json.dumps(voice_attribution) if voice_attribution else None)
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn = get_connection()
+        _ensure_recall_log(conn)
+        now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        conn.execute(
+            "INSERT INTO recall_log "
+            "(session_ts, recalled_ids, voice_attribution, mode, source, accessed_keys, query) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (now, json.dumps(recalled_ids or []),
+             json.dumps(voice_attribution) if voice_attribution else None,
+             mode, source,
+             json.dumps(accessed_keys, ensure_ascii=False) if accessed_keys else None,
+             query)
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        # ロギング失敗で本流を止めない
+        pass
 
 
 CALIBRATE_HIT_THRESHOLD = 0.45   # この類似度以上なら「的中」
@@ -9752,8 +9798,12 @@ def main():
                 session_id=scope_session, topic=scope_topic, status=scope_status,
                 limit=20
             )
+            mode_str = "raw" if raw_mode and not (scope_session or scope_topic or scope_status) else "scope"
+            log_recall(
+                [], mode=mode_str, query=query,
+                accessed_keys=[r.get("raw_turn_id") for r in scope_results if r.get("raw_turn_id") is not None],
+            )
             if json_mode:
-                mode_str = "raw" if raw_mode and not (scope_session or scope_topic or scope_status) else "scope"
                 meta = {"count": len(scope_results), "mode": mode_str,
                         "session": scope_session, "topic": scope_topic, "status": scope_status}
                 print(json.dumps(
@@ -9789,6 +9839,19 @@ def main():
             conn = get_connection()
             try:
                 rows, source = catalog_find_cards(conn, query, limit=20)
+                _ca_keys = [r["key"] for r in rows]
+                _ca_mids = []
+                for r in rows:
+                    try:
+                        _rids = json.loads(r["related_ids"]) if r["related_ids"] else []
+                        _ca_mids.extend([x for x in _rids if isinstance(x, int)])
+                    except (json.JSONDecodeError, TypeError, IndexError, KeyError):
+                        pass
+                log_recall(
+                    sorted(set(_ca_mids)) if _ca_mids else [],
+                    mode='catalog', source=source, query=query,
+                    accessed_keys=_ca_keys,
+                )
                 if json_mode:
                     cards = []
                     for r in rows:
@@ -9833,6 +9896,11 @@ def main():
         else:
             results = search_result
             fuzzy_results = []
+        _mem_ids = [row["id"] for row, _sim in results if row and "id" in row.keys()]
+        log_recall(
+            _mem_ids, mode='memory', query=query,
+            source=("LIKE" if use_like else ("fuzzy" if fuzzy_mode else "brain")),
+        )
         if json_mode:
             # v30 JSON 出力
             conn = get_connection()
