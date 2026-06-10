@@ -646,8 +646,11 @@ _LINDERA_CONFIG = str(Path(__file__).parent / "ext" / "lindera.yml")
 
 
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
+    # timeout + busy_timeout: sleep.py や embed server 等の並走プロセスと
+    # WALロックが競合しても即死せず最大30秒待つ（#AP-022 起動時recall失敗の根本対策）
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA journal_mode=WAL")
     # 拡張を読み込み (sqlite-vec, lindera FTS5 tokenizer)
     # AttributeError は load_extension 非対応の Python (Apple system python など)
@@ -10353,6 +10356,32 @@ def main():
                 tag_str = " ".join(tag)
                 content = (r["content"] or "")[:100]
                 print(f"  #{r['id']} {tag_str} {content}")
+
+    elif cmd == "recall" and "--fast" in sys.argv:
+        # 高速想起: SessionStart hook 用。埋め込みモデル・DMN・voices を通らず、
+        # 鮮度×重要度×access の軽量スコアだけで返す。読み取り専用なので
+        # access_count 更新も再固定化もしない（深い想起は通常 recall で行う）
+        n = 3
+        for a in sys.argv[2:]:
+            if a.isdigit():
+                n = int(a)
+                break
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT id, content, category, importance, created_at, access_count "
+            "FROM memories WHERE forgotten = 0 "
+            "ORDER BY created_at DESC LIMIT 200"
+        ).fetchall()
+        conn.close()
+        scored = []
+        for row in rows:
+            w = freshness(row["created_at"]) * row["importance"] * (1.0 + math.log1p(row["access_count"]))
+            scored.append((row, w))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        print(f"高速想起 ({min(n, len(scored))}件 / 直近200件を鮮度×重要度×accessで選抜):")
+        for row, _ in scored[:n]:
+            head = row["content"].split("\n")[0][:120]
+            print(f"  #{row['id']} [{row['category']}] {row['created_at'][:10]} {head}")
 
     elif cmd == "recall":
         # v30: default は pull 指向の simple list のみ。内面系は全部 opt-in。

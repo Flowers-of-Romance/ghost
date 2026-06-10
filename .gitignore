@@ -11,6 +11,8 @@ turn_export.json
 .mood
 .delusion/
 memo/
+LEARNED.md
+.brain_cache.json
 
 # prayer runtime artifacts
 prayer/audio/
