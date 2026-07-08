@@ -13,6 +13,8 @@ import subprocess
 import sys
 import io
 import time
+from pathlib import Path
+from datetime import datetime, timedelta
 
 # Windows cp932 対策
 if sys.platform == "win32" and getattr(sys.stdout, 'encoding', '').lower() not in ('utf-8', 'utf8'):
@@ -26,15 +28,17 @@ DREAM_LINES = sys.argv[1] if len(sys.argv) > 1 else "30"
 # nap() には入れない — catalog は full sleep のみ。
 # ghost記憶v2（2026-07-08）: 埋め込み補完と増分重複整理を夜間の最初に回す。
 # backfill は sentence-transformers が要るので ghost venv の python を使う（無ければスキップされ、系は劣化動作で継続）。
-from pathlib import Path as _Path
-from datetime import datetime as _dt, timedelta as _td
-_GHOST = _Path(__file__).parent
+_GHOST = Path(__file__).parent
 _VENV_PY = _GHOST / ".venv" / "bin" / "python3"
-_EMBED_PY = str(_VENV_PY) if _VENV_PY.exists() else sys.executable
-_YESTERDAY = (_dt.now() - _td(days=1)).strftime("%Y-%m-%d")
+_YESTERDAY = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
 
-steps = [
-    ("backfill_embed", [_EMBED_PY, str(_GHOST / "memory.py"), "backfill-embeddings", "--missing-only"]),
+steps = []
+if _VENV_PY.exists():
+    # sentence-transformers 入りの venv がある時だけ夜間バックフィルを回す
+    steps.append(("backfill_embed",
+                  [str(_VENV_PY), str(_GHOST / "memory.py"), "backfill-embeddings", "--missing-only"]))
+
+steps += [
     ("reconcile",      [sys.executable, str(_GHOST / "memory.py"), "reconcile", "--since", _YESTERDAY, "--execute"]),
     ("memo_index",    [sys.executable, "memory.py", "memo", "index"]),
     ("promote",       [sys.executable, "memory.py", "promote"]),

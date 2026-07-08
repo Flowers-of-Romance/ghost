@@ -90,14 +90,27 @@ HALF_LIFE_DAYS = 14.0
 LINK_THRESHOLD = 0.82
 
 # 干渉忘却: この類似度を超える古い記憶の重要度を下げる
-INTERFERENCE_THRESHOLD = 0.90
+# 2026-07-08 再較正: multilingual-e5-small の日本語類似度は 0.76-1.0 に圧縮され、
+# 0.90 は「関連トピック」どまり（実測: 別事実ペアの最高値が0.96帯）。
+# 0.90 のままだと embedding 復活後、add のたびに関連記憶を大量侵食する（実測で1 addあたり数十〜百件超）。
+INTERFERENCE_THRESHOLD = 0.97
 
 # 重複ゲート（2026-07-08 ghost記憶v2 — amateru/plans/ghost-memory-v2/plan.md）
 # 閾値は全10,585件の実測分布から決定（measurement-2026-07-08.md）
 # e5-small日本語圧縮: sim0.90=関連トピック、別事実ペアの最高値は0.96帯 → 0.98未満は触らない
 MEMORY_GATE = os.environ.get("GHOST_MEMORY_GATE", "on").lower() != "off"
-GATE_DUP_SIM = float(os.environ.get("GHOST_GATE_DUP", "0.995"))      # NOOP帯
-GATE_UPDATE_SIM = float(os.environ.get("GHOST_GATE_UPDATE", "0.98"))  # supersede帯
+
+
+def _gate_float(env_key, default):
+    """閾値envの防御的パース。不正値でimportごと落とさない"""
+    try:
+        return float(os.environ.get(env_key, default))
+    except ValueError:
+        return float(default)
+
+
+GATE_DUP_SIM = _gate_float("GHOST_GATE_DUP", "0.995")      # NOOP帯
+GATE_UPDATE_SIM = _gate_float("GHOST_GATE_UPDATE", "0.98")  # supersede帯
 
 # 統合: この類似度を超える記憶ペアを統合候補とする
 CONSOLIDATION_THRESHOLD = 0.94
@@ -527,7 +540,10 @@ def backfill_embeddings(dry_run=False, batch=256, missing_only=False):
     total = conn.execute("SELECT COUNT(*) FROM memories WHERE forgotten = 0").fetchone()[0]
     missing = conn.execute(
         "SELECT COUNT(*) FROM memories WHERE forgotten = 0 AND embedding IS NULL").fetchone()[0]
-    print(f"対象: forgotten=0 の {total}件（embedding NULL: {missing}件 / 統一のため全件再生成）")
+    if missing_only:
+        print(f"対象: embedding NULL の {missing}件のみ（増分モード / forgotten=0 全体: {total}件）")
+    else:
+        print(f"対象: forgotten=0 の {total}件（embedding NULL: {missing}件 / 統一のため全件再生成）")
     if dry_run:
         print("  dry-run のため書き込みなし")
         conn.close()
