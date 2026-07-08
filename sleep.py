@@ -24,7 +24,18 @@ DREAM_LINES = sys.argv[1] if len(sys.argv) > 1 else "30"
 # v30: catalog は schema 直後に挿入（cluster_abstract の素材が出揃うため）。
 # catalog は navigability の整理（sleep の神経学的 fitness 整理とは目的が別）。
 # nap() には入れない — catalog は full sleep のみ。
+# ghost記憶v2（2026-07-08）: 埋め込み補完と増分重複整理を夜間の最初に回す。
+# backfill は sentence-transformers が要るので ghost venv の python を使う（無ければスキップされ、系は劣化動作で継続）。
+from pathlib import Path as _Path
+from datetime import datetime as _dt, timedelta as _td
+_GHOST = _Path(__file__).parent
+_VENV_PY = _GHOST / ".venv" / "bin" / "python3"
+_EMBED_PY = str(_VENV_PY) if _VENV_PY.exists() else sys.executable
+_YESTERDAY = (_dt.now() - _td(days=1)).strftime("%Y-%m-%d")
+
 steps = [
+    ("backfill_embed", [_EMBED_PY, str(_GHOST / "memory.py"), "backfill-embeddings", "--missing-only"]),
+    ("reconcile",      [sys.executable, str(_GHOST / "memory.py"), "reconcile", "--since", _YESTERDAY, "--execute"]),
     ("memo_index",    [sys.executable, "memory.py", "memo", "index"]),
     ("promote",       [sys.executable, "memory.py", "promote"]),
     ("dream",         [sys.executable, "dream.py", DREAM_LINES]),

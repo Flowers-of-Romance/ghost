@@ -33,3 +33,6 @@ memory.db.bak-*
 
 # work-in-progress drafts
 drafts/
+
+# runtime state (v32)
+ghost.db

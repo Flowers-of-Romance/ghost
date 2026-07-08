@@ -92,6 +92,13 @@ LINK_THRESHOLD = 0.82
 # 干渉忘却: この類似度を超える古い記憶の重要度を下げる
 INTERFERENCE_THRESHOLD = 0.90
 
+# 重複ゲート（2026-07-08 ghost記憶v2 — amateru/plans/ghost-memory-v2/plan.md）
+# 閾値は全10,585件の実測分布から決定（measurement-2026-07-08.md）
+# e5-small日本語圧縮: sim0.90=関連トピック、別事実ペアの最高値は0.96帯 → 0.98未満は触らない
+MEMORY_GATE = os.environ.get("GHOST_MEMORY_GATE", "on").lower() != "off"
+GATE_DUP_SIM = float(os.environ.get("GHOST_GATE_DUP", "0.995"))      # NOOP帯
+GATE_UPDATE_SIM = float(os.environ.get("GHOST_GATE_UPDATE", "0.98"))  # supersede帯
+
 # 統合: この類似度を超える記憶ペアを統合候補とする
 CONSOLIDATION_THRESHOLD = 0.94
 
@@ -486,6 +493,189 @@ def get_model():
     return _model
 
 
+def normalize_content(text):
+    """重複判定用の正規化: 前後空白除去 + 連続空白の畳み込み"""
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def content_hash(text):
+    """正規化contentのSHA-256（重複ゲート Phase 1a）"""
+    import hashlib
+    return hashlib.sha256(normalize_content(text).encode("utf-8")).hexdigest()
+
+
+def _gate_noop(conn, memory_id, reason, detail=""):
+    """重複ゲートNOOP: 既存記憶を活性化し、mutation_logに記録。INSERTしない"""
+    now_utc = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    conn.execute(
+        "UPDATE memories SET access_count = access_count + 1, last_accessed = ? WHERE id = ?",
+        (now_utc, memory_id))
+    conn.execute(
+        "INSERT INTO mutation_log (memory_id, field, old_value, new_value, reason) "
+        "VALUES (?, 'gate', NULL, ?, ?)",
+        (memory_id, detail, reason))
+    conn.commit()
+
+
+def backfill_embeddings(dry_run=False, batch=256, missing_only=False):
+    """全記憶のembeddingを一括再生成（重複ゲートv2 Phase 0）。
+
+    既存の旧embedding（互換実測 min 0.913）も含めて統一再生成する。
+    sentence-transformers が必要 → ~/.claude/ghost/.venv/bin/python3 で実行。
+    """
+    conn = get_connection()
+    total = conn.execute("SELECT COUNT(*) FROM memories WHERE forgotten = 0").fetchone()[0]
+    missing = conn.execute(
+        "SELECT COUNT(*) FROM memories WHERE forgotten = 0 AND embedding IS NULL").fetchone()[0]
+    print(f"対象: forgotten=0 の {total}件（embedding NULL: {missing}件 / 統一のため全件再生成）")
+    if dry_run:
+        print("  dry-run のため書き込みなし")
+        conn.close()
+        return
+    model = get_model()
+    if model is None:
+        print("✗ sentence-transformers 不在。~/.claude/ghost/.venv/bin/python3 memory.py backfill-embeddings で実行")
+        conn.close()
+        return
+    import time as _time
+    t0 = _time.time()
+    _where = " AND embedding IS NULL" if missing_only else ""
+    rows = conn.execute(
+        f"SELECT id, content FROM memories WHERE forgotten = 0{_where} ORDER BY id").fetchall()
+    if not rows:
+        print("  対象なし")
+        conn.close()
+        return
+    ids = [r["id"] for r in rows]
+    texts = [f"passage: {r['content']}" for r in rows]
+    done = 0
+    for i in range(0, len(texts), batch):
+        vecs = model.encode(texts[i:i + batch], batch_size=64,
+                            normalize_embeddings=True, show_progress_bar=False)
+        for mid, v in zip(ids[i:i + batch], vecs):
+            blob = vec_to_bytes(v)
+            conn.execute("UPDATE memories SET embedding = ? WHERE id = ?", (blob, mid))
+            conn.execute("UPDATE cortex SET embedding = ? WHERE id = ?", (blob, mid))
+            _sync_vec_insert(conn, mid, blob)
+        conn.commit()
+        done += len(vecs)
+        if done % 2048 < batch:
+            print(f"  {done}/{len(texts)} ...")
+    print(f"✓ backfill 完了: {done}件 / {_time.time() - t0:.1f}s")
+    conn.close()
+
+
+def reconcile(dry_run=True, since=None, sim_threshold=0.995):
+    """既存記憶の重複整理（重複ゲートv2 Phase 2 — 記憶大掃除）。
+
+    Stage A: content_hash 完全一致クラスタ
+    Stage B: 保存済みembedding同士の類似クラスタ（sim >= 0.995・同category のみ。
+             一括処理は敵対レビュー指摘によりadd時ゲート(0.98)より高い閾値に制限）
+    残す1件 = importance最大 → confidence最大 → 最古。他は版保存 + forgotten=1 + merged_from。
+    物理削除はしない。デフォルト dry-run。
+    """
+    conn = get_connection()
+    where_since = ""
+    params = []
+    if since:
+        where_since = " AND created_at >= ?"
+        params.append(since)
+
+    rows = conn.execute(
+        f"SELECT id, uuid, category, content, content_hash, importance, confidence, "
+        f"created_at, source_conversation, embedding FROM memories "
+        f"WHERE forgotten = 0{where_since} ORDER BY id", params).fetchall()
+    print(f"対象: {len(rows)}件（forgotten=0{' / since=' + since if since else ''}）")
+
+    def keep_key(r):
+        return (-(r["importance"] or 0), -(r["confidence"] or 0), r["created_at"], r["id"])
+
+    clusters = []  # (kind, [rows])
+
+    # Stage A: ハッシュ一致
+    by_hash = {}
+    for r in rows:
+        by_hash.setdefault(r["content_hash"], []).append(r)
+    stage_a_ids = set()
+    for h, grp in by_hash.items():
+        if h and len(grp) > 1:
+            clusters.append(("exact", sorted(grp, key=keep_key)))
+            stage_a_ids.update(r["id"] for r in grp)
+
+    # Stage B: 類似（Stage A対象外・embedding有りのみ）
+    b_rows = [r for r in rows if r["id"] not in stage_a_ids and r["embedding"] is not None]
+    if b_rows:
+        import numpy as _np
+        M = _np.stack([bytes_to_vec(r["embedding"]) for r in b_rows])
+        M = M / (_np.linalg.norm(M, axis=1, keepdims=True) + 1e-9)
+        n = len(b_rows)
+        used = set()
+        BATCH = 512
+        for i0 in range(0, n, BATCH):
+            S = M[i0:i0 + BATCH] @ M.T
+            for j in range(S.shape[0]):
+                gi = i0 + j
+                if gi in used:
+                    continue
+                sims = S[j]
+                grp_idx = [k for k in range(n)
+                           if k != gi and k not in used and sims[k] >= sim_threshold
+                           and b_rows[k]["category"] == b_rows[gi]["category"]]
+                if grp_idx:
+                    grp = [b_rows[gi]] + [b_rows[k] for k in grp_idx]
+                    used.add(gi)
+                    used.update(grp_idx)
+                    clusters.append(("similar", sorted(grp, key=keep_key)))
+
+    to_forget = sum(len(g) - 1 for _, g in clusters)
+    n_exact = sum(1 for k, _ in clusters if k == "exact")
+    n_sim = sum(1 for k, _ in clusters if k == "similar")
+    print(f"クラスタ: {len(clusters)}個（完全一致 {n_exact} / 類似 {n_sim}）")
+    print(f"無効化予定: {to_forget}件 / 残存予定: {len(rows) - to_forget}件")
+
+    # source別内訳（97%重複の主因検証用）
+    src_count = {}
+    for _, grp in clusters:
+        for r in grp[1:]:
+            key = (r["source_conversation"] or "(source無し)")[:30]
+            src_count[key] = src_count.get(key, 0) + 1
+    print("無効化対象のsource内訳（上位8）:")
+    for k, v in sorted(src_count.items(), key=lambda x: -x[1])[:8]:
+        print(f"  {v:6d}  {k}")
+
+    if dry_run:
+        print("\n--- サンプル（各種別から最大10クラスタ）---")
+        shown = {"exact": 0, "similar": 0}
+        for kind, grp in clusters:
+            if shown[kind] >= 10:
+                continue
+            shown[kind] += 1
+            keep, rest = grp[0], grp[1:]
+            print(f"[{kind}] keep #{keep['id']} ({keep['created_at'][:10]}) 他{len(rest)}件無効化")
+            print(f"   {normalize_content(keep['content'])[:80]}")
+        print("\ndry-run のため変更なし。本実行: reconcile --execute")
+        conn.close()
+        return
+
+    done = 0
+    for kind, grp in clusters:
+        keep, rest = grp[0], grp[1:]
+        for r in rest:
+            _snapshot_version(conn, r["id"], f"reconcile_{kind}", superseded_by=keep["id"])
+            conn.execute("UPDATE memories SET forgotten = 1, merged_from = ? WHERE id = ?",
+                         (keep["uuid"], r["id"]))
+            conn.execute(
+                "INSERT INTO mutation_log (memory_id, field, old_value, new_value, reason) "
+                "VALUES (?, 'gate', ?, ?, ?)",
+                (r["id"], r["uuid"], f"kept=#{keep['id']}", f"reconcile_{kind}"))
+            done += 1
+        if done % 500 < len(rest):
+            conn.commit()
+    conn.commit()
+    print(f"✓ reconcile 完了: {done}件を無効化（版保存済み・可逆）")
+    conn.close()
+
+
 def embed_text(text, is_query=False):
     # まずサーバーに問い合わせ（高速）
     try:
@@ -777,6 +967,20 @@ def init_db():
         conn.execute("ALTER TABLE memories ADD COLUMN merged_from TEXT DEFAULT NULL")
     except sqlite3.OperationalError:
         pass  # already exists
+    # content_hash カラム（重複ゲート 2026-07-08 v2）
+    try:
+        conn.execute("ALTER TABLE memories ADD COLUMN content_hash TEXT")
+    except sqlite3.OperationalError:
+        pass  # already exists
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_content_hash ON memories(content_hash)")
+    _null_hash = conn.execute(
+        "SELECT id, content FROM memories WHERE content_hash IS NULL").fetchall()
+    if _null_hash:
+        for _r in _null_hash:
+            conn.execute("UPDATE memories SET content_hash = ? WHERE id = ?",
+                         (content_hash(_r["content"]), _r["id"]))
+        conn.commit()
+        print(f"  ✓ content_hash を {len(_null_hash)}件 補完（重複ゲートv2マイグレーション）")
     # context_expires_at カラムを追加（既存DBの場合）
     try:
         conn.execute("ALTER TABLE memories ADD COLUMN context_expires_at TEXT DEFAULT NULL")
@@ -4795,7 +4999,7 @@ def prospect_clear(prospect_id):
 # メイン操作
 # ============================================================
 
-def add_memory(content, category="fact", source=None, confidence=None, provenance=None, flashbulb=None, relational_context=None, origin=None, domains=None):
+def add_memory(content, category="fact", source=None, confidence=None, provenance=None, flashbulb=None, relational_context=None, origin=None, domains=None, force=False):
     emotions, arousal, importance = detect_emotions(content)
 
     # 出自と信頼度の自動設定
@@ -4819,12 +5023,42 @@ def add_memory(content, category="fact", source=None, confidence=None, provenanc
 
     conn = get_connection()
 
+    # ── 重複ゲート Phase 1a: 完全一致（ハッシュ・embedding不要）──
+    c_hash = content_hash(content)
+    if MEMORY_GATE and not force:
+        _dup = conn.execute(
+            "SELECT id FROM memories WHERE forgotten = 0 AND content_hash = ? LIMIT 1",
+            (c_hash,)).fetchone()
+        if _dup:
+            _gate_noop(conn, _dup["id"], "gate_noop_exact", c_hash[:16])
+            print(f"↺ 既存 #{_dup['id']} と完全一致 → 追加スキップ（NOOP・access_count+1）")
+            conn.close()
+            return _dup["id"]
+
     # 予期記憶チェック
     check_prospective(conn, content)
 
     # 予測符号化 — 予測誤差が大きいほど重要
     pred_error, similar_id = prediction_error(conn, vec)
     importance, arousal = apply_prediction_error(importance, arousal, pred_error)
+
+    # ── 重複ゲート Phase 1b: 類似判定（実測閾値 0.995 / 0.98、同categoryのみ）──
+    _gate_max_sim = (1.0 - pred_error) if pred_error is not None else None
+    _gate_supersede_id = None
+    _gate_supersede_uuid = None
+    if MEMORY_GATE and not force and _gate_max_sim is not None and similar_id is not None:
+        _sim_row = conn.execute(
+            "SELECT id, category, uuid FROM memories WHERE id = ? AND forgotten = 0",
+            (similar_id,)).fetchone()
+        if _sim_row and _sim_row["category"] == category:
+            if _gate_max_sim >= GATE_DUP_SIM:
+                _gate_noop(conn, _sim_row["id"], "gate_noop_sim", f"sim={_gate_max_sim:.4f}")
+                print(f"↺ 既存 #{_sim_row['id']} と類似 sim={_gate_max_sim:.3f}（>= {GATE_DUP_SIM}）→ 追加スキップ（NOOP）")
+                conn.close()
+                return _sim_row["id"]
+            elif _gate_max_sim >= GATE_UPDATE_SIM:
+                _gate_supersede_id = _sim_row["id"]
+                _gate_supersede_uuid = _sim_row["uuid"]
 
     # スキーマプライミング — 既存スキーマが新記憶の解釈を変える（再帰Level 2）
     schema_boost, schema_extra_kws, matched_schema_ids = schema_prime(conn, vec, keywords, content)
@@ -4877,15 +5111,29 @@ def add_memory(content, category="fact", source=None, confidence=None, provenanc
         """INSERT INTO memories
            (content, category, importance, emotions, arousal, keywords,
             source_conversation, embedding, context_expires_at, temporal_context,
-            spatial_context, relational_context, uuid, updated_at, provenance, confidence, flashbulb, origin)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            spatial_context, relational_context, uuid, updated_at, provenance, confidence, flashbulb, origin, content_hash)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (content, category, importance,
          emo_json, arousal, kw_json,
          source, blob, context_expires, temporal_ctx, spatial_ctx, relational_ctx,
-         mem_uuid, now_utc, provenance, confidence, flashbulb, origin)
+         mem_uuid, now_utc, provenance, confidence, flashbulb, origin, c_hash)
     )
     conn.commit()
     new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    # ── 重複ゲート Phase 1b: supersede 実行（旧を版保存→無効化、来歴を接続）──
+    if _gate_supersede_id is not None:
+        _snapshot_version(conn, _gate_supersede_id, "gate_supersede", superseded_by=new_id)
+        conn.execute("UPDATE memories SET forgotten = 1 WHERE id = ?", (_gate_supersede_id,))
+        conn.execute("UPDATE memories SET merged_from = ? WHERE id = ?",
+                     (_gate_supersede_uuid, new_id))
+        conn.execute(
+            "INSERT INTO mutation_log (memory_id, field, old_value, new_value, reason) "
+            "VALUES (?, 'gate', ?, ?, 'gate_supersede')",
+            (_gate_supersede_id, _gate_supersede_uuid,
+             f"superseded_by=#{new_id} sim={_gate_max_sim:.4f}"))
+        conn.commit()
+        print(f"⇅ 旧記憶 #{_gate_supersede_id} を #{new_id} で置換（sim={_gate_max_sim:.3f}・版保存済み・可逆）")
 
     # 左脳（cortex）: 意味的データ
     doms_json = json.dumps(domains, ensure_ascii=False) if domains else '["unknown"]'
@@ -9719,6 +9967,18 @@ def main():
     if cmd == "init":
         init_db()
 
+    elif cmd == "backfill-embeddings":
+        backfill_embeddings(dry_run="--dry-run" in sys.argv,
+                            missing_only="--missing-only" in sys.argv)
+
+    elif cmd == "reconcile":
+        _since = None
+        if "--since" in sys.argv:
+            _i = sys.argv.index("--since")
+            if _i + 1 < len(sys.argv):
+                _since = sys.argv[_i + 1]
+        reconcile(dry_run="--execute" not in sys.argv, since=_since)
+
     elif cmd == "add":
         if len(sys.argv) < 3:
             print("使い方: python memory.py add \"内容\" [--category CAT] [--source SRC] [--flashbulb TEXT] [--origin ORIGIN] [--domain D1,D2]")
@@ -9727,6 +9987,7 @@ def main():
         content = sys.argv[2]
         args = sys.argv[3:]
         category = "fact"
+        force_add = False
         category_set = False
         source = None
         flashbulb = None
@@ -9750,6 +10011,9 @@ def main():
             elif args[i] == "--domain" and i + 1 < len(args):
                 domains = [d.strip() for d in args[i + 1].split(",") if d.strip()] or None
                 i += 2
+            elif args[i] == "--force-add":
+                force_add = True
+                i += 1
             elif args[i].startswith("--"):
                 i += 2  # 未知のフラグはスキップ
             elif not category_set:
@@ -9761,7 +10025,7 @@ def main():
                 i += 1
             else:
                 i += 1
-        add_memory(content, category, source, flashbulb=flashbulb, origin=origin, domains=domains)
+        add_memory(content, category, source, flashbulb=flashbulb, origin=origin, domains=domains, force=force_add)
 
     elif cmd == "search":
         if len(sys.argv) < 3:
