@@ -30,6 +30,8 @@ DREAM_LINES = sys.argv[1] if len(sys.argv) > 1 else "30"
 # backfill は sentence-transformers が要るので ghost venv の python を使う（無ければスキップされ、系は劣化動作で継続）。
 _GHOST = Path(__file__).parent
 _VENV_PY = _GHOST / ".venv" / "bin" / "python3"
+# reconcile Stage B は numpy を使うため、venv があればそちらの python で揃える
+_MEMORY_RUNNER = str(_VENV_PY) if _VENV_PY.exists() else sys.executable
 _YESTERDAY = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
 
 steps = []
@@ -39,7 +41,7 @@ if _VENV_PY.exists():
                   [str(_VENV_PY), str(_GHOST / "memory.py"), "backfill-embeddings", "--missing-only"]))
 
 steps += [
-    ("reconcile",      [sys.executable, str(_GHOST / "memory.py"), "reconcile", "--since", _YESTERDAY, "--execute"]),
+    ("reconcile",      [_MEMORY_RUNNER, str(_GHOST / "memory.py"), "reconcile", "--since", _YESTERDAY, "--execute"]),
     ("memo_index",    [sys.executable, "memory.py", "memo", "index"]),
     ("promote",       [sys.executable, "memory.py", "promote"]),
     ("dream",         [sys.executable, "dream.py", DREAM_LINES]),
