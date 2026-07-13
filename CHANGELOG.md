@@ -637,7 +637,7 @@ schema 伝播は次段階。
 ghost は記憶システムとして完結していたが、身体（カメラ・マイク・スピーカー）を持たなかった。
 recall で過去は呼び戻せても、いま目の前にあるもの、いま聴こえているもの、いま口にする声を扱う道が無い。
 
-v28 で **prayer** という独立サブシステムを導入した（[Flowers-of-Romance/prayer](https://github.com/Flowers-of-Romance/prayer)）。
+v28 で **prayer** という独立サブシステムを導入した（[0x006a6d/prayer](https://github.com/0x006a6d/prayer)）。
 MacBook のカメラ・マイクで常時知覚し、Qwen3-Omni-30B-A3B-bf16 で画像を cortex（構造）+ limbic（情調）の
 double description に変換、mlx-whisper small で発話を書き起こし、VOICEVOX で応答する。Blade Runner の
 逆転ヴォイトカンプフ — LLM が審査官、人間が祈る側。
@@ -671,7 +671,7 @@ prayer は GHOST_DIR 環境変数か `../ghost` から memory.py を import し�
 
 ### think.py と transfer.py をリポジトリに追加
 
-[#3](https://github.com/Flowers-of-Romance/ghost/issues/3) (@asahi-inoue-jp-shaman-ai-engineer) で指摘:
+[#3](https://github.com/0x006a6d/ghost/issues/3) (@asahi-inoue-jp-shaman-ai-engineer) で指摘:
 `sleep.py` から `python think.py` が呼ばれ、README/CHANGELOG でも言及されているが、
 think.py 本体と、その依存である transfer.py がローカルにしか存在せず、リポジトリから
 欠落していた。clone した環境では `python sleep.py` の think ステップが
@@ -801,7 +801,7 @@ SQLite内でベクトル近傍探索が完結する。
 #### Design notes
 - vec0はJOIN/WHERE制約をサポートしないため、多めにk件取得してからPython側でforgotten等をフィルタする2段階方式
 - 数千件規模では速度差は小さいが、記憶が万単位に成長したときのスケーラビリティを確保
-- [pulp](https://github.com/Flowers-of-Romance/pulp)と同じスタック（sqlite-vec + multilingual-e5-small + FTS5）
+- [pulp](https://github.com/0x006a6d/pulp)と同じスタック（sqlite-vec + multilingual-e5-small + FTS5）
 
 ## [v24.0] - 2026-04-15
 
@@ -1132,7 +1132,7 @@ LLMの記憶も計画もself-attentionに支配される。完全記憶モード
 ## [v12] - 2026-03-17
 
 ### Fixed
-- **proceduralize時にcategoryを更新**: 手続き化された記憶のcategoryを'procedure'に変更するようにした。以前はproceduresテーブルに入るだけでmemoriesのcategoryは元のままだった（[#1](https://github.com/Flowers-of-Romance/ghost/issues/1)）
+- **proceduralize時にcategoryを更新**: 手続き化された記憶のcategoryを'procedure'に変更するようにした。以前はproceduresテーブルに入るだけでmemoriesのcategoryは元のままだった（[#1](https://github.com/0x006a6d/ghost/issues/1)）
 - **Claude側sleepスキルにproceduralize追加**: Gemini側には既にあったがClaude側のSKILL.mdから漏れていた
 
 ## [v11] - 2026-03-16

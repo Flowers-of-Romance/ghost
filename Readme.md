@@ -8,7 +8,7 @@ LLM に「長期記憶」ではなく「脳」を実装する。catalog（目録
 - **対立は解消しない**。極性が反対の記憶ペアは tension link で地下に保持される。整合性ではなく緊張で動く（ラカン的無意識：抑圧されたものは消えず、戻ってくる）
 
 ```bash
-git clone https://github.com/Flowers-of-Romance/ghost.git
+git clone https://github.com/0x006a6d/ghost.git
 cd ghost
 pip install sentence-transformers numpy fugashi unidic-lite sqlite-vec
 ./ext/build_lindera.sh   # M1 macOS は ext/lindera_fts5.dylib が同梱、他は要 build
